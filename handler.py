@@ -97,7 +97,9 @@ def probe_duration(path):
         return None
 
 
-def handler(job):
+async def handler(job):
+    # async: RunPod runs handlers inside its own event loop (asyncio.run() is illegal there —
+    # the first live job said so, Part 119.9, 04:18Z).
     inp = job.get("input") or {}
     prompt = inp.get("prompt")
     if not isinstance(prompt, str) or "<speak" not in prompt:
@@ -111,7 +113,7 @@ def handler(job):
 
     t1 = time.time()
     try:
-        result = asyncio.run(processor.process(ProcessJob(job_id=job_id, input=model_input)))
+        result = await processor.process(ProcessJob(job_id=job_id, input=model_input))
     except Exception as e:  # never raise: RunPod would retry a long job
         log.exception("processor failed")
         return {"error": f"processor: {e}"}
