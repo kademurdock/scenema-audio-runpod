@@ -15,8 +15,11 @@ ln -s "$VOL/seedvc-checkpoints" /app/seed-vc/checkpoints
 if [ -z "${GEMMA_QUANTIZE_EXPLICIT:-}" ]; then
   VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
   if [ -n "$VRAM_MIB" ] && [ "$VRAM_MIB" -lt 40000 ]; then
+    # README's 24 GB row: INT8 audio (identical quality per upstream) + NF4 Gemma,
+    # everything resident. bf16 audio + NF4 Gemma OOM'd a 4090 at 23.5 GB (05:05Z).
     export GEMMA_QUANTIZE=nf4
-    echo "[start] ${VRAM_MIB} MiB VRAM: Gemma NF4, audio transformer bf16"
+    export AUDIO_CKPT="$VOL/scenema-audio-transformer-int8.safetensors"
+    echo "[start] ${VRAM_MIB} MiB VRAM: INT8 audio + NF4 Gemma (24 GB config)"
   else
     export GEMMA_QUANTIZE=
     echo "[start] ${VRAM_MIB:-?} MiB VRAM: everything bf16"
