@@ -7,14 +7,10 @@ FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
+# ffmpeg from apt (Ubuntu 24.04 ships 6.1): upstream's BtbN static-build URL 404s as of Sep 3 2026.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-dev python3-pip git curl wget xz-utils gcc libsndfile1 \
+    python3 python3-dev python3-pip git curl wget xz-utils gcc libsndfile1 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
-
-RUN curl -fSL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz \
-    | tar -xJ --strip-components=2 -C /usr/local/bin/ \
-      ffmpeg-n7.1-latest-linux64-gpl-7.1/bin/ffmpeg \
-      ffmpeg-n7.1-latest-linux64-gpl-7.1/bin/ffprobe
 
 WORKDIR /app
 
