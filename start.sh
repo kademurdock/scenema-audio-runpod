@@ -14,7 +14,15 @@ ln -s "$VOL/seedvc-checkpoints" /app/seed-vc/checkpoints
 # A 48 GB card runs everything bf16. GEMMA_QUANTIZE set explicitly wins.
 if [ -z "${GEMMA_QUANTIZE_EXPLICIT:-}" ]; then
   VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-  if [ -n "$VRAM_MIB" ] && [ "$VRAM_MIB" -lt 40000 ]; then
+  if [ -n "$VRAM_MIB" ] && [ "$VRAM_MIB" -ge 30000 ] && [ "$VRAM_MIB" -lt 40000 ]; then
+    # Part 127 (Sep 4 2026): a 32 GB card (RTX 5090) holds Gemma in 8-bit (~13 GB)
+    # beside the INT8 audio model, all resident — closer to bf16 quality at NF4
+    # speed. patch_gemma_int8.py adds the mode; it falls back to NF4 if the load
+    # fails. 48 GB cards are Low stock in every datacentre with a volume.
+    export GEMMA_QUANTIZE=int8
+    export AUDIO_CKPT="$VOL/scenema-audio-transformer-int8.safetensors"
+    echo "[start] ${VRAM_MIB} MiB VRAM: INT8 audio + INT8 Gemma (32 GB config)"
+  elif [ -n "$VRAM_MIB" ] && [ "$VRAM_MIB" -lt 40000 ]; then
     # README's 24 GB row: INT8 audio (identical quality per upstream) + NF4 Gemma,
     # everything resident. bf16 audio + NF4 Gemma OOM'd a 4090 at 23.5 GB (05:05Z).
     export GEMMA_QUANTIZE=nf4

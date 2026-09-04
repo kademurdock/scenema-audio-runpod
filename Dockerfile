@@ -55,7 +55,8 @@ RUN wget -q -O /app/models/MelBandRoformer_fp16.safetensors \
 
 COPY handler.py /app/handler.py
 COPY start.sh /app/start.sh
-RUN chmod +x /app/start.sh
+COPY patch_gemma_int8.py /app/patch_gemma_int8.py
+RUN chmod +x /app/start.sh && python3 /app/patch_gemma_int8.py /app/upstream/src/audio_core/engine.py
 
 RUN PYTHONPATH=/app/upstream/src python3 -c "\
 import torch; print('torch', torch.__version__, torch.version.cuda); \
