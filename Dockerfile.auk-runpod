@@ -1,7 +1,9 @@
 FROM runpod/pytorch:1.3.1-cu1281-torch271-ubuntu2204
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 HF_HUB_DISABLE_TELEMETRY=1
 RUN apt-get update && apt-get install -y --no-install-recommends python3-venv git ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
-RUN python3 -m venv --system-site-packages /opt/auk-env
+# The Runpod base installs torch into its selected `python`, while `python3`
+# may still point at Ubuntu's different interpreter.
+RUN python -c "import torch; assert torch.__version__.split('+')[0] == '2.7.1'" && python -m venv --system-site-packages /opt/auk-env
 ENV PATH="/opt/auk-env/bin:${PATH}"
 RUN python3 -m pip install --no-cache-dir --upgrade pip==25.3 setuptools==80.9.0 wheel==0.45.1
 RUN python3 -c "import torch; assert torch.__version__.split('+')[0] == '2.7.1'"
