@@ -1,0 +1,15 @@
+FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 HF_HUB_DISABLE_TELEMETRY=1
+RUN apt-get update && apt-get install -y --no-install-recommends git ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
+RUN python3 -m pip install --no-cache-dir --upgrade pip==25.3 setuptools==80.9.0 wheel==0.45.1
+RUN python3 -c "import torch; assert torch.__version__.split('+')[0] == '2.8.0'"
+WORKDIR /app
+ENV PYTHONPATH=/app/upstream/src
+RUN git clone https://github.com/Tencent-Hunyuan/AuK /app/upstream && cd /app/upstream && git checkout e1c935e81e356c87419d9509d7f8a4091457bdca && pip install --no-cache-dir --no-build-isolation . "transformers==4.57.6" "huggingface-hub==0.36.2" "runpod>=1.7,<2" "boto3>=1.35,<2" "soundfile>=0.12,<1" "requests>=2.32,<3"
+ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ENV AUK_MODEL_DIR=/runpod-volume/huggingface-cache/hub/models--tencent--AuK/snapshots/790742b71a4430120daf2b2099192abae449eb9f
+ENV AUK_QWEN_DIR=/runpod-volume/huggingface-cache/hub/models--Qwen--Qwen2.5-Omni-3B/snapshots/f75b40e3da2003cdd6e1829b1f420ca70797c34e
+COPY auk_contract.py auk_handler.py /app/
+RUN python3 -c "from auk.infer.infer_auk import AukInfer; import auk_handler"
+ENTRYPOINT []
+CMD ["python3", "-u", "/app/auk_handler.py"]
