@@ -49,7 +49,7 @@ def plan(inp):
         # Short acoustic windows prevent memory growth; the project can be long.
         tokens = words.split()
         while tokens:
-            end = min(40, len(tokens))
+            end = min(max(8, int(18 * 2.6 / pace)), len(tokens))
             if len(tokens) > end:
                 for i in range(end, max(8, end // 2), -1):
                     if re.search(r'[.!?;][\"\u201d\u2019]*$', tokens[i - 1]):
@@ -59,7 +59,7 @@ def plan(inp):
             instruction = (f'Based on the following description: "{direction}", '
                            f'generate speech content "{text}".')
             result.append({"instruction": instruction, "text": text,
-                           "seconds": max(1, end / (2.6 * pace) + 0.5), "seed": seed})
+                           "seconds": max(1, end * pace / 2.6 + 0.5), "seed": seed})
     if not result:
         raise ValueError("The screenplay contains no spoken words.")
     return result

@@ -79,7 +79,7 @@ def handler(job):
                 # of the recording. Content edits across a join need review.
                 total = source_info.duration
                 target = pieces[0]["seconds"] or total
-                windows = max(1, __import__("math").ceil(max(total, target) / 16))
+                windows = max(1, __import__("math").ceil((total + target) / 28))
                 steps = []
                 for n in range(windows):
                     ref = work / f"ref{n}.wav"
@@ -126,7 +126,7 @@ def handler(job):
                 s3.upload_file(str(path), bucket, key + suffix, ExtraArgs={"ContentType": mime})
             url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key + ".mp3"}, ExpiresIn=604800)
             return {"engine": "auk", "quality": "base-bf16-32", "key": key + ".mp3",
-                    "wav_key": key + ".wav", "url": url, "duration_s": round(duration, 2),
+                    "wav_key": key + ".wav", "wav_url": s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key + ".wav"}, ExpiresIn=604800), "url": url, "duration_s": round(duration, 2),
                     "processing_ms": int((time.monotonic() - start) * 1000),
                     "bytes": mp3.stat().st_size, "seed": pieces[0]["seed"],
                     "has_reference_voice": bool(inp.get("reference_voice_url")), "parts": len(steps)}
