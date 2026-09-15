@@ -21,9 +21,15 @@ ENGINE = None
 def engine():
     global ENGINE
     if ENGINE is None:
+        model_dir = Path(os.environ.get('AUK_MODEL_DIR', '/models/AuK'))
+        qwen_dir = Path(os.environ.get('AUK_QWEN_DIR', '/models/Qwen'))
+        if not (model_dir / 'auk_base.safetensors').is_file():
+            raise ValueError('The AuK model cache is not ready. No audio was generated.')
+        if not (qwen_dir / 'config.json').is_file():
+            raise ValueError('The Qwen model cache is not ready. No audio was generated.')
         from auk.infer.infer_auk import AukInfer
-        ENGINE = AukInfer("/models/AuK/config.yaml", "/models/AuK/auk_base.safetensors",
-                          qwen_path="/models/Qwen", dtype="bf16", device="cuda",
+        ENGINE = AukInfer(str(model_dir / 'config.yaml'), str(model_dir / 'auk_base.safetensors'),
+                          qwen_path=str(qwen_dir), dtype="bf16", device="cuda",
                           cpu_offload=True)
     return ENGINE
 
