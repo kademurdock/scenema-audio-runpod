@@ -12,7 +12,7 @@ import time
 import urllib.parse
 import uuid
 
-from auk_contract import plan
+from auk_contract import plan, model_instruction
 
 log = logging.getLogger("auk-worker")
 logging.basicConfig(level=logging.INFO)
@@ -104,10 +104,7 @@ def handler(job):
             for n, piece in enumerate(steps):
                 runpod.serverless.progress_update(job, f"AuK HQ: part {n + 1} of {len(steps)}")
                 reference = piece.get("source", source)
-                instruction = piece["instruction"]
-                if not editing and reference:
-                    instruction = (f'Say the following with the same voice: "{piece["text"]}". '
-                                   + instruction.split(", generate speech content")[0])
+                instruction = model_instruction(piece, has_reference=bool(reference))
                 content = [{"type": "text", "text": instruction}]
                 if reference:
                     content.append({"type": "audio", "audio": str(reference)})

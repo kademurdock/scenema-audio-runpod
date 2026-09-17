@@ -1,7 +1,20 @@
 """AuK requests and legacy screenplay compatibility. No GPU imports."""
 import math
+import json
 import re
 import xml.etree.ElementTree as ET
+
+
+def model_instruction(piece, has_reference=False):
+    """Use AuK's distinct speech contracts; edit requests keep their own words."""
+    if "text" not in piece:
+        return piece["instruction"]
+    text = json.dumps(piece["text"], ensure_ascii=False)
+    if has_reference:
+        return f"Say the following with the same voice: {text}"
+    direction = json.dumps(piece["direction"], ensure_ascii=False)
+    return (f"Generate speech based on the following description: {direction}. "
+            f"The content to speak is: {text}.")
 
 
 def plan(inp):
@@ -56,10 +69,10 @@ def plan(inp):
                         end = i
                         break
             text = " ".join(tokens[:end]); tokens = tokens[end:]
-            instruction = (f'Based on the following description: "{direction}", '
-                           f'generate speech content "{text}".')
-            result.append({"instruction": instruction, "text": text,
-                           "seconds": max(1, end * pace / 2.6 + 0.5), "seed": seed})
+            piece = {"direction": direction, "text": text,
+                     "seconds": max(1, end * pace / 2.6 + 0.5), "seed": seed}
+            piece["instruction"] = model_instruction(piece)
+            result.append(piece)
     if not result:
         raise ValueError("The screenplay contains no spoken words.")
     return result
