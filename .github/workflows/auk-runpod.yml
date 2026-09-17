@@ -25,3 +25,4 @@ jobs:
           push: true
           tags: ghcr.io/kademurdock/scenema-audio-runpod:auk-runpod-${{ github.sha }}
           cache-to: type=inline
+          cache-from: type=registry,ref=ghcr.io/kademurdock/scenema-audio-runpod:auk-runpod-b1782eb4d0ead81765fa737f96e01cc1673843b6

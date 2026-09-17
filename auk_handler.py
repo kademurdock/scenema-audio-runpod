@@ -3,6 +3,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import socket
 import subprocess
@@ -138,6 +139,11 @@ def handler(job):
                     "has_reference_voice": bool(inp.get("reference_voice_url")), "parts": len(steps)}
     except Exception as error:
         # Do not return URLs, signed queries, or storage credentials in errors.
+        missing = getattr(error, "name", None) if isinstance(error, ModuleNotFoundError) else None
+        if missing and re.fullmatch(r"[a-zA-Z0-9_.]+", missing):
+            log.error("AuK missing dependency: %s", missing)
+            return {"error": "The AuK worker is missing a required audio component. Generation stopped; your script and source recording are unchanged.",
+                    "error_code": "missing_dependency", "missing_module": missing}
         log.error("AuK failed (%s)", type(error).__name__)
         return {"error": str(error) if isinstance(error, ValueError) else
                 f"AuK could not finish ({type(error).__name__}). Your source recording is unchanged."}

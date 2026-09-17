@@ -13,7 +13,10 @@ RUN git clone https://github.com/Tencent-Hunyuan/AuK /app/upstream && cd /app/up
 ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ENV AUK_MODEL_DIR=/runpod-volume/huggingface-cache/hub/models--tencent--AuK/snapshots/790742b71a4430120daf2b2099192abae449eb9f
 ENV AUK_QWEN_DIR=/runpod-volume/huggingface-cache/hub/models--Qwen--Qwen2.5-Omni-3B/snapshots/f75b40e3da2003cdd6e1829b1f420ca70797c34e
-COPY auk_contract.py auk_handler.py /app/
-RUN python3 -c "from auk.infer.infer_auk import AukInfer; import auk_handler"
+# qwen-omni-utils imports audioread, but does not declare it. Recent librosa
+# versions no longer guarantee that transitive dependency.
+RUN python3 -m pip install --no-cache-dir "audioread>=3.0.1,<4"
+COPY auk_contract.py auk_handler.py check_auk_audio.py /app/
+RUN python3 -c "from auk.infer.infer_auk import AukInfer; import auk_handler" && python3 /app/check_auk_audio.py
 ENTRYPOINT []
 CMD ["python3", "-u", "/app/auk_handler.py"]
