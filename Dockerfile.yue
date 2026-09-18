@@ -1,0 +1,12 @@
+FROM python:3.12-slim-bookworm
+ENV PYTHONUNBUFFERED=1 HF_HUB_DISABLE_TELEMETRY=1
+RUN apt-get update && apt-get install -y --no-install-recommends git ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+RUN pip install --no-cache-dir torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+RUN git clone https://github.com/multimodal-art-projection/YuE.git /app/upstream && cd /app/upstream && git checkout bd90e4ccae671d869b3ecaca6d7e893927d29442 && pip install --no-cache-dir . 'runpod>=1.7,<2' 'boto3>=1.35,<2' 'requests>=2.32,<3'
+ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+ENV YUE_MODEL_DIR=/runpod-volume/huggingface-cache/hub/models--m-a-p--YuE2-3B/snapshots/14fc6c6f146441b1dd6363fcb2e01e82a6914cb7
+ENV YUE_VAE_DIR=/runpod-volume/huggingface-cache/hub/models--m-a-p--YuE2-Vae/snapshots/9a94e1d0ea9f8087e98f77fa88df4a4068104d2a
+COPY yue_handler.py auk_handler.py auk_contract.py /app/
+RUN python -c "from yue2 import YuE2Pipeline; import yue_handler; import soundfile; import boto3; import runpod"
+CMD ["python", "-u", "/app/yue_handler.py"]

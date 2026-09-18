@@ -1,0 +1,86 @@
+"""One full-quality YuE2 candidate per request; private audio and score outputs."""
+import os
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+PIPE = None
+
+
+def request_input(inp):
+    style = inp.get('style', '')
+    lyrics = inp.get('lyrics', '')
+    abc = inp.get('abc') or None
+    if not isinstance(style, str) or not 3 <= len(style.strip()) <= 3000:
+        raise ValueError('Describe the music in 3 to 3000 characters.')
+    if not isinstance(lyrics, str) or len(lyrics) > 8000:
+        raise ValueError('Lyrics must be text, up to 8000 characters.')
+    if abc is not None and (not isinstance(abc, str) or len(abc) > 40000):
+        raise ValueError('The composition must be ABC text, up to 40000 characters.')
+    if inp.get('reference_voice_url') or inp.get('audio_urls'):
+        raise ValueError('An audio cover needs a transcribed melody score. Audio reference import is not enabled yet.')
+    seed = inp.get('seed', 42)
+    if type(seed) is not int or not 0 <= seed <= 2147483647:
+        raise ValueError('Seed must be a whole number from 0 to 2147483647.')
+    cot = inp.get('cot', 'melody' if abc else 'full')
+    if cot not in ('full', 'melody'):
+        raise ValueError('Choose full composition or melody planning.')
+    return dict(style=style.strip(), lyrics=lyrics.strip(), abc=abc, cot=cot, seed=seed)
+
+
+def engine():
+    global PIPE
+    if PIPE is None:
+        from yue2 import YuE2Pipeline
+        PIPE = YuE2Pipeline.from_pretrained(
+            os.environ['YUE_MODEL_DIR'], vae=os.environ['YUE_VAE_DIR'],
+            local_files_only=True, device='cuda')
+    return PIPE
+
+
+def handler(job):
+    start = time.monotonic()
+    try:
+        inp = request_input(job.get('input') or {})
+        import boto3
+        import runpod
+        import soundfile as sf
+        from auk_handler import ffmpeg
+        runpod.serverless.progress_update(job, 'Loading YuE2 and composing your song')
+        result = engine()(**inp)
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td) / 'song'
+            result.save_artifacts(work)
+            wav = work / 'master.wav'
+            mp3 = work / 'master.mp3'
+            ffmpeg('-i', work / 'audio.flac', '-c:a', 'pcm_s24le', wav)
+            ffmpeg('-i', wav, '-c:a', 'libmp3lame', '-b:a', '320k', mp3)
+            duration = sf.info(wav).duration
+            client = boto3.client('s3', endpoint_url=os.environ['AWS_ENDPOINT_URL'],
+                                  region_name=os.environ.get('AWS_REGION', 'us-east-005'))
+            bucket = os.environ['AWS_BUCKET_NAME']
+            prefix = f'yue2/{uuid.uuid4()}'
+            files = [(mp3, 'audio/mpeg'), (wav, 'audio/wav')]
+            files += [(p, 'text/plain' if p.suffix == '.abc' else 'application/json')
+                      for p in work.iterdir() if p.suffix in ('.abc', '.json')]
+            for p, mime in files:
+                client.upload_file(str(p), bucket, prefix+'/'+p.name, ExtraArgs={'ContentType': mime})
+            def url(name):
+                return client.generate_presigned_url('get_object', Params={'Bucket':bucket,'Key':prefix+'/'+name}, ExpiresIn=604800)
+            return {'engine':'yue2', 'quality':'bf16-default', 'key':prefix+'/master.mp3',
+                    'wav_key':prefix+'/master.wav', 'url':url('master.mp3'), 'wav_url':url('master.wav'),
+                    'score_key':prefix+'/score.abc' if (work/'score.abc').exists() else None,
+                    'duration_s':round(duration,2), 'bytes':mp3.stat().st_size,
+                    'processing_ms':int((time.monotonic()-start)*1000), 'seed':inp['seed'],
+                    'truncated':result.truncated}
+    except ValueError as error:
+        return {'error':str(error)}
+    except Exception as error:
+        print('YuE2 failed:',type(error).__name__,flush=True)
+        return {'error':f'YuE2 could not finish ({type(error).__name__}). Your writing is saved.'}
+
+
+if __name__ == '__main__':
+    import runpod
+    runpod.serverless.start({'handler': handler})
