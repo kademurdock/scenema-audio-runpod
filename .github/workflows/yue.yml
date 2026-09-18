@@ -2,7 +2,7 @@ name: build-yue2
 on:
   push:
     branches: [main, session202-yue2]
-    paths: [Dockerfile.yue, yue_handler.py, .github/workflows/yue.yml]
+    paths: [Dockerfile.yue, yue_handler.py, cover.py, .github/workflows/yue.yml]
   workflow_dispatch:
 permissions:
   contents: read
@@ -26,3 +26,5 @@ jobs:
           file: Dockerfile.yue
           push: true
           tags: ghcr.io/kademurdock/scenema-audio-runpod:yue2-${{ github.sha }}
+          cache-from: type=registry,ref=ghcr.io/kademurdock/scenema-audio-runpod:yue2-13fd27da7fb4dc00b86e8341fc27f481e3314a83
+          cache-to: type=inline

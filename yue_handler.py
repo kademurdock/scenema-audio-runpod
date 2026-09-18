@@ -1,5 +1,7 @@
 """One full-quality YuE2 candidate per request; private audio and score outputs."""
 import os
+import json
+import subprocess
 import tempfile
 import time
 import uuid
@@ -18,8 +20,11 @@ def request_input(inp):
         raise ValueError('Lyrics must be text, up to 8000 characters.')
     if abc is not None and (not isinstance(abc, str) or len(abc) > 40000):
         raise ValueError('The composition must be ABC text, up to 40000 characters.')
-    if inp.get('reference_voice_url') or inp.get('audio_urls'):
-        raise ValueError('An audio cover needs a transcribed melody score. Audio reference import is not enabled yet.')
+    reference = inp.get('reference_voice_url')
+    if reference and (not isinstance(reference, str) or len(reference) > 12000):
+        raise ValueError('Import the source recording again.')
+    if reference and abc:
+        raise ValueError('Use a source recording or a composition score, not both.')
     seed = inp.get('seed', 42)
     if type(seed) is not int or not 0 <= seed <= 2147483647:
         raise ValueError('Seed must be a whole number from 0 to 2147483647.')
@@ -46,10 +51,31 @@ def handler(job):
         import boto3
         import runpod
         import soundfile as sf
-        from auk_handler import ffmpeg
-        runpod.serverless.progress_update(job, 'Loading YuE2 and composing your song')
-        result = engine()(**inp)
+        from auk_handler import ffmpeg, download
         with tempfile.TemporaryDirectory() as td:
+            reference = (job.get('input') or {}).get('reference_voice_url')
+            warnings = []
+            if reference:
+                global PIPE
+                if PIPE is not None:
+                    PIPE.close()
+                    PIPE = None
+                runpod.serverless.progress_update(job, 'Transcribing the source melody for your cover')
+                source = Path(td) / 'source'
+                download(reference, source)
+                decoded = Path(td) / 'source.wav'
+                ffmpeg('-i', source, '-ar', 24000, '-ac', 1, decoded)
+                if sf.info(decoded).duration > 360:
+                    raise ValueError('Use a source recording up to six minutes long.')
+                score_dir = Path(td) / 'transcription'
+                env = {**os.environ, 'LD_LIBRARY_PATH': '/opt/cover/lib', 'PATH': '/opt/cover/bin:'+os.environ['PATH']}
+                subprocess.run(['/opt/cover/bin/python', '/app/cover.py', str(decoded), str(score_dir)],
+                               env=env, check=True, timeout=600, capture_output=True)
+                inp['abc'] = (score_dir/'score.abc').read_text()
+                inp['cot'] = 'melody'
+                warnings = json.loads((score_dir/'warnings.json').read_text())
+            runpod.serverless.progress_update(job, 'Loading YuE2 and recording your song')
+            result = engine()(**inp)
             work = Path(td) / 'song'
             result.save_artifacts(work)
             wav = work / 'master.wav'
@@ -73,7 +99,8 @@ def handler(job):
                     'score_key':prefix+'/score.abc' if (work/'score.abc').exists() else None,
                     'duration_s':round(duration,2), 'bytes':mp3.stat().st_size,
                     'processing_ms':int((time.monotonic()-start)*1000), 'seed':inp['seed'],
-                    'truncated':any(result.truncated.values()), 'truncation_flags':result.truncated}
+                    'truncated':any(result.truncated.values()), 'truncation_flags':result.truncated,
+                    'cover':bool(reference), 'transcription_warnings':warnings}
     except ValueError as error:
         return {'error':str(error)}
     except Exception as error:

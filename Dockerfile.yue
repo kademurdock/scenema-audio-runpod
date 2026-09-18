@@ -1,3 +1,9 @@
+FROM mambaorg/micromamba:2.3.3 AS coverenv
+USER root
+RUN micromamba create -y -p /opt/cover -c conda-forge python=3.11 ffmpeg=6.1 && micromamba clean -a -y
+RUN /opt/cover/bin/python -m pip install --no-cache-dir torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
+ADD https://huggingface.co/m-a-p/SheetSage2/resolve/80af707174fc7ee521c25925d5f014729f0e61ae/requirements.txt /tmp/requirements.txt
+RUN /opt/cover/bin/python -m pip install --no-cache-dir -r /tmp/requirements.txt
 FROM python:3.12-slim-bookworm
 ENV PYTHONUNBUFFERED=1 HF_HUB_DISABLE_TELEMETRY=1
 RUN apt-get update && apt-get install -y --no-install-recommends git ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
@@ -8,5 +14,11 @@ ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 ENV YUE_MODEL_DIR=/runpod-volume/huggingface-cache/hub/models--m-a-p--YuE2-3B/snapshots/14fc6c6f146441b1dd6363fcb2e01e82a6914cb7
 ENV YUE_VAE_DIR=/runpod-volume/huggingface-cache/hub/models--m-a-p--YuE2-Vae/snapshots/9a94e1d0ea9f8087e98f77fa88df4a4068104d2a
 COPY yue_handler.py auk_handler.py auk_contract.py /app/
+COPY --from=coverenv /opt/cover /opt/cover
+COPY cover.py /app/
+ENV YUE_SCORE_DIR=/runpod-volume/huggingface-cache/hub/models--m-a-p--SheetSage2/snapshots/80af707174fc7ee521c25925d5f014729f0e61ae
+ENV YUE_MERT_DIR=/runpod-volume/huggingface-cache/hub/models--m-a-p--MERT-v2-FullSong/snapshots/d8ba1c745e733b3908ce6ad16ebeb17ac7600a42
+ENV HF_HUB_CACHE=/runpod-volume/huggingface-cache/hub
+RUN LD_LIBRARY_PATH=/opt/cover/lib /opt/cover/bin/python -c "import torch, torchaudio, transformers; from torchaudio.io import StreamReader; assert torch.__version__.startswith('2.8.0')"
 RUN python -c "from yue2 import YuE2Pipeline; import yue_handler; import soundfile; import boto3; import runpod"
 CMD ["python", "-u", "/app/yue_handler.py"]
