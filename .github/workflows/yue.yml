@@ -2,7 +2,7 @@ name: build-yue2
 on:
   push:
     branches: [main, session202-yue2]
-    paths: [Dockerfile.yue, yue_handler.py, cover.py, .github/workflows/yue.yml]
+    paths: [Dockerfile.yue, yue_handler.py, test_yue_controls.py, cover.py, .github/workflows/yue.yml]
   workflow_dispatch:
 permissions:
   contents: read
@@ -12,6 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Validate sound controls without GPU charges
+        run: python -m unittest test_yue_controls.py
       - name: Free disk for CUDA
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: docker/setup-buildx-action@v3
@@ -26,5 +28,5 @@ jobs:
           file: Dockerfile.yue
           push: true
           tags: ghcr.io/kademurdock/scenema-audio-runpod:yue2-${{ github.sha }}
-          cache-from: type=registry,ref=ghcr.io/kademurdock/scenema-audio-runpod:yue2-13fd27da7fb4dc00b86e8341fc27f481e3314a83
+          cache-from: type=registry,ref=ghcr.io/kademurdock/scenema-audio-runpod:yue2-2bc4ab7a5b33158f102ef2041bf0648d480465ba
           cache-to: type=inline

@@ -5,9 +5,35 @@ import subprocess
 import tempfile
 import time
 import uuid
+import math
+from dataclasses import replace
 from pathlib import Path
 
 PIPE = None
+
+
+def sound_controls(inp):
+    def number(key, default, low, high, integer=False):
+        value = inp.get(key, default)
+        if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high or (integer and type(value) is not int):
+            raise ValueError(f'{key} must be between {low} and {high}' + (' in whole numbers.' if integer else '.'))
+        return value
+    return dict(weirdness=number('weirdness', 50, 0, 100, True),
+                steps=number('steps', 32, 16, 64, True),
+                guidance=number('guidance', 1.0, 1.0, 3.0))
+
+
+def render_song(pipe, inp, controls):
+    # Reset per request: a previous song's advanced settings must not leak.
+    original = pipe.generation_config
+    pipe.generation_config = replace(original, ode_steps=controls['steps'])
+    variation = controls['weirdness']
+    try:
+        return pipe(**inp, cfg_scale=controls['guidance'],
+                    abc_sampling={'temperature': round(.4 + .006 * variation, 3)},
+                    semantic_sampling={'temperature': round(.7 + .006 * variation, 3)})
+    finally:
+        pipe.generation_config = original
 
 
 def request_input(inp):
@@ -48,6 +74,7 @@ def handler(job):
     start = time.monotonic()
     try:
         inp = request_input(job.get('input') or {})
+        controls = sound_controls(job.get('input') or {})
         import boto3
         import runpod
         import soundfile as sf
@@ -75,7 +102,7 @@ def handler(job):
                 inp['cot'] = 'melody'
                 warnings = json.loads((score_dir/'warnings.json').read_text())
             runpod.serverless.progress_update(job, 'Loading YuE2 and recording your song')
-            result = engine()(**inp)
+            result = render_song(engine(), inp, controls)
             work = Path(td) / 'song'
             result.save_artifacts(work)
             wav = work / 'master.wav'
@@ -100,7 +127,8 @@ def handler(job):
                     'duration_s':round(duration,2), 'bytes':mp3.stat().st_size,
                     'processing_ms':int((time.monotonic()-start)*1000), 'seed':inp['seed'],
                     'truncated':any(result.truncated.values()), 'truncation_flags':result.truncated,
-                    'cover':bool(reference), 'transcription_warnings':warnings}
+                    'cover':bool(reference), 'transcription_warnings':warnings,
+                    'controls': controls}
     except ValueError as error:
         return {'error':str(error)}
     except Exception as error:
