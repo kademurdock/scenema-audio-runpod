@@ -73,7 +73,7 @@ def handler(job):
                     'score_key':prefix+'/score.abc' if (work/'score.abc').exists() else None,
                     'duration_s':round(duration,2), 'bytes':mp3.stat().st_size,
                     'processing_ms':int((time.monotonic()-start)*1000), 'seed':inp['seed'],
-                    'truncated':result.truncated}
+                    'truncated':any(result.truncated.values()), 'truncation_flags':result.truncated}
     except ValueError as error:
         return {'error':str(error)}
     except Exception as error:
