@@ -70,6 +70,18 @@ def engine():
     return PIPE
 
 
+def warm():
+    # FlashBoot snapshots a booted worker. Loading here, not inside the first
+    # job, puts a ready model in that snapshot and keeps loading out of the
+    # billed song. A failure only falls back to loading on first use.
+    began = time.monotonic()
+    try:
+        engine()
+        print(f'YuE2 ready at boot in {time.monotonic() - began:.1f}s', flush=True)
+    except Exception as error:
+        print('YuE2 boot load skipped:', type(error).__name__, flush=True)
+
+
 def handler(job):
     start = time.monotonic()
     try:
@@ -82,6 +94,7 @@ def handler(job):
         with tempfile.TemporaryDirectory() as td:
             reference = (job.get('input') or {}).get('reference_voice_url')
             warnings = []
+            cover_began = time.monotonic()
             if reference:
                 global PIPE
                 if PIPE is not None:
@@ -101,8 +114,14 @@ def handler(job):
                 inp['abc'] = (score_dir/'score.abc').read_text()
                 inp['cot'] = 'melody'
                 warnings = json.loads((score_dir/'warnings.json').read_text())
+            cover_s = round(time.monotonic() - cover_began, 1) if reference else 0
             runpod.serverless.progress_update(job, 'Loading YuE2 and recording your song')
-            result = render_song(engine(), inp, controls)
+            load_began = time.monotonic()
+            pipe = engine()
+            load_s = round(time.monotonic() - load_began, 1)
+            render_began = time.monotonic()
+            result = render_song(pipe, inp, controls)
+            render_s = round(time.monotonic() - render_began, 1)
             work = Path(td) / 'song'
             result.save_artifacts(work)
             wav = work / 'master.wav'
@@ -128,7 +147,8 @@ def handler(job):
                     'processing_ms':int((time.monotonic()-start)*1000), 'seed':inp['seed'],
                     'truncated':any(result.truncated.values()), 'truncation_flags':result.truncated,
                     'cover':bool(reference), 'transcription_warnings':warnings,
-                    'controls': controls}
+                    'controls': controls,
+                    'timing': {'cover_s': cover_s, 'model_load_s': load_s, 'render_s': render_s}}
     except ValueError as error:
         return {'error':str(error)}
     except Exception as error:
@@ -138,4 +158,5 @@ def handler(job):
 
 if __name__ == '__main__':
     import runpod
+    warm()
     runpod.serverless.start({'handler': handler})

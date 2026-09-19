@@ -146,6 +146,18 @@ def handler(job):
                 f"AuK could not finish ({type(error).__name__}). Your source recording is unchanged."}
 
 
+def warm():
+    # Same reason as YuE2: a FlashBoot snapshot should hold a loaded model, and
+    # the first request should not pay for loading. Falls back to first use.
+    began = time.monotonic()
+    try:
+        engine()
+        log.info("AuK ready at boot in %.1fs", time.monotonic() - began)
+    except Exception as error:
+        log.error("AuK boot load skipped (%s)", type(error).__name__)
+
+
 if __name__ == "__main__":
     import runpod
+    warm()
     runpod.serverless.start({"handler": handler})
