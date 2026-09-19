@@ -146,18 +146,18 @@ def handler(job):
                 f"AuK could not finish ({type(error).__name__}). Your source recording is unchanged."}
 
 
-def warm():
-    # Same reason as YuE2: a FlashBoot snapshot should hold a loaded model, and
-    # the first request should not pay for loading. Falls back to first use.
-    began = time.monotonic()
-    try:
-        engine()
-        log.info("AuK ready at boot in %.1fs", time.monotonic() - began)
-    except Exception as error:
-        log.error("AuK boot load skipped (%s)", type(error).__name__)
+# NO BOOT-TIME LOAD FOR AuK YET (Part 215, Sep 19 2026). YuE2 loads at boot and it
+# works (14.7 s queue, 0 s in-job load). The same warm() was tried here twice on
+# image 02224ba and never served a job -- but the test was CONFOUNDED: the same
+# night RunPod kept renting A40 hosts in CA whose containers never started
+# (runtime null, pods cycling), and the old known-good image b6b823e sat in the
+# queue the same way. So it is NOT established that the boot load was at fault.
+# It is left out because it could not be verified and AuK must stay simple while
+# its hosts are flaky. To retry: first confirm the current image serves a job,
+# then change one thing, and prefer loading AFTER runpod.serverless.start() is
+# listening, behind a lock shared with engine().
 
 
 if __name__ == "__main__":
     import runpod
-    warm()
     runpod.serverless.start({"handler": handler})
