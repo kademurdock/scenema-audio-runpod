@@ -1,7 +1,7 @@
 name: build-yue2
 on:
   push:
-    branches: [main, session202-yue2]
+    branches: [main, session202-yue2, lora-styles]
     paths: [Dockerfile.yue, yue_handler.py, test_yue_controls.py, cover.py, .github/workflows/yue.yml]
   workflow_dispatch:
 permissions:

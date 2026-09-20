@@ -1,6 +1,6 @@
 import unittest
 from dataclasses import dataclass
-from yue_handler import sound_controls, render_song
+from yue_handler import sound_controls, render_song, request_input, style_request
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,25 @@ class ControlsTest(unittest.TestCase):
                            ('guidance', float('nan')), ('guidance', 0)]:
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 sound_controls({key: value})
+
+
+class StyleTest(unittest.TestCase):
+    def test_score_free_song_keeps_upstream_guidance(self):
+        _, args = render_song(Pipeline(), {'seed': 1, 'cot': 'off'}, sound_controls({}))
+        self.assertEqual(args['cfg_scale'], 1.01)
+
+    def test_style_key_and_strength_are_checked(self):
+        self.assertIsNone(style_request({}))
+        self.assertEqual(style_request({'lora_key': 'yue2-loras/kids-step1200.pt'}), ('yue2-loras/kids-step1200.pt', 1.0))
+        for bad in ({'lora_key': '../secrets.pt'}, {'lora_key': 'yue2-loras/a.pt', 'lora_scale': 9}):
+            with self.assertRaises(ValueError):
+                style_request(bad)
+
+    def test_score_free_refuses_a_cover(self):
+        ok = request_input({'style': 'soulful', 'lyrics': 'la', 'cot': 'off'})
+        self.assertEqual(ok['cot'], 'off')
+        with self.assertRaises(ValueError):
+            request_input({'style': 'soulful', 'lyrics': 'la', 'cot': 'off', 'abc': 'X:1'})
 
 
 if __name__ == '__main__':
