@@ -1,6 +1,12 @@
+import hashlib
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
 from yue_handler import sound_controls, render_song, request_input, style_request
+from yue_handler import (cover_options, check_combination, fixed_score_render, instrumental_style, lyric_tags,
+                         tempo_style, semantic_budget, score_facts, lyric_fit, planning_request, PLANNING_TAGS,
+                         FEATURES, UNMOVABLE)
+from abc_tools import parse_abc
 
 
 @dataclass(frozen=True)
@@ -13,6 +19,127 @@ class Pipeline:
 
     def __call__(self, **kwargs):
         return self.generation_config.ode_steps, kwargs
+
+
+# A YuE2 plan from Sep 17 (platform render; melody plus chords) and SheetSage2's
+# melody-only transcription of the same song: the real shapes the worker sees.
+PLANNED = '''X:1
+T:
+M:3/4
+L:1/16
+Q:1/4=84
+V: Vocal clef=treble name="Vocal Melody" snm="Vocal"
+V: Ins clef=treble name="Ins Melody" snm="Inst."
+K:Bb
+% intro
+V: Vocal
+"Bb"z12|"Bb"z4"Bb/D"z8|"Eb"z12|"Eb"z4"Eb/F"z4"F"z4|
+V: Ins
+B,2FB2FF3B,2F|B,3B,2FDF2F2B|E3B,2G4B,2G-|G3B,2GF3A,2F|
+V: Vocal
+"Bb"z12|"Bb"z4"Bb/D"z8|"Eb"z12|"Eb"z4"Eb/F"zBd2"F"d2dd-|
+V: Ins
+B,3B,2F4B,2F|B,z2B,2FDF2F2B|E3B,2G4B,2G|Z|
+% verse
+V: Vocal
+"Bb"d2BBz8|"Bb"z4"Bb/D"zBd2f2BB-|"Eb"B3z8z|"Eb"z4"Eb/F"zBd2"F"d2d2|
+V: Ins
+Z4|
+V: Vocal
+"Gm7"d6c4Bd-|"F"d4-dzc4BB-|"Eb"B3z8z|"Eb"z4zBd2d2dd-|
+V: Ins
+Z4|
+V: Vocal
+"Bb"d2cBz8|"Bb"z4"Bb/D"zBd2f2BB-|"Eb"B3z8z|"Eb"z4"Eb/F"zBd2"F"d2dd-|
+V: Ins
+Z4|
+V: Vocal
+"Gm7"d3zc4B2d2-|"F"d6c2BBBz|"Eb"z12|"Eb"z6d2d2dd-|
+V: Ins
+Z4|
+V: Vocal
+"Cm7"d2cBz8|"F"z6dc3BB-|
+V: Ins
+Z2|
+% outro
+V: Vocal
+"Bb"B3z8z|"Bb"z4"Bb/D"z8|"Eb"z12|"Eb"z4"Eb/F"z4"F"z4|
+V: Ins
+Z|z6f6|g12-|g4z2f6|
+V: Vocal
+"Gm7"z12|"F"z12|"Bb"z12|"Bb"z12|
+V: Ins
+d12|c12|B12-|B4z8|
+'''
+
+TRANSCRIBED = '''X:1
+T:
+M:3/4
+L:1/32
+Q:1/4=83
+V: Vocal clef=treble name="Vocal Melody" snm="Vocal"
+V: Ins clef=treble name="Ins Melody" snm="Inst."
+K:Bb
+% intro
+V: Vocal
+Z4|
+V: Ins
+Z|B,4F2B4f6F2B4f2|B4F2B4f2d2f4f4B2|E4G2B4g6G2B4g2|
+V: Vocal
+Z4|
+V: Ins
+E4G2B4g2F4z2A4f2|B4F2B4f6F2B4f2|B4F2B4f2d2f4f4B2|E4G2B4g2z12|
+V: Vocal
+z8z2B2d4d4d2d2-|
+V: Ins
+z8B2z12z2|
+% verse
+V: Vocal
+d4B4z16|z8z2B2d4f4B2B2-|B4z16z4|z8z2B2d4d4d4|
+V: Ins
+Z4|
+V: Vocal
+d12c8B2d2-|d8-d2z2c8B2B2-|B4z16z4|z8z2B2d4d4d2d2-|
+V: Ins
+Z4|
+V: Vocal
+d4c2B2z16|z8z2B2d4f4B2B2-|B4z16z4|z8z2B2d4d4d2d2-|
+V: Ins
+Z4|
+V: Vocal
+d6z2c8B4d4-|d12c2B2B2B6|Z|z12d4d4d2d2-|
+V: Ins
+Z4|
+V: Vocal
+d4c2B2z16|z12d2c6B2B2-|
+V: Ins
+Z2|
+% outro
+V: Vocal
+B4z16z4|Z3|
+V: Ins
+Z|d12f12|g24-|g8z4f12|
+V: Vocal
+Z4|
+V: Ins
+d24|c24|B24-|B8z16|
+'''
+
+TAGS = '[Intro]\n\n[Verse]\n\n[Outro]\n'
+NO_SINGING = ', no vocals, no singing, no choir, no spoken words.'
+# Every request shape the booth sends today (yue.ts yueInput), including the
+# fields the worker ignores (title, count, band, lora_scale without a key).
+BOOTH_COVER = {'style': 'Warm soul ballad', 'title': 'Test', 'count': 2, 'weirdness': 50, 'steps': 32,
+               'guidance': 1, 'lyrics': '[Verse]\nHold on to me\n[Chorus]\nAll night long', 'band': None,
+               'reference_voice_url': 'https://example.invalid/original.mp3', 'cot': 'melody', 'seed': 7}
+
+
+def harmony(chords):
+    result = []
+    for when, symbol in chords:
+        if not result or result[-1][1] != symbol:
+            result.append((when, symbol))
+    return result
 
 
 class ControlsTest(unittest.TestCase):
@@ -65,6 +192,228 @@ class StyleTest(unittest.TestCase):
         self.assertEqual(ok['cot'], 'off')
         with self.assertRaises(ValueError):
             request_input({'style': 'soulful', 'lyrics': 'la', 'cot': 'off', 'abc': 'X:1'})
+
+
+class CoverOptionsTest(unittest.TestCase):
+    TODAY = dict(mode='render', keep_harmony=None, instrumental=False, length_guard=False, match_score_tempo=False)
+
+    def test_todays_requests_get_todays_behaviour(self):
+        shapes = [{}, BOOTH_COVER, {'style': 'pop', 'lyrics': 'la', 'cot': 'off', 'lora_key': 'yue2-loras/kids.pt',
+                                    'lora_scale': 1.2, 'band': 'kids'},
+                  {'style': 'pop', 'abc': PLANNED, 'cot': 'full', 'weirdness': 80, 'steps': 64, 'guidance': 2.5}]
+        for shape in shapes:
+            with self.subTest(shape=sorted(shape)):
+                self.assertEqual(cover_options(shape), self.TODAY)
+        self.assertEqual(cover_options({'keep_harmony': False, 'instrumental': False}),
+                         dict(self.TODAY, keep_harmony=False))
+
+    def test_new_fields_turn_the_length_guard_on_unless_told(self):
+        self.assertTrue(cover_options({'instrumental': True})['length_guard'])
+        self.assertTrue(cover_options({'keep_harmony': True})['length_guard'])
+        self.assertTrue(cover_options({'match_score_tempo': True})['length_guard'])
+        self.assertFalse(cover_options({'keep_harmony': True, 'length_guard': False})['length_guard'])
+        self.assertTrue(cover_options({'length_guard': True})['length_guard'])
+
+    def test_bad_values_are_refused_before_any_gpu_work(self):
+        for key, value in [('keep_harmony', 'yes'), ('keep_harmony', 1), ('instrumental', 0),
+                           ('length_guard', 'true'), ('match_score_tempo', [True])]:
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, 'true or false'):
+                cover_options({key: value})
+        for mode in ('cover', 'Render', 5, ['render'], None, ''):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'not available'):
+                cover_options({'mode': mode})
+        self.assertEqual(cover_options({'mode': 'transcribe'})['mode'], 'transcribe')
+
+    def test_impossible_combinations_are_refused(self):
+        song = request_input({'style': 'pop', 'lyrics': 'la'})
+        off = request_input({'style': 'pop', 'lyrics': 'la', 'cot': 'off'})
+        score = request_input({'style': 'pop', 'abc': PLANNED})
+        with self.assertRaisesRegex(ValueError, 'chords'):
+            check_combination(song, cover_options({'keep_harmony': True}), None)
+        with self.assertRaisesRegex(ValueError, 'write a score first'):
+            check_combination(off, cover_options({'instrumental': True}), None)
+        with self.assertRaisesRegex(ValueError, 'tempo'):
+            check_combination(song, cover_options({'match_score_tempo': True}), None)
+        check_combination(score, cover_options({'keep_harmony': True}), None)
+        check_combination(song, cover_options({'keep_harmony': True}), 'https://example.invalid/a.mp3')
+        check_combination(song, cover_options({'instrumental': True, 'keep_harmony': True}), None)
+        check_combination(off, cover_options({}), None)
+
+    def test_features_are_advertised(self):
+        self.assertTrue({'keep-harmony', 'instrumental', 'transcribe', 'score-cache', 'length-guard'} <= set(FEATURES))
+
+
+class BackwardsCompatibilityTest(unittest.TestCase):
+    def test_recording_cover_renders_exactly_as_before(self):
+        # Before Part 295: inp['abc'] = transcription; inp['cot'] = 'melody'; render_song(pipe, inp, controls).
+        for extra in ({}, {'lora_key': 'yue2-loras/kids-step1200.pt', 'lora_scale': 0.8},
+                      {'weirdness': 90, 'steps': 48, 'guidance': 2.0}):
+            raw = dict(BOOTH_COVER, **extra)
+            inp, controls = request_input(raw), sound_controls(raw)
+            before = dict(inp, abc=TRANSCRIBED, cot='melody')
+            render, budget, facts, extras, notes = fixed_score_render(inp, cover_options(raw), TRANSCRIBED,
+                                                                      'recording', 72.6)
+            self.assertEqual(render, before)
+            self.assertIsNone(budget)
+            self.assertEqual(notes, [])
+            self.assertNotIn('transfer', extras)
+            self.assertEqual(render_song(Pipeline(), render, controls), render_song(Pipeline(), before, controls))
+            self.assertNotIn('max_tokens', render_song(Pipeline(), render, controls)[1]['semantic_sampling'])
+
+    def test_given_score_renders_exactly_as_before(self):
+        for cot in ('melody', 'full'):
+            raw = {'style': 'pop', 'lyrics': 'la la', 'abc': PLANNED, 'cot': cot, 'seed': 5}
+            inp = request_input(raw)
+            render, budget, _, _, notes = fixed_score_render(inp, cover_options(raw), inp['abc'], 'score')
+            self.assertEqual(render, inp)
+            self.assertIsNone(budget)
+            self.assertEqual(notes, [])
+
+    def test_score_facts_never_block_a_sung_cover(self):
+        broken = TRANSCRIBED.replace('K:Bb', 'K:A#')
+        inp = request_input(BOOTH_COVER)
+        render, budget, facts, extras, _ = fixed_score_render(inp, cover_options(BOOTH_COVER), broken, 'recording', 72.6)
+        self.assertEqual(render, dict(inp, abc=broken, cot='melody'))
+        self.assertEqual(facts, {})
+        self.assertIsNone(extras['lyric_fit'])
+
+
+class InstrumentalTest(unittest.TestCase):
+    def test_recording_becomes_an_upstream_instrumental(self):
+        raw = dict(BOOTH_COVER, instrumental=True)
+        render, budget, facts, extras, notes = fixed_score_render(request_input(raw), cover_options(raw),
+                                                                  TRANSCRIBED, 'recording', 72.6)
+        before, after = parse_abc(TRANSCRIBED), parse_abc(render['abc'])
+        self.assertEqual(after.voices['Vocal'].notes, [])
+        for note in before.voices['Vocal'].notes:
+            self.assertIn(note, after.voices['Ins'].notes)
+        self.assertEqual(after.bpm, before.bpm)
+        self.assertEqual(after.voices['Ins'].bars, before.voices['Ins'].bars)
+        self.assertEqual(render['lyrics'], TAGS)
+        self.assertEqual(render['lyrics'], lyric_tags(render['abc']))
+        self.assertEqual(render['style'], 'Instrumental, Warm soul ballad' + NO_SINGING)
+        self.assertEqual(render['cot'], 'melody')
+        self.assertEqual(extras['transfer']['vocal_notes_moved'], len(before.voices['Vocal'].notes))
+        self.assertFalse(extras['transfer']['chords_kept'])
+        self.assertEqual(budget, semantic_budget(72.6, facts['score_seconds']))
+        self.assertEqual(len(notes), 1)
+
+    def test_kept_harmony_renders_with_the_full_score(self):
+        raw = {'style': 'Piano trio', 'abc': PLANNED, 'instrumental': True, 'keep_harmony': True}
+        render, _, _, extras, notes = fixed_score_render(request_input(raw), cover_options(raw), PLANNED, 'score')
+        self.assertEqual(render['cot'], 'full')
+        self.assertEqual(harmony(parse_abc(render['abc']).voices['Vocal'].chords),
+                         harmony(parse_abc(PLANNED).voices['Vocal'].chords))
+        self.assertTrue(extras['transfer']['chords_kept'])
+        self.assertEqual(notes, [])
+
+    def test_a_score_keeps_its_chords_unless_told(self):
+        for keep, cot in ((None, 'full'), (False, 'melody')):
+            raw = {'style': 'Piano trio', 'abc': PLANNED, 'instrumental': True}
+            if keep is not None:
+                raw['keep_harmony'] = keep
+            render, _, _, _, _ = fixed_score_render(request_input(raw), cover_options(raw), PLANNED, 'score')
+            with self.subTest(keep=keep):
+                self.assertEqual(render['cot'], cot)
+
+    def test_yue2_plan_keeps_chords_and_words_only_guide_it(self):
+        raw = {'style': 'Banjo breakdown', 'lyrics': 'Down by the river', 'instrumental': True}
+        inp = request_input(raw)
+        self.assertEqual(planning_request(inp), dict(style='Instrumental, Banjo breakdown' + NO_SINGING,
+                                                     lyrics='Down by the river\n', cot='full', seed=42))
+        self.assertEqual(planning_request(request_input({'style': 'Banjo breakdown'}))['lyrics'], PLANNING_TAGS)
+        render, budget, _, _, notes = fixed_score_render(inp, cover_options(raw), PLANNED, 'YuE2')
+        self.assertEqual(render['cot'], 'full')
+        self.assertEqual(render['lyrics'], TAGS)
+        self.assertEqual(budget, semantic_budget(score_facts(PLANNED)['score_seconds']))
+        self.assertIn('guided', notes[0])
+
+    def test_style_prefix_and_suffix_match_upstream(self):
+        upstream = ('Instrumental, expressive chamber string ensemble, lyrical violin melody, warm viola and cello '
+                    'accompaniment, G major, 96 BPM, a repeated opening phrase followed by a short gentle ending, '
+                    'natural concert hall acoustics, no vocals, no singing, no choir, no spoken words.')
+        self.assertEqual(instrumental_style(upstream), upstream)
+        self.assertEqual(instrumental_style('Warm soul ballad.'), 'Instrumental, Warm soul ballad' + NO_SINGING)
+        self.assertEqual(instrumental_style('instrumental jazz trio, no vocals'),
+                         'instrumental jazz trio, no vocals, no singing, no choir, no spoken words.')
+
+    def test_unmovable_melody_is_a_plain_error_not_a_fallback(self):
+        raw = dict(BOOTH_COVER, instrumental=True)
+        broken = TRANSCRIBED.replace('K:Bb', 'K:A#')
+        with self.assertRaises(ValueError) as caught:
+            fixed_score_render(request_input(raw), cover_options(raw), broken, 'recording', 72.6)
+        self.assertEqual(str(caught.exception), UNMOVABLE['recording'])
+
+
+class LengthAndTempoTest(unittest.TestCase):
+    def test_budget_follows_the_report_with_headroom_and_caps(self):
+        self.assertEqual(semantic_budget(60), 1650)
+        self.assertEqual(semantic_budget(72.6, 75.9), 2088)
+        self.assertEqual(semantic_budget(None, 100), 2750)
+        self.assertEqual(semantic_budget(400), 9000)
+        self.assertEqual(semantic_budget(3), 200)
+        self.assertIsNone(semantic_budget())
+        self.assertIsNone(semantic_budget(None, None))
+
+    def test_budget_reaches_the_pipeline(self):
+        _, args = render_song(Pipeline(), {'seed': 1}, sound_controls({}), 2088)
+        self.assertEqual(args['semantic_sampling'], {'temperature': 1.0, 'max_tokens': 2088})
+
+    def test_guarded_cover_gets_a_budget(self):
+        raw = dict(BOOTH_COVER, keep_harmony=True)
+        render, budget, _, _, _ = fixed_score_render(request_input(raw), cover_options(raw), TRANSCRIBED, 'recording', 72.6)
+        self.assertEqual(render['cot'], 'full')
+        self.assertEqual(budget, 2088)
+
+    def test_tempo_names_the_score(self):
+        self.assertEqual(tempo_style('Soul ballad, 120 BPM, warm', 83), 'Soul ballad, 83 BPM, warm')
+        self.assertEqual(tempo_style('90bpm groove', 83), '83 BPM groove')
+        self.assertEqual(tempo_style('Soul ballad.', 83), 'Soul ballad, 83 BPM')
+        raw = dict(BOOTH_COVER, style='Soul ballad at 120 BPM', match_score_tempo=True)
+        render, _, _, _, _ = fixed_score_render(request_input(raw), cover_options(raw), TRANSCRIBED, 'recording', 72.6)
+        self.assertEqual(render['style'], 'Soul ballad at 83 BPM')
+        self.assertEqual(render['cot'], 'melody')
+
+
+class ScoreReportTest(unittest.TestCase):
+    def test_sections_tempo_key_and_length(self):
+        facts = score_facts(PLANNED)
+        self.assertEqual((facts['score_bpm'], facts['score_musical_key'], facts['score_meter']), (84, 'Bb', '3/4'))
+        self.assertEqual(facts['score_seconds'], 72.86)
+        self.assertEqual([(s['name'], s['bars'], s['sung_notes']) for s in facts['sections']],
+                         [('intro', 8, 5), ('verse', 18, 52), ('outro', 8, 0)])
+        self.assertEqual(score_facts('not a score'), {})
+
+    def test_lyric_fit_reports_without_blocking(self):
+        sections = score_facts(TRANSCRIBED)['sections']
+        fit = lyric_fit('[Verse 1]\nHold on to me, hold on tight\nAll the way home tonight\n[Chorus]\nLa', sections)
+        self.assertEqual(fit['sections'][0]['score_section'], 'verse')
+        self.assertEqual(fit['sections'][0]['sung_notes'], 56)
+        self.assertEqual(fit['sections'][0]['fit'], 'short')
+        self.assertEqual(fit['sections'][1]['fit'], 'no tune')
+        self.assertFalse(fit['same_order'])
+        self.assertTrue(lyric_fit('[Verse]\n' + 'la ' * 50, sections)['same_order'])
+        self.assertIsNone(lyric_fit('', sections))
+        self.assertIsNone(lyric_fit('words', []))
+
+
+class VendoredHelpersTest(unittest.TestCase):
+    # Upstream YuE ab2e5a3 skills/yue2-music/instrumental, as listed in its bundle-manifest.json.
+    UPSTREAM = {
+        'abc_tools.py': 'ea04b922dacebec7ad257a2f8d83bdb5dfecb7a23110c1a3121c5c41c313930e',
+        'common.py': '2929619bd37a176c87c37fdcde9864613d4d5172ca2d89d724aa450a4d7053be',
+        'compile_score.py': 'c4eec7f68e3f09b93b45d568a8af640b3f10bb47d31ef6d3b6ce4ae23ac1dea3',
+        'instrumentalize.py': 'a769111656f418cf4298841dc4a7f6be1a50bfae1e66b1bccfaca3eacf948681',
+        'LICENSE': '689d887cb61b76599b8bded2066dbd4cd728d5345533925585ee1270ae7315d1',
+    }
+
+    def test_helpers_are_upstream_verbatim(self):
+        folder = Path(__file__).resolve().parent / 'instrumental'
+        for name, digest in self.UPSTREAM.items():
+            with self.subTest(name=name):
+                self.assertEqual(hashlib.sha256((folder / name).read_bytes()).hexdigest(), digest)
+        import abc_tools
+        self.assertEqual(Path(abc_tools.__file__).resolve().parent, folder)
 
 
 if __name__ == '__main__':
