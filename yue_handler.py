@@ -3,8 +3,11 @@
 Part 295 adds upstream's official cover and instrumental recipe (YuE #202) as
 optional request fields: keep_harmony, instrumental, length_guard,
 match_score_tempo and mode. A request without them renders exactly as before.
-The lyric sync follow-up adds fit_lyrics, measure_fit and mode=measure
-(lyric_sync.py, align.py); a request without them also renders exactly as before."""
+The lyric sync follow-up adds fit_lyrics, measure_fit, fit_score_touchup and mode=measure
+(lyric_sync.py, align.py); a request without them also renders exactly as before, except that
+the lyric_fit report now pairs sections by name and meter_check reports a style whose meter
+contradicts the score."""
+import difflib
 import os
 import hashlib
 import json
@@ -31,10 +34,12 @@ STYLE = {'applied': None, 'plain': None}
 STYLE_KEY = re.compile(r'^yue2-loras/[A-Za-z0-9._-]{1,80}\.pt$')
 TAKE_KEY = re.compile(r'^yue2/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/master\.(?:wav|mp3)$')
 # What this worker can do; the booth checks this before offering an option.
-# lyric-sync: fit_lyrics="timing"; fit-score: measure_fit and mode="measure".
+# lyric-sync: fit_lyrics="timing"; fit-score: measure_fit and mode="measure"; score-touchup:
+# fit_score_touchup; lyric-fit-v2: lyric_fit rows paired by section name; meter-check: meter_check.
 FEATURES = ('keep-harmony', 'instrumental', 'transcribe', 'score-cache', 'length-guard',
-            'match-tempo', 'sections', 'lyric-fit', 'chord-check', 'lyric-sync', 'fit-score')
-ALIGN_REVISION = 'mmsfa-hdemucs-1'  # word timing cache revision (align.py's models and recipe)
+            'match-tempo', 'sections', 'lyric-fit', 'chord-check', 'lyric-sync', 'fit-score',
+            'score-touchup', 'lyric-fit-v2', 'meter-check')
+ALIGN_REVISION = 'mmsfa-star-hdemucs-2'  # word timing cache revision (align.py's models and recipe)
 TOKENS_PER_SECOND, TOKEN_CAP, TOKEN_FLOOR, GUARD_HEADROOM = 25, 9000, 200, 1.10
 NO_SINGING = ('no vocals', 'no singing', 'no choir', 'no spoken words')
 PLANNING_TAGS = '[Intro]\n\n[Verse]\n\n[Chorus]\n\n[Outro]\n'
@@ -53,6 +58,10 @@ CHORD_SYMBOL = re.compile(r'"[A-G][^"\n]*"')
 BPM = re.compile(r'\b\d{2,3}(?:\.\d+)?\s*bpm\b', re.I)
 TAG = re.compile(r'^\s*\[([^\]\n]+)\]\s*$')
 WORD = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)*")
+METER = re.compile(r'(?<![\d/])([1-9]|1[0-2])\s*/\s*(2|4|8|16)(?![\d/])')
+WALTZ = re.compile(r'\bwaltz', re.I)
+NOT_THE_TAKES_SCORE = ("That take's score is not one this recording was read into, so it cannot be scored "
+                       'against the recording.')
 
 
 def sound_controls(inp):
@@ -139,14 +148,22 @@ def sync_options(inp):
 
     fit_lyrics: "timing" re-breaks the lyric lines to the recording's phrases from measured
     word timing; her words and their order never change. measure_fit: after the render, time
-    the take's words too and score how well they sit on their notes (report only)."""
+    the take's words too and score how well they sit on their notes (report only).
+    fit_score_touchup (A/B only, with fit_lyrics): fold a quick lead-in note into the held note
+    after it where a held word would otherwise stretch over more notes than it has syllables."""
     fit = inp.get('fit_lyrics')
     if fit is not None and fit is not False and fit != 'timing':
         raise ValueError('fit_lyrics must be "timing" or false.')
     measure = inp.get('measure_fit')
     if measure is not None and type(measure) is not bool:
         raise ValueError('measure_fit must be true or false.')
-    return dict(fit_lyrics=fit == 'timing', measure_fit=bool(measure))
+    touchup = inp.get('fit_score_touchup')
+    if touchup is not None and type(touchup) is not bool:
+        raise ValueError('fit_score_touchup must be true or false.')
+    if touchup and fit != 'timing':
+        raise ValueError('fit_score_touchup needs fit_lyrics "timing": the score is touched up only where '
+                         'the fitted words need it.')
+    return dict(fit_lyrics=fit == 'timing', measure_fit=bool(measure), fit_score_touchup=bool(touchup))
 
 
 def check_sync(inp, options, sync, reference):
@@ -293,43 +310,102 @@ def sung_sections(sections, pickup=8):
 
 
 def lyric_fit(lyrics, sections):
-    """Report only, never blocks: each lyric section's words against the notes of its tune."""
+    """Report only, never blocks: each lyric section's words against the notes of its tune.
+
+    Sections are paired by name and order (difflib), so words under [Intro] where the
+    recording's intro has no sung tune are marked "no tune" instead of shifting every later
+    pair by one; sections whose names differ are paired in order within that stretch."""
     sung = sung_sections(sections)
     words = lyric_sections(lyrics)
     if not sung or not words:
         return None
-    rows = []
-    for index in range(max(len(sung), len(words))):
-        tune = sung[index] if index < len(sung) else None
-        text = words[index] if index < len(words) else None
-        row = dict(score_section=tune and tune['name'], lyrics_section=text and text['tag'],
+
+    def row(text, tune):
+        out = dict(score_section=tune and tune['name'], lyrics_section=text and text['tag'],
                    sung_notes=tune and tune['sung_notes'], syllables=text and text['syllables'])
         if tune and text:
             ratio = text['syllables'] / tune['sung_notes']
-            row['fit'] = 'short' if ratio < .6 else 'long' if ratio > 1.4 else 'close'
+            out['fit'] = 'short' if ratio < .6 else 'long' if ratio > 1.4 else 'close'
         else:
-            row['fit'] = 'no words' if tune else 'no tune'
-        rows.append(row)
+            out['fit'] = 'no words' if tune else 'no tune'
+        return out
+    names = [section_name(w['tag']) for w in words]
+    rows = []
+    for _, a0, a1, b0, b1 in difflib.SequenceMatcher(None, names, [s['name'] for s in sung],
+                                                     autojunk=False).get_opcodes():
+        pairs = min(a1 - a0, b1 - b0)
+        rows += [row(words[a0 + d], sung[b0 + d]) for d in range(pairs)]
+        rows += [row(words[a], None) for a in range(a0 + pairs, a1)]
+        rows += [row(None, sung[b]) for b in range(b0 + pairs, b1)]
     return dict(scope='rough syllable count against sung notes; a guide only', sections=rows,
-                same_order=[section_name(w['tag']) for w in words] == [s['name'] for s in sung])
+                same_order=names == [s['name'] for s in sung], paired='by section name and order')
+
+
+def meter_class(numerator, denominator):
+    """Compound (6/8, 9/8, 12/8), triple (3/4) or duple (2/4, 4/4, 2/2) feel."""
+    if denominator == 8 and numerator in (6, 9, 12):
+        return 'compound'
+    if numerator == 3:
+        return 'triple'
+    if numerator in (2, 4):
+        return 'duple'
+    return f'{numerator}/{denominator}'
+
+
+def meter_check(style, score_meter):
+    """When the style names a meter or feel the score's M: contradicts (upstream: describe
+    tempo and meter consistently), the two meters; otherwise None. A style of "6/8 feel" over a
+    4/4 score asks for triple accents on a straight grid, so phrasing can feel off the beat."""
+    if not style or not score_meter or not re.fullmatch(r'\d+/\d+', score_meter):
+        return None
+    theirs = meter_class(*map(int, score_meter.split('/')))
+    for match in METER.finditer(style):
+        numerator, denominator = int(match.group(1)), int(match.group(2))
+        if numerator < 2:
+            continue
+        if meter_class(numerator, denominator) != theirs:
+            return dict(style_meter=f'{numerator}/{denominator}', score_meter=score_meter)
+    if WALTZ.search(style) and theirs != 'triple':
+        return dict(style_meter='waltz', score_meter=score_meter)
+    return None
+
+
+def touchup_note(report):
+    """What fit_score_touchup changed, in words."""
+    places = len(report['places'])
+    return (f"The score was touched up in {places} place{'s' if places != 1 else ''}: a quick note leading "
+            'into a held note became part of it, so the held word keeps that note. The rest of the melody '
+            'is unchanged.')
 
 
 def apply_sync(inp, abc, sync, render, extras, notes):
     """Fix 1: her lyric lines re-broken to the recording's phrases (only when fit_lyrics asked),
-    and the timing plan kept for measure_fit. Pure: the timing was measured beforehand."""
-    result = lyric_sync.fit(abc, inp['lyrics'], sync.get('timing'), sync.get('words'), failed=sync.get('error'))
+    and the timing plan kept for measure_fit; fix 3 when fit_score_touchup asked. Pure: the
+    timing was measured beforehand. A failure here never stops the take: it renders her lines
+    as written."""
+    try:
+        result = lyric_sync.fit(abc, inp['lyrics'], sync.get('timing'), sync.get('words'), failed=sync.get('error'),
+                                touchup=bool(sync.get('touchup')))
+    except Exception as error:
+        print('Lyric sync fit failed:', type(error).__name__, flush=True)
+        result = lyric_sync.fit(abc, inp['lyrics'], None, None, failed='error')
     report = dict(result['report'], lyrics_fitted=False)
     if sync.get('fit'):
         notes.extend(result['notes'])
         if result['applied']:
             render['lyrics'] = result['lyrics']
             report['lyrics_fitted'] = True
+            if result.get('abc') and (report.get('score_touchup') or {}).get('applied'):
+                render['abc'] = result['abc']
+                notes.append(touchup_note(report['score_touchup']))
     elif not result['applied']:
         notes.append(f"This take could not be scored against the tune: {lyric_sync.REASONS[report['reason']]}.")
     words = lyric_sync.lyric_words(inp['lyrics'])[0]
-    order = result['order'] if report['lyrics_fitted'] else list(range(len(words)))
+    fitted = report['lyrics_fitted']
+    order = result['order'] if fitted else list(range(len(words)))
+    stars = result.get('line_ends') if fitted else lyric_sync.star_after(words)
     extras.update(lyric_sync=report, sync_plan=result['plan'], sync_order=order,
-                  sync_words=[words[i]['norm'] for i in order])
+                  sync_words=[words[i]['norm'] for i in order], sync_stars=stars)
 
 
 def fixed_score_render(inp, options, abc, origin, source_seconds=None, sync=None):
@@ -380,6 +456,7 @@ def fixed_score_render(inp, options, abc, origin, source_seconds=None, sync=None
         if sync is not None:
             apply_sync(inp, abc, sync, render, extras, notes)
         extras['lyric_fit'] = lyric_fit(render['lyrics'], facts.get('sections', []))
+    extras['meter_check'] = meter_check(render['style'], facts.get('score_meter'))
     budget = semantic_budget(source_seconds, facts.get('score_seconds')) if options['length_guard'] else None
     return render, budget, facts, extras, notes
 
@@ -524,7 +601,8 @@ def midi_timing(folder, abc):
         folder = Path(folder)
         midis = [(p.relative_to(folder).as_posix(), p.read_bytes()) for p in sorted(folder.rglob('*.mid'))]
         timing = lyric_sync.note_times(lyric_sync.score_plan(abc), midis)
-        return dict(timing, revision=lyric_sync.REVISION, abc_sha=hashlib.sha256(abc.encode('utf-8')).hexdigest()[:16])
+        return dict(timing, revision=lyric_sync.TIMING_REVISION,
+                    abc_sha=hashlib.sha256(abc.encode('utf-8')).hexdigest()[:16])
     except Exception as error:
         print('Note timing skipped:', type(error).__name__, str(error)[:200], flush=True)
         return None
@@ -535,7 +613,7 @@ def cached_timing(client, bucket, key, abc):
     try:
         timing = json.loads(client.get_object(Bucket=bucket, Key=key + '.timing.json')['Body'].read())
         if timing.get('abc_sha') == hashlib.sha256(abc.encode('utf-8')).hexdigest()[:16] \
-                and timing.get('revision') == lyric_sync.REVISION:
+                and timing.get('revision') == lyric_sync.TIMING_REVISION:
             return timing
     except Exception as error:
         if type(error).__name__ not in ('NoSuchKey', 'ClientError'):
@@ -551,17 +629,10 @@ def cache_timing(client, bucket, key, timing):
         print('Note timing cache write skipped:', type(error).__name__, flush=True)
 
 
-def read_recording(reference, td, task, client, bucket, want_timing=False):
-    """Download, check and transcribe a source recording, once per recording and task.
-
-    The score is cached in the private bucket by the recording's hash, the task
-    (melody or full) and the SheetSage2 revision, so takes 2 to 4 of a cover
-    skip transcription. Only the few-KB score is stored, never the audio. A fresh
-    transcription also caches its note timing (a few KB, from SheetSage2's MIDI);
-    a cached score's timing is read only when lyric sync asks for it."""
+def fetch_recording(reference, td):
+    """Download and decode a source recording once: (source path, decoded path, seconds)."""
     import soundfile as sf
     from auk_handler import ffmpeg, download
-    timing, began = {}, time.monotonic()
     source = Path(td) / 'source'
     download(reference, source)
     decoded = Path(td) / 'source.wav'
@@ -569,6 +640,21 @@ def read_recording(reference, td, task, client, bucket, want_timing=False):
     seconds = sf.info(decoded).duration
     if seconds > 360:
         raise ValueError('Use a source recording up to six minutes long.')
+    return source, decoded, seconds
+
+
+def read_recording(reference, td, task, client, bucket, want_timing=False, fetched=None, cache_only=False):
+    """Download, check and transcribe a source recording, once per recording and task.
+
+    The score is cached in the private bucket by the recording's hash, the task
+    (melody or full) and the SheetSage2 revision, so takes 2 to 4 of a cover
+    skip transcription. Only the few-KB score is stored, never the audio. A fresh
+    transcription also caches its note timing (a few KB, from SheetSage2's MIDI);
+    a cached score's timing is read only when lyric sync asks for it.
+    fetched: fetch_recording()'s result, to skip the download. cache_only: None instead of a
+    fresh transcription when nothing is cached for this task."""
+    timing, began = {}, time.monotonic()
+    source, decoded, seconds = fetched or fetch_recording(reference, td)
     timing['download_s'] = round(time.monotonic() - began, 1)
     key = score_cache_key(sha256(source), task)
     began = time.monotonic()
@@ -578,7 +664,7 @@ def read_recording(reference, td, task, client, bucket, want_timing=False):
         meta = json.loads(client.get_object(Bucket=bucket, Key=key + '.json')['Body'].read())
         timing['transcribe_s'] = round(time.monotonic() - began, 1)
         hit = dict(abc=abc, warnings=meta.get('warnings', []), cached=True, key=key,
-                   seconds=seconds, timing=timing, peak=None)
+                   seconds=seconds, timing=timing, peak=None, task=task)
     except Exception as error:
         if type(error).__name__ not in ('NoSuchKey', 'ClientError'):
             print('Score cache read skipped:', type(error).__name__, flush=True)
@@ -586,6 +672,8 @@ def read_recording(reference, td, task, client, bucket, want_timing=False):
         hit.update(source=source, decoded=decoded,
                    note_times=cached_timing(client, bucket, key, hit['abc']) if want_timing else None)
         return hit
+    if cache_only:
+        return None
     park_pipeline()
     score_dir = Path(td) / 'transcription'
     try:
@@ -614,21 +702,26 @@ def read_recording(reference, td, task, client, bucket, want_timing=False):
     if note_times and key:
         cache_timing(client, bucket, key, note_times)
     return dict(abc=abc, warnings=warnings, cached=False, key=key, seconds=seconds, timing=timing, peak=peak,
-                source=source, decoded=decoded, note_times=note_times)
+                source=source, decoded=decoded, note_times=note_times, task=task)
 
 
 class SyncError(Exception):
     """Word timing could not be measured; the take goes ahead with the lyrics as written."""
 
 
-def align_audio(path, words, td, tag):
+def align_audio(path, words, td, tag, stars=None):
     """GPU: time known words on a recording's vocal stem (align.py in the cover env).
-    words: aligner text per word (lyric_sync.aligner_text); returns align.py's result."""
+    words: aligner text per word (lyric_sync.aligner_text); stars: per word, whether vocals the
+    lyrics do not name (an ad-lib) may follow it (lyric_sync.star_after). Returns align.py's
+    result."""
     from auk_handler import ffmpeg
     raw, spec, out = Path(td) / f'{tag}.f32', Path(td) / f'{tag}-words.json', Path(td) / f'{tag}-timing.json'
     try:
         ffmpeg('-i', path, '-f', 'f32le', '-acodec', 'pcm_f32le', '-ac', 2, '-ar', 44100, raw)
-        spec.write_text(json.dumps({'words': words}))
+        body = {'words': words}
+        if stars is not None and len(stars) == len(words):
+            body['star_after'] = [bool(x) for x in stars]
+        spec.write_text(json.dumps(body))
         park_pipeline()
         subprocess.run(['/opt/cover/bin/python', '/app/align.py', str(raw), str(spec), str(out)],
                        env=cover_env(), check=True, timeout=600, capture_output=True)
@@ -685,7 +778,8 @@ def source_sync(read, lyrics, td, client, bucket, task):
             if type(error).__name__ not in ('NoSuchKey', 'ClientError'):
                 print('Word timing cache read skipped:', type(error).__name__, flush=True)
     try:
-        result = align_audio(read['source'], [w['norm'] for w in words], td, 'source')
+        result = align_audio(read['source'], [w['norm'] for w in words], td, 'source',
+                             stars=lyric_sync.star_after(words))
     except SyncError:
         state['error'] = 'align'
         return state
@@ -700,11 +794,30 @@ def source_sync(read, lyrics, td, client, bucket, task):
 
 
 def measure_take(path, extras, td):
-    """Fix 2: time the take's own words and score them against the recording's plan."""
-    take = align_audio(path, extras['sync_words'], td, 'take')
-    score = lyric_sync.measure(extras['sync_plan'], extras['sync_order'], take['words'])
+    """Fix 2: time the take's own words and score them against the recording's plan.
+
+    The take is aligned with the words it was given (take_words, or sync_words), in their own
+    line layout; take_positions picks the ones that are her words, in sync_order."""
+    take = align_audio(path, extras.get('take_words') or extras['sync_words'], td, 'take',
+                       stars=extras.get('take_stars') or extras.get('sync_stars'))
+    timed = take['words']
+    if extras.get('take_positions') is not None:
+        timed = [timed[p] for p in extras['take_positions']]
+    score = lyric_sync.measure(extras['sync_plan'], extras['sync_order'], timed)
     score['take_align'] = {k: take.get(k) for k in ('timing', 'peak_gib')}
     return score
+
+
+def safe_measure(path, extras, td, notes):
+    """measure_take for a finished take: any failure is a note, never a failed take."""
+    try:
+        return measure_take(path, extras, td)
+    except SyncError:
+        pass
+    except Exception as error:
+        print('Take scoring failed:', type(error).__name__, flush=True)
+    notes.append('This take could not be scored against the tune this time.')
+    return None
 
 
 def planning_request(inp):
@@ -759,7 +872,10 @@ def transcribe_only(job, inp, options, start):
 
 def measure_request(inp):
     """mode=measure: a finished take (take_key in the private bucket), the source recording it
-    covers and the lyrics it sang. Nothing is rendered."""
+    covers and her lyrics as written (the recording is timed against them). lyrics_used: the
+    lines the take was given when they differ (a fitted take's lyrics_used), in any layout.
+    cover_mode ("harmony" or "melody") narrows which of the recording's scores the take was
+    rendered from; by default the take's own score.abc decides. Nothing is rendered."""
     reference, take, lyrics = inp.get('reference_voice_url'), inp.get('take_key'), inp.get('lyrics')
     if not reference or not isinstance(reference, str) or len(reference) > 12000:
         raise ValueError('Scoring a take needs the source recording it covers. Import it again.')
@@ -767,28 +883,74 @@ def measure_request(inp):
         raise ValueError('That take is not available to score.')
     if not isinstance(lyrics, str) or len(lyrics) > 8000 or not lyric_sync.lyric_words(lyrics)[0]:
         raise ValueError('Scoring a take needs the lyrics it sang, up to 8000 characters.')
-    return reference, take, lyrics.strip()
+    used = inp.get('lyrics_used')
+    if used is not None and (not isinstance(used, str) or len(used) > 8000 or not lyric_sync.lyric_words(used)[0]):
+        raise ValueError('lyrics_used must be the words the take was given, up to 8000 characters.')
+    mode = inp.get('cover_mode')
+    if mode is not None and mode not in ('harmony', 'melody'):
+        raise ValueError('cover_mode must be "harmony" or "melody".')
+    return dict(reference=reference, take=take, lyrics=lyrics.strip(), lyrics_used=used.strip() if used else None,
+                cover_mode=mode)
+
+
+def take_score(client, bucket, take_key):
+    """The score a take was rendered from (score.abc beside its master), or None."""
+    try:
+        key = take_key.rsplit('/', 1)[0] + '/score.abc'
+        return client.get_object(Bucket=bucket, Key=key)['Body'].read().decode('utf-8')
+    except Exception as error:
+        if type(error).__name__ not in ('NoSuchKey', 'ClientError'):
+            print('Take score read skipped:', type(error).__name__, flush=True)
+        return None
+
+
+def measure_read(req, take_abc, td, client, bucket):
+    """The recording read into the score its take was rendered from: the recording's cached
+    full and melody scores (cover_mode narrows them) matched against the take's score.abc, as
+    it is or touched up (fit_score_touchup). Nothing is transcribed afresh unless the take has
+    no score of its own and was a harmony cover; a melody score is never transcribed here.
+    ValueError when the take's score is not one of this recording's."""
+    tasks = {'harmony': ['full'], 'melody': ['melody']}.get(req['cover_mode'], ['full', 'melody'])
+    fetched = fetch_recording(req['reference'], td)
+    for task in tasks:
+        read = read_recording(req['reference'], td, task, client, bucket, want_timing=True, fetched=fetched,
+                              cache_only=True)
+        if read and (take_abc is None or read['abc'].strip() == take_abc.strip()):
+            return dict(read, touched=False)
+        if read and lyric_sync.touched_from(read['abc'], take_abc):
+            return dict(read, touched=True)
+    if take_abc is not None or 'full' not in tasks:
+        raise ValueError(NOT_THE_TAKES_SCORE)
+    return read_recording(req['reference'], td, 'full', client, bucket, want_timing=True, fetched=fetched)
 
 
 def measure_only(job, inp, options, start):
     """mode=measure (fix 0 and 2 on a take that already exists): which words the take sang on
     the recording's held notes, and whether its phrases start after a pause. About the GPU cost
     of two word timings; the recording's side is cached for later takes."""
-    reference, take_key, lyrics = measure_request(inp)
+    req = measure_request(inp)
+    take_key, lyrics = req['take'], req['lyrics']
     import runpod
-    task = 'full' if options['keep_harmony'] else 'melody'
     with tempfile.TemporaryDirectory() as td:
         client, bucket = storage()
         runpod.serverless.progress_update(job, 'Timing the words of the recording')
         began = time.monotonic()
-        read = read_recording(reference, td, task, client, bucket, want_timing=True)
-        state = source_sync(read, lyrics, td, client, bucket, task)
+        take_abc = take_score(client, bucket, take_key)
+        read = measure_read(req, take_abc, td, client, bucket)
+        state = source_sync(read, lyrics, td, client, bucket, read['task'])
         sync_s = round(time.monotonic() - began, 1)
         inp_like = dict(lyrics=lyrics)
         extras, notes = {}, []
         apply_sync(inp_like, read['abc'], dict(state, fit=False, measure=True), dict(inp_like), extras, notes)
         report = extras['lyric_sync']
-        report.update(words_cached=state['words_cached'], source_align=state['align'])
+        report.update(words_cached=state['words_cached'], source_align=state['align'], score_task=read['task'],
+                      score_is_takes=take_abc is not None, score_touched=bool(read.get('touched')))
+        if req['lyrics_used'] and extras['sync_plan']:
+            order, positions = lyric_sync.sung_order(req['lyrics_used'], lyrics)
+            used = lyric_sync.lyric_words(req['lyrics_used'])[0]
+            extras.update(sync_order=order, take_positions=positions, take_words=[w['norm'] for w in used],
+                          take_stars=lyric_sync.star_after(used))
+            report['take_words'] = dict(given=len(used), hers=len(order))
         measure_s = None
         if extras['sync_plan']:
             runpod.serverless.progress_update(job, 'Timing the words of the take')
@@ -799,10 +961,7 @@ def measure_only(job, inp, options, start):
             except Exception as error:
                 print('Take download failed:', type(error).__name__, flush=True)
                 raise ValueError('That take is not available to score.') from None
-            try:
-                report.update(measure_take(local, extras, td))
-            except SyncError:
-                notes.append('This take could not be scored against the tune this time.')
+            report.update(safe_measure(local, extras, td, notes) or {})
             measure_s = round(time.monotonic() - began, 1)
         return {'engine': 'yue2', 'mode': 'measure', 'take_key': take_key, 'lyric_sync': report,
                 'worker_notes': notes, 'transcription_cached': read['cached'],
@@ -860,7 +1019,8 @@ def handler(job):
                 runpod.serverless.progress_update(job, 'Timing your words against the recording')
                 began = time.monotonic()
                 state = source_sync(read, inp['lyrics'], td, client, bucket, task)
-                sync = dict(state, fit=sync_opts['fit_lyrics'], measure=sync_opts['measure_fit'])
+                sync = dict(state, fit=sync_opts['fit_lyrics'], measure=sync_opts['measure_fit'],
+                            touchup=sync_opts['fit_score_touchup'])
                 timing['sync_s'] = round(time.monotonic() - began, 1)
             runpod.serverless.progress_update(job, 'Loading YuE2 and recording your song')
             load_began = time.monotonic()
@@ -920,10 +1080,7 @@ def handler(job):
             if sync is not None and sync['measure'] and extras.get('sync_plan'):
                 runpod.serverless.progress_update(job, 'Checking which words landed on the long notes')
                 began = time.monotonic()
-                try:
-                    extras['lyric_sync'].update(measure_take(wav, extras, td))
-                except SyncError:
-                    notes.append('This take could not be scored against the tune this time.')
+                extras['lyric_sync'].update(safe_measure(wav, extras, td, notes) or {})
                 timing['measure_s'] = round(time.monotonic() - began, 1)
             prefix = f'yue2/{uuid.uuid4()}'
             files = [(mp3, 'audio/mpeg'), (wav, 'audio/wav')]
@@ -953,6 +1110,7 @@ def handler(job):
                 'score_meter': facts.get('score_meter'), 'score_seconds': facts.get('score_seconds'),
                 'score_tokens': score_tokens, 'sections': facts.get('sections', []),
                 'lyric_fit': extras.get('lyric_fit'), 'transfer': extras.get('transfer'),
+                'meter_check': extras.get('meter_check'),
                 'semantic_budget_tokens': budget, 'worker_notes': notes, 'gpu': gpu_name(),
                 'memory': {'render_peak_gib': render_peak, 'transcribe_peak_gib': read['peak'] if read else None},
                 'features': list(FEATURES)})
