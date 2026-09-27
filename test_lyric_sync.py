@@ -719,7 +719,7 @@ V: Ins clef=treble name="Ins Melody" snm="Inst."
 K:C
 % verse
 V: Vocal
-c4c4d4e4|f8z8|
+c4B4d4e4|f8z8|
 V: Ins
 Z2|
 % chorus
@@ -871,7 +871,7 @@ class HandlerRoundTwoTest(unittest.TestCase):
         render, _, _, extras, notes = Y.fixed_score_render(inp, Y.cover_options(cover), TOUCH, 'recording', 20.0, sync=state)
         self.assertNotEqual(render['abc'], TOUCH)
         self.assertEqual(len(S.parse_abc(render['abc']).voices['Vocal'].notes), 15)
-        self.assertIn('touched up in 1 place:', notes[-1])
+        self.assertIn('touched up in 1 place so each held word lands on its long note', notes[-1])
         state['touchup'] = False
         render, _, _, extras, notes = Y.fixed_score_render(inp, Y.cover_options(cover), TOUCH, 'recording', 20.0, sync=state)
         self.assertEqual(render['abc'], TOUCH)
@@ -969,6 +969,91 @@ class StarTokenTest(unittest.TestCase):
         self.assertEqual(align.targets([[1], [1], [2], [3], []], S.star_after(words), 9),
                          ([9, 1, 1, 9, 2, 9, 3, 9], [None, 0, 1, None, 2, None, 3, None]))
         self.assertEqual(align.targets([[1], [2]]), ([1, 2], [0, 1]))           # no stars: exactly the round-1 targets
+
+
+# ---- Round 3 (review): each fix on invented lyrics. ----
+
+class RoundThreeTest(unittest.TestCase):
+    def test_clear_words_stay_in_a_phrase_with_too_few_notes(self):
+        # Eight notes, a short rest, then five notes that SheetSage2 wrote for fourteen clearly heard
+        # words (a stretch it transcribed thinly): those words stay in their phrase. Unclear words
+        # still follow the count and stop near 1.4 syllables per note.
+        notes = fake_notes([(k, 1, 60 + k) for k in range(8)] + [(8.5 + k, 1, 70 + k) for k in range(5)])
+        plan = dict(notes=notes, phrases=[dict(first=0, last=7, count=8, section=0),
+                                          dict(first=8, last=12, count=5, section=0)])
+        words, _ = S.lyric_words('[Verse]\n' + ' '.join(['la'] * 5) + '\n' + ' '.join(['la'] * 14))
+        onset = [k + 0.03 for k in range(5)] + [8.53 + 5.0 * k / 14 for k in range(14)]
+        self.assertEqual(S._assign(plan, words, list(range(19)), onset, [1.0] * 19), [(0, 5), (5, 19)])
+        self.assertEqual(S._assign(plan, words, list(range(19)), onset, [1.0] * 5 + [0.3] * 14)[0], (0, 11))
+
+    def test_a_repeat_note_is_no_way_onto_a_held_note(self):
+        # A word heard after a quick same-pitch repeat note ended does not take that note (and with
+        # it the held note after it) ...
+        quick = fake_notes([(0, 1, 60), (1, 1, 62), (2, 0.5, 62), (2.5, 2, 64), (4.5, 1, 65)])
+        self.assertEqual(S._snap(quick, 0, 4, [0.0, 1.0, 2.8], [1, 1, 1], [1, 1, 1]), [0, 1, 4])
+        # ... and a word heard a second inside a held note never takes it, even when the held note
+        # repeats the pitch before it.
+        held = fake_notes([(0, 1, 60), (1, 1, 62), (2, 3, 62), (5, 1, 64)])
+        self.assertEqual(S._snap(held, 0, 3, [0.0, 1.0, 3.0], [1, 1, 1], [1, 1, 1]), [0, 1, 3])
+        # Heard inside a quick repeat note, it still may (SheetSage2 split one sung pitch).
+        repeat = fake_notes([(0, 1, 60), (1, 1, 60), (2, 1, 64)])
+        self.assertEqual(S._snap(repeat, 0, 2, [0.0, 1.3], [1, 1], [1, 1]), [0, 1])
+
+    def test_a_shared_layout_never_runs_backwards(self):
+        # Two choruses with the same words; the second's tune lacks the first's third note, so two
+        # of the source's starts land on one note of the second. Starts must still rise in order.
+        words, sections = S.lyric_words('[Chorus]\nsun moon star sky\n[Chorus]\nsun moon star sky\n')
+        notes = fake_notes([(0, 1, 60), (1, 1, 62), (2, 1, 64), (3, 1, 65), (4, 1, 67),
+                            (6, 1, 60), (7, 1, 62), (8, 1, 65), (9, 1, 67)])
+        plan = dict(notes=notes, phrases=[dict(first=0, last=4, count=5, section=0),
+                                          dict(first=5, last=8, count=4, section=1)])
+        heard = dict(start=0.0, end=0.1, score=0.9, quiet_before=0.0)
+        times = [heard] * 4 + [dict(heard, score=0.05)] * 4
+        start = [0, 1, 2, 2, 5, 6, 7, 8]
+        rows, copied = S._repeats(words, sections, list(range(8)), start, plan, times, {0: True, 1: False})
+        self.assertTrue(rows[0]['disagreements'][0]['shared'])
+        self.assertEqual(start, sorted(start))
+        self.assertEqual(start[4:], [5, 6, 7, 7])
+        self.assertTrue(all(n < len(notes) for n in start))
+
+    def test_the_lead_in_is_tied_so_the_held_word_lands_on_its_note(self):
+        # Two one-syllable words over two same-pitch quick notes, then the held word over its own
+        # note and a slide into the held note: four notes before it for two syllables. The slide
+        # folds and the same-pitch pair is tied, so one syllable per note reaches the held note.
+        score = TOUCH.replace('z4g2a2b3a1g4-', 'z4g2g2b3a1g4-')
+        plan, timing, times = touch_times(score)
+        result = S.fit(score, TOUCH_LYRICS, timing, times, touchup=True)
+        touch = result['report']['score_touchup']
+        self.assertEqual((touch['folds'], touch['ties'], touch['lead_in_ties']), (1, 0, 1))
+        self.assertEqual([p['kind'] for p in touch['places']], ['slide', 'lead-in tie'])
+        self.assertEqual((touch['notes_before'], touch['notes_after']), (16, 14))
+        self.assertTrue(S.touched_from(score, result['abc']))
+        before = [(on, p) for on, p, _ in S.parse_abc(score).voices['Vocal'].notes]
+        after = S.parse_abc(result['abc']).voices['Vocal'].notes
+        chorus = next(n for n, (on, p, d) in enumerate(after) if on == before[5][0])
+        self.assertEqual([p for _, p, _ in after[chorus:chorus + 3]], [before[5][1], before[7][1], before[9][1]])
+        # The tied pair starts where the first of it did; the held note now starts where its slide did.
+        self.assertEqual([on for on, _, _ in after[chorus:chorus + 3]], [before[5][0], before[7][0], before[8][0]])
+        # A two-syllable word over its two notes is never tied when nothing is extra (the fixture's
+        # verse: its held word's own quick note cannot fold and no same-pitch pair is there).
+        plain = S.fit(TOUCH, TOUCH_LYRICS, *touch_times(TOUCH)[1:], touchup=True)['report']['score_touchup']
+        self.assertEqual(plain['lead_in_ties'], 0)
+
+    def test_an_unexpected_timing_failure_renders_her_lines(self):
+        # A recording read without its decoded audio: the SheetSage2 re-read fails with a KeyError,
+        # which source_sync does not expect. The take goes ahead with her lines as written.
+        read = dict(note_times=None, key=None, abc=SCORE, source='s')
+        with self.assertRaises(KeyError):
+            Y.source_sync(read, COVER['lyrics'], '/tmp', Bucket(), 'b', 'full')
+        state = Y.safe_source_sync(read, COVER['lyrics'], '/tmp', Bucket(), 'b', 'full')
+        self.assertEqual(state, dict(timing=None, words=None, error='error', words_cached=False, align=None))
+        inp = Y.request_input(COVER)
+        render, _, _, extras, notes = Y.fixed_score_render(inp, Y.cover_options(COVER), SCORE, 'recording', 50.0,
+                                                           sync=dict(state, fit=True, measure=True))
+        self.assertEqual(render['lyrics'], inp['lyrics'])
+        self.assertEqual(extras['lyric_sync']['reason'], 'error')
+        self.assertIsNone(extras['sync_plan'])
+        self.assertIn('kept as written', notes[-1])
 
 
 if __name__ == '__main__':

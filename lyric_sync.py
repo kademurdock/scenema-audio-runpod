@@ -16,11 +16,14 @@ Round 2 (after Kade's ear): a word starts only on a note onset, never deep insid
 held note belongs to the word that reaches it; sections with the same words and tune share one
 layout taken from the instance heard most clearly; a section whose words were mostly not heard
 keeps her own lines; her line breaks inside a phrase stay unless a phrase end is within two
-words; no fitted line grows past her longest line.
+words; no fitted line grows past her longest line. Round 3 (review): words heard clearly inside
+a phrase stay there even where SheetSage2 wrote too few notes for them, and a word heard deep
+inside a held note never takes it, even when the held note repeats the pitch before it.
 
 measure() scores a finished take against the same plan: did each held note keep its word,
-and does each phrase start after a pause. It never changes a take. touch_up() optionally folds
-a quick lead-in note into the held note after it (A/B only) so a held word has one note fewer.
+and does each phrase start after a pause. It never changes a take. touch_up() optionally (A/B
+only) folds a quick slide into the held note after it and ties same-pitch lead-in notes, so a
+phrase has as many notes before a held note as syllables sung before it.
 
 Standard library only, plus the vendored upstream parser. Reports carry counts and indices,
 never lyric text; only fit()'s `lyrics` field holds her words, for the render itself."""
@@ -37,7 +40,7 @@ sys.path.append(str(Path(__file__).resolve().parent / 'instrumental'))
 from abc_tools import NATURAL, TOKEN, parse_abc  # noqa: E402
 from instrumentalize import section_starts  # noqa: E402
 
-REVISION = 2                  # the fit's own rules (reports carry it)
+REVISION = 3                  # the fit's own rules (reports carry it)
 TIMING_REVISION = 1           # note_times() output, cached per score; unchanged since round 1
 PHRASE_GAP = Fraction(1, 2)   # a rest of an eighth note or longer ends a phrase
 CLAUSE_HOLD = Fraction(3)     # a note of three beats or more sung straight on ends a clause: a comma
@@ -49,7 +52,8 @@ TIME_WEIGHT = 4.0             # cost per second a word's onset sits outside its 
 COUNT_WEIGHT = 0.2            # light pull toward as many rough syllables as notes
 LOW_WEIGHT_BOOST = 4.0        # that pull grows up to five-fold where the words were not clearly heard
 MAX_PER_NOTE = 1.4            # syllables per note a phrase takes before its words look misplaced
-OVERFULL = 5.0                # cost per syllable over that
+OVERFULL = 5.0                # cost per syllable over that, where the words were not clearly heard
+OVERFULL_FLOOR = 0.25         # and the share of it that still applies where they were
 MIX = 3.0                     # cost of one phrase singing the end of one of her sections and the start of the next
 LOW_SCORE = 0.15              # aligner confidence below this is "not clearly heard"
 UNHEARD_WEIGHT = 0.3          # how far an unclear word's own aligned time is trusted (a clear one: 1)
@@ -409,15 +413,17 @@ def _assign(plan, words, sung, onset, weight):
     """Sung words (in order) to phrases (in order): the fewest seconds of onsets outside their
     phrase, plus a pull toward as many syllables as notes. The pull is light where the words
     were heard clearly and up to five times stronger where they were not, and a phrase cannot
-    take much more than MAX_PER_NOTE syllables per note. A phrase that sings words of two of
+    take much more than MAX_PER_NOTE syllables per note unless its words were heard clearly
+    there (a stretch SheetSage2 wrote too few notes for). A phrase that sings words of two of
     her sections costs MIX, so unclear words do not drift across her section tags. None when
     impossible."""
     notes, phrases = plan['notes'], plan['phrases']
     P, W = len(phrases), len(sung)
     lo = [notes[p['first']]['s'] - LEAD for p in phrases]
     hi = [notes[p['last']]['s'] + LEAD for p in phrases]
-    syl, pull, mixed = [0], [0.0], [0]
+    syl, pull, mixed, unclear = [0], [0.0], [0], [0.0]
     for k, i in enumerate(sung):
+        unclear.append(unclear[-1] + (1.0 - weight[k]))
         syl.append(syl[-1] + words[i]['syllables'])
         pull.append(pull[-1] + COUNT_WEIGHT * (1.0 + LOW_WEIGHT_BOOST * (1.0 - weight[k])))
         mixed.append(mixed[-1] + (k > 0 and words[i]['section'] != words[sung[k - 1]]['section']))
@@ -446,7 +452,10 @@ def _assign(plan, words, sung, onset, weight):
                 size = syl[k + 1] - syl[i]
                 weight_here = (pull[k + 1] - pull[i]) / (k + 1 - i)
                 over = max(0.0, size - max(MAX_PER_NOTE * count, count + 1))
-                cost = (here + timing + weight_here * mismatch(size, count) + OVERFULL * over
+                # Overfull is weighed by how unclear the group's words are: words heard clearly
+                # inside a phrase stay there even where SheetSage2 wrote too few notes for them.
+                share = max(OVERFULL_FLOOR, (unclear[k + 1] - unclear[i]) / (k + 1 - i))
+                cost = (here + timing + weight_here * mismatch(size, count) + OVERFULL * share * over
                         + MIX * (mixed[k + 1] - mixed[i + 1]))
                 if cost < best[k + 1][j + 1]:
                     best[k + 1][j + 1], back[k + 1][j + 1] = cost, i
@@ -486,7 +495,10 @@ def _snap(notes, first, last, ts, ws, syls):
                 return 0.0
             return FORCED_SHARE + TIME_WEIGHT * ws[k] * (s - t if t < s else t - e)
         cost = TIME_WEIGHT * ws[k] * abs(t - s)
-        if t - s > SNAP and not _repeat_note(notes, first + n):
+        # The same-pitch exception covers a word heard inside a quick repeat note only: never a
+        # word heard after that note ended, and never a held note (it belongs to the word that
+        # reaches it).
+        if t - s > SNAP and not (t <= e + SNAP and note['dur'] < HELD and _repeat_note(notes, first + n)):
             cost += REFUSE * ws[k]
         return cost
 
@@ -639,10 +651,9 @@ def _repeats(words, sections, sung, start, plan, times, trusted):
             ks = m['positions']
             mapping, ratio = _note_map(src_notes, [(n, notes[n]['pitch']) for n in m['notes']])
             moved = [mapping[start[s]] for s in source['positions']]
-            for r in range(1, len(moved)):  # starts rise wherever the source's rise
+            for r in range(1, len(moved)):  # starts rise wherever the source's rise, and never fall
                 src_rises = start[source['positions'][r]] > start[source['positions'][r - 1]]
-                if src_rises and moved[r] <= moved[r - 1]:
-                    moved[r] = moved[r - 1] + 1
+                moved[r] = max(moved[r], moved[r - 1] + 1 if src_rises else moved[r - 1])
             fits = (ratio >= REPEAT_MATCH and moved[-1] <= m['notes'][-1]
                     and (ks[0] == 0 or start[ks[0] - 1] < moved[0])
                     and (ks[-1] + 1 >= len(start) or moved[-1] < start[ks[-1] + 1]))
@@ -1084,12 +1095,17 @@ def _merge_note(abc, index):
 
 
 def touch_up(abc, plan, groups, start, own, fitted, words, sung):
-    """Fix 3 (A/B only): where a held word reaches its held note over more lead-in notes than it
-    has syllables, fold the touching note before the held note into it when it only repeats the
-    held pitch (a tie: the melody is unchanged) or is a sixteenth-note slide into it (the slide's
-    pitch goes). Each fold leaves the word one note fewer, as YuE2's own songs set it. Only in
-    fitted sections; every change is checked with the native parser, which must find every other
-    note, bar, chord and the Ins voice unchanged. Returns (new score or None, report)."""
+    """Fix 3 (A/B only): where a phrase has more notes before a held note than syllables sung
+    before it, so that one syllable per note would put the next word on the held note (her
+    chorus: two words over four quick notes before the held word), remove the extra onsets:
+    1. the held word's own quick notes before the held note fold into it when they only repeat
+       the held pitch (a tie: the melody is unchanged) or are a sixteenth-note slide into it
+       (the slide's pitch goes);
+    2. then touching same-pitch notes before the held word's first note, among the two words
+       before it, are tied into one (every pitch stays; one re-attack goes).
+    Never a word's own first note after its start, never another held note. Only in fitted
+    sections; every change is checked with the native parser, which must find every other note,
+    bar, chord and the Ins voice unchanged. Returns (new score or None, report)."""
     notes = plan['notes']
     merges, taken = [], set()
     for j, group in enumerate(groups):
@@ -1098,22 +1114,36 @@ def touch_up(abc, plan, groups, start, own, fitted, words, sung):
         phrase = plan['phrases'][j]
         for n in range(phrase['first'], phrase['last'] + 1):
             k = own.get(n)
-            if notes[n]['dur'] < HELD or k is None or not fitted[k] or start[k] >= n:
+            if notes[n]['dur'] < HELD or k is None or not fitted[k] or start[k] > n:
                 continue
-            extra = (n - start[k]) - max(words[sung[k]]['syllables'] - 1, 0)
+            place = dict(section=plan['sections'][phrase['section']]['name'], phrase=j, held_note=n - phrase['first'])
+            lead = [x for x in range(group[0], k) if start[x] >= phrase['first']]
+            extra = ((n - phrase['first']) - sum(words[sung[x]]['syllables'] for x in lead)
+                     - max(words[sung[k]]['syllables'] - 1, 0))
             m, target = n - 1, n
-            # Never the word's own first note (its syllable's attack) and never another held note.
             while extra > 0 and m > start[k] and own.get(m) == k and m not in taken and notes[m]['dur'] < HELD:
                 touching = notes[m]['on'] + notes[m]['dur'] == notes[target]['on']
                 if not touching or not (notes[m]['pitch'] == notes[n]['pitch'] or notes[m]['dur'] <= SLIDE):
                     break
-                merges.append(dict(note=m, kind='tie' if notes[m]['pitch'] == notes[n]['pitch'] else 'slide',
-                                   section=plan['sections'][phrase['section']]['name'], phrase=j,
-                                   held_note=n - phrase['first']))
+                merges.append(dict(place, note=m, kind='tie' if notes[m]['pitch'] == notes[n]['pitch'] else 'slide'))
                 taken.add(m)
                 extra -= 1
                 target, m = m, m - 1
-    report = dict(applied=False, ties=0, folds=0, notes_before=len(notes), notes_after=len(notes), places=[])
+            window = [x for x in lead[-2:] if fitted[x]]
+            if extra <= 0 or not window:
+                continue
+            for m in range(start[k] - 2, start[window[0]] - 1, -1):  # tie note m onto note m + 1
+                if extra <= 0:
+                    break
+                a, b = notes[m], notes[m + 1]
+                if (m in taken or m + 1 in taken or a['dur'] >= HELD or b['dur'] >= HELD
+                        or a['pitch'] != b['pitch'] or a['on'] + a['dur'] != b['on']):
+                    continue
+                merges.append(dict(place, note=m, kind='lead-in tie'))
+                taken.add(m)
+                extra -= 1
+    report = dict(applied=False, ties=0, folds=0, lead_in_ties=0, notes_before=len(notes), notes_after=len(notes),
+                  places=[])
     if not merges:
         report['reason'] = 'nothing to touch up'
         return None, report
@@ -1126,7 +1156,7 @@ def touch_up(abc, plan, groups, start, own, fitted, words, sung):
         if new is None:
             continue
         text = new
-        report['ties' if merge['kind'] == 'tie' else 'folds'] += 1
+        report[{'tie': 'ties', 'slide': 'folds'}.get(merge['kind'], 'lead_in_ties')] += 1
         report['places'].append(dict(section=merge['section'], phrase=merge['phrase'], held_note=merge['held_note'],
                                      kind=merge['kind']))
     if text == abc:

@@ -373,9 +373,9 @@ def meter_check(style, score_meter):
 def touchup_note(report):
     """What fit_score_touchup changed, in words."""
     places = len(report['places'])
-    return (f"The score was touched up in {places} place{'s' if places != 1 else ''}: a quick note leading "
-            'into a held note became part of it, so the held word keeps that note. The rest of the melody '
-            'is unchanged.')
+    return (f"The score was touched up in {places} place{'s' if places != 1 else ''} so each held word lands on "
+            'its long note: a quick note sliding into it, or two quick notes of the same pitch before it, '
+            'became one note. The rest of the melody is unchanged.')
 
 
 def apply_sync(inp, abc, sync, render, extras, notes):
@@ -793,6 +793,16 @@ def source_sync(read, lyrics, td, client, bucket, task):
     return state
 
 
+def safe_source_sync(read, lyrics, td, client, bucket, task):
+    """source_sync for a take about to render: an unexpected failure is a reason (the take
+    renders her lines as written), never a failed take."""
+    try:
+        return source_sync(read, lyrics, td, client, bucket, task)
+    except Exception as error:
+        print('Lyric sync timing failed:', type(error).__name__, flush=True)
+        return dict(timing=None, words=None, error='error', words_cached=False, align=None)
+
+
 def measure_take(path, extras, td):
     """Fix 2: time the take's own words and score them against the recording's plan.
 
@@ -1018,7 +1028,7 @@ def handler(job):
             if wants_sync:
                 runpod.serverless.progress_update(job, 'Timing your words against the recording')
                 began = time.monotonic()
-                state = source_sync(read, inp['lyrics'], td, client, bucket, task)
+                state = safe_source_sync(read, inp['lyrics'], td, client, bucket, task)
                 sync = dict(state, fit=sync_opts['fit_lyrics'], measure=sync_opts['measure_fit'],
                             touchup=sync_opts['fit_score_touchup'])
                 timing['sync_s'] = round(time.monotonic() - began, 1)
