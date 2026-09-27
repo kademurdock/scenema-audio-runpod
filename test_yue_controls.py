@@ -5,7 +5,7 @@ from pathlib import Path
 from yue_handler import sound_controls, render_song, request_input, style_request
 from yue_handler import (cover_options, check_combination, fixed_score_render, instrumental_style, lyric_tags,
                          tempo_style, semantic_budget, score_facts, lyric_fit, planning_request, PLANNING_TAGS,
-                         FEATURES, UNMOVABLE)
+                         FEATURES, UNMOVABLE, NO_CHORDS, score_has_chords)
 from abc_tools import parse_abc
 
 
@@ -360,9 +360,14 @@ class LengthAndTempoTest(unittest.TestCase):
         self.assertEqual(args['semantic_sampling'], {'temperature': 1.0, 'max_tokens': 2088})
 
     def test_guarded_cover_gets_a_budget(self):
+        # PLANNED stands in for SheetSage2's full transcription: melody plus chord symbols.
         raw = dict(BOOTH_COVER, keep_harmony=True)
-        render, budget, _, _, _ = fixed_score_render(request_input(raw), cover_options(raw), TRANSCRIBED, 'recording', 72.6)
+        render, budget, _, _, notes = fixed_score_render(request_input(raw), cover_options(raw), PLANNED, 'recording', 72.6)
         self.assertEqual(render['cot'], 'full')
+        self.assertEqual(budget, semantic_budget(72.6, 72.86))
+        self.assertEqual(notes, [])
+        raw = dict(BOOTH_COVER, match_score_tempo=True)
+        _, budget, _, _, _ = fixed_score_render(request_input(raw), cover_options(raw), TRANSCRIBED, 'recording', 72.6)
         self.assertEqual(budget, 2088)
 
     def test_tempo_names_the_score(self):
@@ -373,6 +378,59 @@ class LengthAndTempoTest(unittest.TestCase):
         render, _, _, _, _ = fixed_score_render(request_input(raw), cover_options(raw), TRANSCRIBED, 'recording', 72.6)
         self.assertEqual(render['style'], 'Soul ballad at 83 BPM')
         self.assertEqual(render['cot'], 'melody')
+
+
+class ChordCheckTest(unittest.TestCase):
+    """Keeping chords needs chords. A cappella, or a voice sung into a phone, transcribes
+    without any; upstream refuses cot=full for such a score, so it renders as the melody cover."""
+
+    def test_score_has_chords(self):
+        self.assertTrue(score_has_chords(PLANNED))
+        self.assertFalse(score_has_chords(TRANSCRIBED))
+        # A key label upstream's parser cannot read falls back to a plain look for chord symbols.
+        self.assertTrue(score_has_chords(PLANNED.replace('K:Bb', 'K:A#')))
+        self.assertFalse(score_has_chords(TRANSCRIBED.replace('K:Bb', 'K:A#')))
+        self.assertFalse(score_has_chords(''))
+
+    def test_recording_without_chords_renders_as_the_melody_cover(self):
+        raw = dict(BOOTH_COVER, keep_harmony=True)
+        inp = request_input(raw)
+        render, budget, facts, extras, notes = fixed_score_render(inp, cover_options(raw), TRANSCRIBED, 'recording', 72.6)
+        self.assertEqual(render, dict(inp, abc=TRANSCRIBED, cot='melody'))
+        self.assertEqual(notes, [NO_CHORDS['recording']])
+        self.assertEqual(budget, 2088)  # the length guard still applies
+        self.assertIsNotNone(extras['lyric_fit'])
+        self.assertEqual(facts['score_bpm'], 83)
+
+    def test_score_without_chords_renders_from_its_melody(self):
+        raw = {'style': 'pop', 'lyrics': 'la la', 'abc': TRANSCRIBED, 'keep_harmony': True}
+        inp = request_input(raw)
+        render, _, _, _, notes = fixed_score_render(inp, cover_options(raw), inp['abc'], 'score')
+        self.assertEqual(render['cot'], 'melody')
+        self.assertEqual(notes, [NO_CHORDS['score']])
+        raw['abc'] = PLANNED
+        inp = request_input(raw)
+        render, _, _, _, notes = fixed_score_render(inp, cover_options(raw), inp['abc'], 'score')
+        self.assertEqual(render['cot'], 'full')
+        self.assertEqual(notes, [])
+
+    def test_unreadable_scores_never_fail_a_sung_cover(self):
+        raw = dict(BOOTH_COVER, keep_harmony=True)
+        for abc, cot in ((PLANNED.replace('K:Bb', 'K:A#'), 'full'), (TRANSCRIBED.replace('K:Bb', 'K:A#'), 'melody')):
+            with self.subTest(cot=cot):
+                render, _, facts, _, _ = fixed_score_render(request_input(raw), cover_options(raw), abc, 'recording', 72.6)
+                self.assertEqual(render['cot'], cot)
+                self.assertEqual(facts, {})
+
+    def test_chordless_instrumental_still_uses_melody(self):
+        raw = dict(BOOTH_COVER, instrumental=True, keep_harmony=True)
+        render, _, _, extras, notes = fixed_score_render(request_input(raw), cover_options(raw), TRANSCRIBED, 'recording', 72.6)
+        self.assertEqual(render['cot'], 'melody')
+        self.assertFalse(extras['transfer']['chords_kept'])
+        self.assertIn(NO_CHORDS['recording'], notes)
+
+    def test_feature_is_advertised(self):
+        self.assertIn('chord-check', FEATURES)
 
 
 class ScoreReportTest(unittest.TestCase):

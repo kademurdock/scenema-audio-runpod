@@ -27,7 +27,7 @@ STYLE = {'applied': None, 'plain': None}
 STYLE_KEY = re.compile(r'^yue2-loras/[A-Za-z0-9._-]{1,80}\.pt$')
 # What this worker can do; the booth checks this before offering an option.
 FEATURES = ('keep-harmony', 'instrumental', 'transcribe', 'score-cache', 'length-guard',
-            'match-tempo', 'sections', 'lyric-fit')
+            'match-tempo', 'sections', 'lyric-fit', 'chord-check')
 TOKENS_PER_SECOND, TOKEN_CAP, TOKEN_FLOOR, GUARD_HEADROOM = 25, 9000, 200, 1.10
 NO_SINGING = ('no vocals', 'no singing', 'no choir', 'no spoken words')
 PLANNING_TAGS = '[Intro]\n\n[Verse]\n\n[Chorus]\n\n[Outro]\n'
@@ -37,6 +37,12 @@ UNMOVABLE = {
     'score': "This score's melody could not be moved onto an instrument. Try a sung version, or another score.",
     'YuE2': "YuE2's score for this instrumental could not be moved onto an instrument. Try another seed.",
 }
+# Keeping chords needs chords: a cappella or a voice into a phone transcribes without any.
+NO_CHORDS = {
+    'recording': 'No chords were heard in this recording, so its melody was used with a new accompaniment.',
+    'score': 'This score has no chord symbols, so its melody was used with a new accompaniment.',
+}
+CHORD_SYMBOL = re.compile(r'"[A-G][^"\n]*"')
 BPM = re.compile(r'\b\d{2,3}(?:\.\d+)?\s*bpm\b', re.I)
 TAG = re.compile(r'^\s*\[([^\]\n]+)\]\s*$')
 WORD = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)*")
@@ -193,6 +199,17 @@ def score_facts(abc):
         return {}
 
 
+def score_has_chords(abc):
+    """Whether the score's Vocal voice carries chord symbols (upstream picks cot=full only then).
+
+    A score upstream's parser cannot read falls back to a plain look for quoted
+    chord symbols, so this never blocks a render."""
+    try:
+        return bool(parse_abc(abc).voices['Vocal'].chords)
+    except (ValueError, KeyError, TypeError, IndexError, ZeroDivisionError):
+        return bool(CHORD_SYMBOL.search(abc or ''))
+
+
 def syllables(word):
     """Rough English syllable count: vowel groups, less a silent final e, at least one."""
     word = word.lower()
@@ -285,6 +302,8 @@ def fixed_score_render(inp, options, abc, origin, source_seconds=None):
         chords = bool(parse_abc(converted).voices['Vocal'].chords)
         render.update(abc=converted, lyrics=lyric_tags(converted), style=instrumental_style(style),
                       cot='full' if chords else 'melody')
+        if options['keep_harmony'] and not chords:
+            notes.append(NO_CHORDS['recording' if origin == 'recording' else 'score'])
         extras['transfer'] = dict(vocal_notes_moved=check['vocal_notes_before'],
                                   original_ins_notes=check['original_ins_notes'],
                                   unaltered_ins_notes=check['unaltered_ins_notes'],
@@ -296,10 +315,15 @@ def fixed_score_render(inp, options, abc, origin, source_seconds=None):
                          else "An instrumental sings no words, so the score's section names replaced your lyrics.")
     else:
         render['style'] = style
-        if origin == 'recording':
-            render['cot'] = 'full' if options['keep_harmony'] else 'melody'
-        elif options['keep_harmony']:
-            render['cot'] = 'full'
+        if options['keep_harmony']:
+            # Upstream refuses cot=full for a score without chords; render it as the melody cover instead.
+            if score_has_chords(abc):
+                render['cot'] = 'full'
+            else:
+                render['cot'] = 'melody'
+                notes.append(NO_CHORDS['recording' if origin == 'recording' else 'score'])
+        elif origin == 'recording':
+            render['cot'] = 'melody'
         extras['lyric_fit'] = lyric_fit(inp['lyrics'], facts.get('sections', []))
     budget = semantic_budget(source_seconds, facts.get('score_seconds')) if options['length_guard'] else None
     return render, budget, facts, extras, notes
@@ -524,7 +548,7 @@ def transcribe_only(job, inp, options, start):
         return {'engine': 'yue2', 'mode': 'transcribe', 'abc': read['abc'], 'score_key': key + '.abc',
                 'score_url': client.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': key + '.abc'},
                                                            ExpiresIn=604800),
-                'cover_mode': 'harmony' if options['keep_harmony'] else 'melody',
+                'cover_mode': 'harmony' if options['keep_harmony'] and score_has_chords(read['abc']) else 'melody',
                 'score_bpm': facts.get('score_bpm'), 'score_musical_key': facts.get('score_musical_key'),
                 'score_meter': facts.get('score_meter'), 'score_seconds': facts.get('score_seconds'),
                 'sections': facts.get('sections', []), 'source_seconds': round(read['seconds'], 2),
@@ -643,7 +667,8 @@ def handler(job):
                       'timing': {'cover_s': cover_s, 'model_load_s': load_s, 'render_s': render_s, **timing}}
             output.update({
                 'mode': 'render', 'instrumental': options['instrumental'], 'score_origin': origin,
-                'cover_mode': ('harmony' if options['keep_harmony'] else 'melody') if reference else None,
+                # What was rendered, not what was asked: chords are kept only when the score has them.
+                'cover_mode': ('harmony' if render['cot'] == 'full' else 'melody') if reference else None,
                 'transcription_cached': read['cached'] if read else None,
                 'source_seconds': round(read['seconds'], 2) if read else None,
                 'source_score_key': prefix+'/source-score.abc' if (work/'source-score.abc').exists() else None,
