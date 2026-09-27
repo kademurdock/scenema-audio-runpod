@@ -305,20 +305,36 @@ def mismatch(syllable_count, notes):
     return (3.0 if diff > 0 else 1.0) * diff * diff / max(notes, 1)
 
 
-def sections_without_tune(sections, plan):
-    """Her sections paired by name and order with the score's (difflib); a pair whose score
-    section owns no phrase has no sung tune in the recording, such as words under [Intro]
-    where the recording's intro is instrumental."""
+def sections_without_tune(sections, plan, words=None, times=None):
+    """Her sections paired by name and order with the score's (difflib) whose score section
+    owns no phrase, such as words under [Intro] where the recording's intro is instrumental.
+
+    Returns (set aside, kept): a paired section is kept after all when most of its words are
+    heard clearly on the tune's phrases, as when a song's last line is written under [Outro]
+    but SheetSage2 transcribed its notes inside the verse. Needs plan notes with times ('s',
+    'e') for that check; without words and times every such pair is set aside."""
     hers = [s for s in sections if s['words'] and s['name']]
     theirs = plan['sections']
     matcher = difflib.SequenceMatcher(None, [s['name'] for s in hers], [s['name'] for s in theirs], autojunk=False)
-    out = set()
+    spans = [(plan['notes'][p['first']].get('s'), plan['notes'][p['last']].get('e')) for p in plan['phrases']]
+    aside, kept = set(), set()
     for op, a0, a1, b0, b1 in matcher.get_opcodes():
-        if op == 'equal':
-            for a, b in zip(range(a0, a1), range(b0, b1)):
-                if not theirs[b]['phrases']:
-                    out.add(hers[a]['index'])
-    return out
+        if op != 'equal':
+            continue
+        for a, b in zip(range(a0, a1), range(b0, b1)):
+            if theirs[b]['phrases']:
+                continue
+            index, on_tune = hers[a]['index'], 0
+            for i, word in enumerate(words or []):
+                t = times[i] if times and i < len(times) else None
+                if word['section'] != index or not t or (t.get('score') or 0) < LOW_SCORE:
+                    continue
+                start = t.get('start')
+                if isinstance(start, (int, float)) and any(
+                        s is not None and s - 1.0 <= start <= e + 1.0 for s, e in spans):
+                    on_tune += 1
+            (kept if on_tune * 2 > hers[a]['words'] else aside).add(index)
+    return aside, kept
 
 
 def _onsets(words, sung, times):
@@ -466,14 +482,15 @@ def fit(abc, lyrics, timing, word_times, failed=None):
     for note, (start, end) in zip(plan['notes'], timing['notes']):
         note['s'], note['e'] = start, max(end, start)
     report['note_timing'] = dict(matched=timing.get('matched'), source=timing.get('source'))
-    aside = sections_without_tune(sections, plan)
+    times = word_times or []
+    aside, kept_by_timing = sections_without_tune(sections, plan, words, times)
     sung = [i for i, w in enumerate(words) if w['section'] not in aside]
     report['words_without_tune'] = [dict(section=s['name'], words=s['words'],
                                          lines=len({w['line'] for w in words if w['section'] == s['index']}))
                                     for s in sections if s['index'] in aside]
+    report['sections_sung_elsewhere'] = len(kept_by_timing)
     if not sung:
         return refuse('empty')
-    times = word_times or []
     heard = sum(1 for i in sung if i < len(times) and times[i] and (times[i].get('score') or 0) >= LOW_SCORE)
     report['words'] = dict(sung=len(sung), heard=heard, set_aside=len(words) - len(sung))
     if heard < MIN_HEARD * len(sung):

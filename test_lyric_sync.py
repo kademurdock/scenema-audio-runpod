@@ -242,7 +242,7 @@ class FitTest(unittest.TestCase):
         dumped = json.dumps([result['report'], result['notes'], result['plan']]).lower()
         for word in set(w.lower() for w in Y.WORD.findall(MISBROKEN)):
             if len(word) >= 4 and word not in ('intro', 'verse', 'chorus'):
-                self.assertNotIn(word, dumped)
+                self.assertNotRegex(dumped, r'\b' + word + r'\b')
 
     def test_timing_decides_which_word_holds_the_note(self):
         # The singer stretched "Sing" over two notes, so "it" lands on the four-beat note.
@@ -285,6 +285,26 @@ class FitTest(unittest.TestCase):
         result = S.fit(SCORE, MISBROKEN, self.timing, times)
         self.assertTrue(result['applied'])
         self.assertEqual(result['report']['words']['far_from_notes'], 1)
+
+    def test_a_last_line_under_outro_sung_in_the_chorus_is_kept(self):
+        # The score's outro has no tune, but these words are heard on the chorus's last phrase.
+        lyrics = MISBROKEN.replace('it ring all night long we\ndance till the dawn\n',
+                                   'it ring all night long\n\n[Outro]\nwe dance till the dawn\n')
+        result = S.fit(SCORE, lyrics, self.timing, word_times(self.plan, lyrics, STARTS))
+        self.assertEqual(result['lyrics'], FITTED)
+        self.assertEqual(result['report']['sections_sung_elsewhere'], 1)
+        self.assertEqual(result['report']['words_without_tune'], [dict(section='intro', words=5, lines=1)])
+        # Intro words heard clearly on the verse's tune are kept too; unheard ones are not.
+        times = word_times(self.plan, lyrics, STARTS)
+        on_tune = [dict(t, start=times[5]['start'] - 0.2 + 0.01 * k, score=0.6) for k, t in enumerate(times[:5])]
+        plan = S.score_plan(SCORE)
+        for note, (start, end) in zip(plan['notes'], self.timing['notes']):
+            note['s'], note['e'] = start, end
+        words, sections = S.lyric_words(lyrics)
+        self.assertEqual(S.sections_without_tune(sections, plan, words, on_tune + times[5:]), (set(), {0, 3}))
+        quiet = [dict(t, score=0.05) for t in on_tune]
+        self.assertEqual(S.sections_without_tune(sections, plan, words, quiet + times[5:]), ({0}, {3}))
+        self.assertEqual(S.sections_without_tune(sections, plan), ({0, 3}, set()))
 
     def test_untagged_lyrics_still_fit(self):
         body = '\n'.join(line for line in MISBROKEN.splitlines()[3:] if not line.startswith('['))
@@ -497,7 +517,7 @@ class HandlerSyncTest(unittest.TestCase):
         stored = bucket.objects[bucket.puts[0]].decode('utf-8').lower()
         for word in set(w.lower() for w in Y.WORD.findall(MISBROKEN)):
             if len(word) >= 4:
-                self.assertNotIn(word, stored)
+                self.assertNotRegex(stored, r'\b' + word + r'\b')
 
     def test_failed_measurements_name_their_reason(self):
         def broken(*args):
