@@ -181,8 +181,7 @@ class Base(unittest.TestCase):
         return path
 
     def run_job(self, req, audio=None, index=True):
-        work = os.path.join(self.td, "work")
-        os.makedirs(work, exist_ok=True)
+        work = tempfile.mkdtemp(prefix="work-", dir=self.td)  # a fresh folder per job, as each worker job gets
         said = []
         out = voice_pipeline.run(req, audio or self.song_file(), os.path.join(self.td, "m.pth"),
                                  os.path.join(self.td, "m.index") if index else None, work, self.runner(), progress=said.append)
