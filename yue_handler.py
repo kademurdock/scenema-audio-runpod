@@ -2,8 +2,11 @@
 
 Part 295 adds upstream's official cover and instrumental recipe (YuE #202) as
 optional request fields: keep_harmony, instrumental, length_guard,
-match_score_tempo and mode. A request without them renders exactly as before."""
+match_score_tempo and mode. A request without them renders exactly as before.
+The lyric sync follow-up adds fit_lyrics, measure_fit and mode=measure
+(lyric_sync.py, align.py); a request without them also renders exactly as before."""
 import os
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -21,13 +24,17 @@ sys.path.append(str(Path(__file__).resolve().parent / 'instrumental'))
 from abc_tools import parse_abc  # noqa: E402
 from common import sha256  # noqa: E402
 from instrumentalize import convert_score, section_starts  # noqa: E402
+import lyric_sync  # noqa: E402
 
 PIPE = None
 STYLE = {'applied': None, 'plain': None}
 STYLE_KEY = re.compile(r'^yue2-loras/[A-Za-z0-9._-]{1,80}\.pt$')
+TAKE_KEY = re.compile(r'^yue2/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/master\.(?:wav|mp3)$')
 # What this worker can do; the booth checks this before offering an option.
+# lyric-sync: fit_lyrics="timing"; fit-score: measure_fit and mode="measure".
 FEATURES = ('keep-harmony', 'instrumental', 'transcribe', 'score-cache', 'length-guard',
-            'match-tempo', 'sections', 'lyric-fit', 'chord-check')
+            'match-tempo', 'sections', 'lyric-fit', 'chord-check', 'lyric-sync', 'fit-score')
+ALIGN_REVISION = 'mmsfa-hdemucs-1'  # word timing cache revision (align.py's models and recipe)
 TOKENS_PER_SECOND, TOKEN_CAP, TOKEN_FLOOR, GUARD_HEADROOM = 25, 9000, 200, 1.10
 NO_SINGING = ('no vocals', 'no singing', 'no choir', 'no spoken words')
 PLANNING_TAGS = '[Intro]\n\n[Verse]\n\n[Chorus]\n\n[Outro]\n'
@@ -112,7 +119,7 @@ def cover_options(inp):
     when a new field is used). match_score_tempo: the style names the score's BPM.
     mode: render (default) or transcribe (read the melody only, no song)."""
     mode = inp.get('mode', 'render')
-    if not isinstance(mode, str) or mode not in ('render', 'transcribe'):
+    if not isinstance(mode, str) or mode not in ('render', 'transcribe', 'measure'):
         raise ValueError('That kind of request is not available on this music worker yet.')
 
     def flag(key):
@@ -124,6 +131,33 @@ def cover_options(inp):
     new_shape = bool(keep or instrumental or tempo)
     return dict(mode=mode, keep_harmony=keep, instrumental=bool(instrumental),
                 length_guard=new_shape if guard is None else guard, match_score_tempo=bool(tempo))
+
+
+def sync_options(inp):
+    """Lyric sync fields (SYNC_DESIGN.md fixes 1 and 2), both optional. Leaving them out keeps
+    today's request exactly.
+
+    fit_lyrics: "timing" re-breaks the lyric lines to the recording's phrases from measured
+    word timing; her words and their order never change. measure_fit: after the render, time
+    the take's words too and score how well they sit on their notes (report only)."""
+    fit = inp.get('fit_lyrics')
+    if fit is not None and fit is not False and fit != 'timing':
+        raise ValueError('fit_lyrics must be "timing" or false.')
+    measure = inp.get('measure_fit')
+    if measure is not None and type(measure) is not bool:
+        raise ValueError('measure_fit must be true or false.')
+    return dict(fit_lyrics=fit == 'timing', measure_fit=bool(measure))
+
+
+def check_sync(inp, options, sync, reference):
+    if not (sync['fit_lyrics'] or sync['measure_fit']):
+        return
+    if options['instrumental']:
+        raise ValueError('An instrumental sings no words, so there are no lyrics to fit to its tune.')
+    if not reference:
+        raise ValueError('Fitting words to the tune needs the source recording they were sung to.')
+    if not lyric_sync.lyric_words(inp['lyrics'])[0]:
+        raise ValueError('Add the words to sing before fitting them to the tune.')
 
 
 def check_combination(inp, options, reference):
@@ -280,9 +314,28 @@ def lyric_fit(lyrics, sections):
                 same_order=[section_name(w['tag']) for w in words] == [s['name'] for s in sung])
 
 
-def fixed_score_render(inp, options, abc, origin, source_seconds=None):
+def apply_sync(inp, abc, sync, render, extras, notes):
+    """Fix 1: her lyric lines re-broken to the recording's phrases (only when fit_lyrics asked),
+    and the timing plan kept for measure_fit. Pure: the timing was measured beforehand."""
+    result = lyric_sync.fit(abc, inp['lyrics'], sync.get('timing'), sync.get('words'), failed=sync.get('error'))
+    report = dict(result['report'], lyrics_fitted=False)
+    if sync.get('fit'):
+        notes.extend(result['notes'])
+        if result['applied']:
+            render['lyrics'] = result['lyrics']
+            report['lyrics_fitted'] = True
+    elif not result['applied']:
+        notes.append(f"This take could not be scored against the tune: {lyric_sync.REASONS[report['reason']]}.")
+    words = lyric_sync.lyric_words(inp['lyrics'])[0]
+    order = result['order'] if report['lyrics_fitted'] else list(range(len(words)))
+    extras.update(lyric_sync=report, sync_plan=result['plan'], sync_order=order,
+                  sync_words=[words[i]['norm'] for i in order])
+
+
+def fixed_score_render(inp, options, abc, origin, source_seconds=None, sync=None):
     """The exact request YuE2 renders once its score is fixed: a recording's
     transcription, a given score or a YuE2 plan. Pure: no GPU, files or network.
+    sync: the recording's measured timing when fit_lyrics or measure_fit was asked.
 
     Returns (render request, semantic token budget or None, score facts, extras, notes)."""
     render, extras, notes = dict(inp, abc=abc), {}, []
@@ -324,7 +377,9 @@ def fixed_score_render(inp, options, abc, origin, source_seconds=None):
                 notes.append(NO_CHORDS['recording' if origin == 'recording' else 'score'])
         elif origin == 'recording':
             render['cot'] = 'melody'
-        extras['lyric_fit'] = lyric_fit(inp['lyrics'], facts.get('sections', []))
+        if sync is not None:
+            apply_sync(inp, abc, sync, render, extras, notes)
+        extras['lyric_fit'] = lyric_fit(render['lyrics'], facts.get('sections', []))
     budget = semantic_budget(source_seconds, facts.get('score_seconds')) if options['length_guard'] else None
     return render, budget, facts, extras, notes
 
@@ -451,12 +506,59 @@ def score_cache_key(digest, task):
     return f'yue2-scores/{digest}/{task}-{revision}'
 
 
-def read_recording(reference, td, task, client, bucket):
+def cover_env():
+    return {**os.environ, 'LD_LIBRARY_PATH': '/opt/cover/lib', 'PATH': '/opt/cover/bin:' + os.environ['PATH']}
+
+
+def run_sheetsage(decoded, out_dir, task):
+    subprocess.run(['/opt/cover/bin/python', '/app/cover.py', str(decoded), str(out_dir), task],
+                   env=cover_env(), check=True, timeout=600, capture_output=True)
+
+
+def midi_timing(folder, abc):
+    """Real times of abc's sung notes from the MIDI SheetSage2 wrote beside it, or None.
+
+    SheetSage2 writes its melody MIDI (real seconds) with every transcription; the score
+    itself only has beats on one steady tempo, which drifts from the recording."""
+    try:
+        folder = Path(folder)
+        midis = [(p.relative_to(folder).as_posix(), p.read_bytes()) for p in sorted(folder.rglob('*.mid'))]
+        timing = lyric_sync.note_times(lyric_sync.score_plan(abc), midis)
+        return dict(timing, revision=lyric_sync.REVISION, abc_sha=hashlib.sha256(abc.encode('utf-8')).hexdigest()[:16])
+    except Exception as error:
+        print('Note timing skipped:', type(error).__name__, str(error)[:200], flush=True)
+        return None
+
+
+def cached_timing(client, bucket, key, abc):
+    """A cached score's note timing, when it was made for exactly this score."""
+    try:
+        timing = json.loads(client.get_object(Bucket=bucket, Key=key + '.timing.json')['Body'].read())
+        if timing.get('abc_sha') == hashlib.sha256(abc.encode('utf-8')).hexdigest()[:16] \
+                and timing.get('revision') == lyric_sync.REVISION:
+            return timing
+    except Exception as error:
+        if type(error).__name__ not in ('NoSuchKey', 'ClientError'):
+            print('Note timing cache read skipped:', type(error).__name__, flush=True)
+    return None
+
+
+def cache_timing(client, bucket, key, timing):
+    try:
+        client.put_object(Bucket=bucket, Key=key + '.timing.json', ContentType='application/json',
+                          Body=json.dumps(timing).encode('utf-8'))
+    except Exception as error:
+        print('Note timing cache write skipped:', type(error).__name__, flush=True)
+
+
+def read_recording(reference, td, task, client, bucket, want_timing=False):
     """Download, check and transcribe a source recording, once per recording and task.
 
     The score is cached in the private bucket by the recording's hash, the task
     (melody or full) and the SheetSage2 revision, so takes 2 to 4 of a cover
-    skip transcription. Only the few-KB score is stored, never the audio."""
+    skip transcription. Only the few-KB score is stored, never the audio. A fresh
+    transcription also caches its note timing (a few KB, from SheetSage2's MIDI);
+    a cached score's timing is read only when lyric sync asks for it."""
     import soundfile as sf
     from auk_handler import ffmpeg, download
     timing, began = {}, time.monotonic()
@@ -470,21 +572,24 @@ def read_recording(reference, td, task, client, bucket):
     timing['download_s'] = round(time.monotonic() - began, 1)
     key = score_cache_key(sha256(source), task)
     began = time.monotonic()
+    hit = None
     try:
         abc = client.get_object(Bucket=bucket, Key=key + '.abc')['Body'].read().decode('utf-8')
         meta = json.loads(client.get_object(Bucket=bucket, Key=key + '.json')['Body'].read())
         timing['transcribe_s'] = round(time.monotonic() - began, 1)
-        return dict(abc=abc, warnings=meta.get('warnings', []), cached=True, key=key,
-                    seconds=seconds, timing=timing, peak=None)
+        hit = dict(abc=abc, warnings=meta.get('warnings', []), cached=True, key=key,
+                   seconds=seconds, timing=timing, peak=None)
     except Exception as error:
         if type(error).__name__ not in ('NoSuchKey', 'ClientError'):
             print('Score cache read skipped:', type(error).__name__, flush=True)
+    if hit:
+        hit.update(source=source, decoded=decoded,
+                   note_times=cached_timing(client, bucket, key, hit['abc']) if want_timing else None)
+        return hit
     park_pipeline()
     score_dir = Path(td) / 'transcription'
-    env = {**os.environ, 'LD_LIBRARY_PATH': '/opt/cover/lib', 'PATH': '/opt/cover/bin:'+os.environ['PATH']}
     try:
-        subprocess.run(['/opt/cover/bin/python', '/app/cover.py', str(decoded), str(score_dir), task],
-                       env=env, check=True, timeout=600, capture_output=True)
+        run_sheetsage(decoded, score_dir, task)
         abc = (score_dir/'score.abc').read_text()
         warnings = json.loads((score_dir/'warnings.json').read_text())
     except (subprocess.SubprocessError, OSError, ValueError) as error:
@@ -505,7 +610,101 @@ def read_recording(reference, td, task, client, bucket):
     except Exception as error:
         print('Score cache write skipped:', type(error).__name__, flush=True)
         key = None
-    return dict(abc=abc, warnings=warnings, cached=False, key=key, seconds=seconds, timing=timing, peak=peak)
+    note_times = midi_timing(score_dir, abc)
+    if note_times and key:
+        cache_timing(client, bucket, key, note_times)
+    return dict(abc=abc, warnings=warnings, cached=False, key=key, seconds=seconds, timing=timing, peak=peak,
+                source=source, decoded=decoded, note_times=note_times)
+
+
+class SyncError(Exception):
+    """Word timing could not be measured; the take goes ahead with the lyrics as written."""
+
+
+def align_audio(path, words, td, tag):
+    """GPU: time known words on a recording's vocal stem (align.py in the cover env).
+    words: aligner text per word (lyric_sync.aligner_text); returns align.py's result."""
+    from auk_handler import ffmpeg
+    raw, spec, out = Path(td) / f'{tag}.f32', Path(td) / f'{tag}-words.json', Path(td) / f'{tag}-timing.json'
+    try:
+        ffmpeg('-i', path, '-f', 'f32le', '-acodec', 'pcm_f32le', '-ac', 2, '-ar', 44100, raw)
+        spec.write_text(json.dumps({'words': words}))
+        park_pipeline()
+        subprocess.run(['/opt/cover/bin/python', '/app/align.py', str(raw), str(spec), str(out)],
+                       env=cover_env(), check=True, timeout=600, capture_output=True)
+        result = json.loads(out.read_text())
+    except (subprocess.SubprocessError, OSError, ValueError) as error:
+        detail = ''
+        try:
+            detail = json.loads(out.read_text()).get('error', '')
+        except Exception:
+            pass
+        tail = getattr(error, 'stderr', None) or b''
+        print('Word timing failed:', type(error).__name__, detail, tail[-1200:].decode('utf-8', 'replace'), flush=True)
+        raise SyncError(detail or type(error).__name__) from None
+    finally:
+        raw.unlink(missing_ok=True)
+    if len(result.get('words') or []) != len(words):
+        raise SyncError('word count')
+    return result
+
+
+def source_sync(read, lyrics, td, client, bucket, task):
+    """The recording's measured timing for lyric sync. Never raises.
+
+    Note times come from the score cache (or one SheetSage2 re-read of a score cached before
+    timing was kept, about 15 s of GPU once per recording). Word times come from align.py on
+    the recording, cached per recording and lyrics, so takes 2 to 4 cost nothing extra.
+    Returns dict(timing, words, error, words_cached, align); error is a lyric_sync.REASONS key."""
+    state = dict(timing=read.get('note_times'), words=None, error=None, words_cached=False, align=None)
+    if state['timing'] is None:
+        folder = Path(td) / 'retime'
+        park_pipeline()
+        try:
+            run_sheetsage(read['decoded'], folder, task)
+            state['timing'] = midi_timing(folder, read['abc'])
+        except (subprocess.SubprocessError, OSError) as error:
+            tail = getattr(error, 'stderr', None) or b''
+            print('SheetSage2 re-read failed:', type(error).__name__, tail[-800:].decode('utf-8', 'replace'), flush=True)
+        if state['timing'] and read.get('key'):
+            cache_timing(client, bucket, read['key'], state['timing'])
+    if state['timing'] is None:
+        state['error'] = 'notes'
+        return state
+    words = lyric_sync.lyric_words(lyrics)[0]
+    words_key = None
+    if read.get('key'):
+        digest = hashlib.sha256(lyrics.encode('utf-8')).hexdigest()[:16]
+        words_key = f"{read['key'].rsplit('/', 1)[0]}/words-{digest}-{ALIGN_REVISION}.json"
+        try:
+            cached = json.loads(client.get_object(Bucket=bucket, Key=words_key)['Body'].read())
+            if len(cached.get('words') or []) == len(words):
+                state.update(words=cached['words'], words_cached=True)
+                return state
+        except Exception as error:
+            if type(error).__name__ not in ('NoSuchKey', 'ClientError'):
+                print('Word timing cache read skipped:', type(error).__name__, flush=True)
+    try:
+        result = align_audio(read['source'], [w['norm'] for w in words], td, 'source')
+    except SyncError:
+        state['error'] = 'align'
+        return state
+    state.update(words=result['words'], align={k: result.get(k) for k in ('timing', 'peak_gib', 'device')})
+    if words_key:
+        try:
+            client.put_object(Bucket=bucket, Key=words_key, ContentType='application/json', Body=json.dumps(
+                dict(words=result['words'], revision=ALIGN_REVISION)).encode('utf-8'))
+        except Exception as error:
+            print('Word timing cache write skipped:', type(error).__name__, flush=True)
+    return state
+
+
+def measure_take(path, extras, td):
+    """Fix 2: time the take's own words and score them against the recording's plan."""
+    take = align_audio(path, extras['sync_words'], td, 'take')
+    score = lyric_sync.measure(extras['sync_plan'], extras['sync_order'], take['words'])
+    score['take_align'] = {k: take.get(k) for k in ('timing', 'peak_gib')}
+    return score
 
 
 def planning_request(inp):
@@ -558,6 +757,61 @@ def transcribe_only(job, inp, options, start):
                 'gpu': gpu_name(), 'memory': {'transcribe_peak_gib': read['peak']}, 'features': list(FEATURES)}
 
 
+def measure_request(inp):
+    """mode=measure: a finished take (take_key in the private bucket), the source recording it
+    covers and the lyrics it sang. Nothing is rendered."""
+    reference, take, lyrics = inp.get('reference_voice_url'), inp.get('take_key'), inp.get('lyrics')
+    if not reference or not isinstance(reference, str) or len(reference) > 12000:
+        raise ValueError('Scoring a take needs the source recording it covers. Import it again.')
+    if not isinstance(take, str) or not TAKE_KEY.match(take):
+        raise ValueError('That take is not available to score.')
+    if not isinstance(lyrics, str) or len(lyrics) > 8000 or not lyric_sync.lyric_words(lyrics)[0]:
+        raise ValueError('Scoring a take needs the lyrics it sang, up to 8000 characters.')
+    return reference, take, lyrics.strip()
+
+
+def measure_only(job, inp, options, start):
+    """mode=measure (fix 0 and 2 on a take that already exists): which words the take sang on
+    the recording's held notes, and whether its phrases start after a pause. About the GPU cost
+    of two word timings; the recording's side is cached for later takes."""
+    reference, take_key, lyrics = measure_request(inp)
+    import runpod
+    task = 'full' if options['keep_harmony'] else 'melody'
+    with tempfile.TemporaryDirectory() as td:
+        client, bucket = storage()
+        runpod.serverless.progress_update(job, 'Timing the words of the recording')
+        began = time.monotonic()
+        read = read_recording(reference, td, task, client, bucket, want_timing=True)
+        state = source_sync(read, lyrics, td, client, bucket, task)
+        sync_s = round(time.monotonic() - began, 1)
+        inp_like = dict(lyrics=lyrics)
+        extras, notes = {}, []
+        apply_sync(inp_like, read['abc'], dict(state, fit=False, measure=True), dict(inp_like), extras, notes)
+        report = extras['lyric_sync']
+        report.update(words_cached=state['words_cached'], source_align=state['align'])
+        measure_s = None
+        if extras['sync_plan']:
+            runpod.serverless.progress_update(job, 'Timing the words of the take')
+            began = time.monotonic()
+            local = Path(td) / ('take' + Path(take_key).suffix)
+            try:
+                client.download_file(bucket, take_key, str(local))
+            except Exception as error:
+                print('Take download failed:', type(error).__name__, flush=True)
+                raise ValueError('That take is not available to score.') from None
+            try:
+                report.update(measure_take(local, extras, td))
+            except SyncError:
+                notes.append('This take could not be scored against the tune this time.')
+            measure_s = round(time.monotonic() - began, 1)
+        return {'engine': 'yue2', 'mode': 'measure', 'take_key': take_key, 'lyric_sync': report,
+                'worker_notes': notes, 'transcription_cached': read['cached'],
+                'source_seconds': round(read['seconds'], 2),
+                'processing_ms': int((time.monotonic() - start) * 1000),
+                'timing': {**read['timing'], 'sync_s': sync_s, 'measure_s': measure_s},
+                'gpu': gpu_name(), 'features': list(FEATURES)}
+
+
 def warm():
     # FlashBoot snapshots a booted worker. Loading here, not inside the first
     # job, puts a ready model in that snapshot and keeps loading out of the
@@ -577,11 +831,16 @@ def handler(job):
         options = cover_options(raw)
         if options['mode'] == 'transcribe':
             return transcribe_only(job, raw, options, start)
+        if options['mode'] == 'measure':
+            return measure_only(job, raw, options, start)
         inp = request_input(raw)
         controls = sound_controls(raw)
         wanted = style_request(raw)
         reference = raw.get('reference_voice_url')
         check_combination(inp, options, reference)
+        sync_opts = sync_options(raw)
+        check_sync(inp, options, sync_opts, reference)
+        wants_sync = sync_opts['fit_lyrics'] or sync_opts['measure_fit']
         import runpod
         import soundfile as sf
         from auk_handler import ffmpeg
@@ -591,10 +850,18 @@ def handler(job):
             cover_began = time.monotonic()
             if reference:
                 runpod.serverless.progress_update(job, 'Transcribing the source melody for your cover')
-                read = read_recording(reference, td, 'full' if options['keep_harmony'] else 'melody', client, bucket)
+                task = 'full' if options['keep_harmony'] else 'melody'
+                read = read_recording(reference, td, task, client, bucket, want_timing=wants_sync)
                 warnings = read['warnings']
                 timing.update(read['timing'])
             cover_s = round(time.monotonic() - cover_began, 1) if reference else 0
+            sync = None
+            if wants_sync:
+                runpod.serverless.progress_update(job, 'Timing your words against the recording')
+                began = time.monotonic()
+                state = source_sync(read, inp['lyrics'], td, client, bucket, task)
+                sync = dict(state, fit=sync_opts['fit_lyrics'], measure=sync_opts['measure_fit'])
+                timing['sync_s'] = round(time.monotonic() - began, 1)
             runpod.serverless.progress_update(job, 'Loading YuE2 and recording your song')
             load_began = time.monotonic()
             pipe = engine()
@@ -622,7 +889,7 @@ def handler(job):
             if fixed is not None:
                 began = time.monotonic()
                 render, budget, facts, extras, notes = fixed_score_render(
-                    inp, options, fixed, origin, read['seconds'] if read else None)
+                    inp, options, fixed, origin, read['seconds'] if read else None, sync=sync)
                 timing['convert_s'] = round(time.monotonic() - began, 2)
             else:
                 origin = 'YuE2' if inp['cot'] != 'off' else None
@@ -648,6 +915,16 @@ def handler(job):
             ffmpeg('-i', work / 'audio.flac', '-c:a', 'pcm_s24le', wav)
             ffmpeg('-i', wav, '-c:a', 'libmp3lame', '-b:a', '320k', mp3)
             duration = sf.info(wav).duration
+            if sync is not None:
+                extras['lyric_sync'].update(words_cached=sync['words_cached'], source_align=sync['align'])
+            if sync is not None and sync['measure'] and extras.get('sync_plan'):
+                runpod.serverless.progress_update(job, 'Checking which words landed on the long notes')
+                began = time.monotonic()
+                try:
+                    extras['lyric_sync'].update(measure_take(wav, extras, td))
+                except SyncError:
+                    notes.append('This take could not be scored against the tune this time.')
+                timing['measure_s'] = round(time.monotonic() - began, 1)
             prefix = f'yue2/{uuid.uuid4()}'
             files = [(mp3, 'audio/mpeg'), (wav, 'audio/wav')]
             files += [(p, 'text/plain' if p.suffix == '.abc' else 'application/json')
@@ -679,6 +956,8 @@ def handler(job):
                 'semantic_budget_tokens': budget, 'worker_notes': notes, 'gpu': gpu_name(),
                 'memory': {'render_peak_gib': render_peak, 'transcribe_peak_gib': read['peak'] if read else None},
                 'features': list(FEATURES)})
+            if sync is not None:
+                output['lyric_sync'] = extras.get('lyric_sync')
             if render['lyrics'] != inp['lyrics']:
                 output['lyrics_used'] = render['lyrics']
             if render['style'] != inp['style']:

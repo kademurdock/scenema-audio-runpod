@@ -1,8 +1,8 @@
 name: build-yue2
 on:
   push:
-    branches: [main, session202-yue2, lora-styles, p295-covers]
-    paths: [Dockerfile.yue, yue_handler.py, test_yue_controls.py, cover.py, 'instrumental/**', .github/workflows/yue.yml]
+    branches: [main, session202-yue2, lora-styles, p295-covers, p295-covers-sync]
+    paths: [Dockerfile.yue, yue_handler.py, test_yue_controls.py, cover.py, lyric_sync.py, align.py, test_lyric_sync.py, 'instrumental/**', .github/workflows/yue.yml]
   workflow_dispatch:
 permissions:
   contents: read
@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate sound controls without GPU charges
-        run: python -m unittest test_yue_controls.py
+        run: python -m unittest test_yue_controls.py test_lyric_sync.py
       - name: Free disk for CUDA
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: docker/setup-buildx-action@v3

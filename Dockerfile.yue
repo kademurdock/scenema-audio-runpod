@@ -16,14 +16,20 @@ RUN git clone https://github.com/multimodal-art-projection/YuE.git /app/upstream
 ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 ENV YUE_MODEL_DIR=/runpod-volume/huggingface-cache/hub/models--m-a-p--YuE2-3B/snapshots/14fc6c6f146441b1dd6363fcb2e01e82a6914cb7
 ENV YUE_VAE_DIR=/runpod-volume/huggingface-cache/hub/models--m-a-p--YuE2-Vae/snapshots/9a94e1d0ea9f8087e98f77fa88df4a4068104d2a
-COPY yue_handler.py auk_handler.py auk_contract.py /app/
-COPY instrumental/ /app/instrumental/
 COPY --from=coverenv /opt/cover /opt/cover
-COPY cover.py /app/
+# Lyric sync (fit_lyrics, measure_fit): torchaudio's own Hybrid Demucs vocal separator and MMS
+# forced aligner, baked into a torch hub cache so nothing downloads at run time.
+ENV YUE_ALIGN_HOME=/opt/align
+RUN TORCH_HOME=/opt/align LD_LIBRARY_PATH=/opt/cover/lib /opt/cover/bin/python -c "import torchaudio; p = torchaudio.pipelines; p.HDEMUCS_HIGH_MUSDB_PLUS.get_model(); p.MMS_FA.get_model(with_star=False); print('aligner labels', ''.join(p.MMS_FA.get_dict(star=None)))" && du -sh /opt/align
+COPY yue_handler.py lyric_sync.py auk_handler.py auk_contract.py /app/
+COPY instrumental/ /app/instrumental/
+COPY cover.py align.py /app/
 ENV YUE_SCORE_DIR=/runpod-volume/huggingface-cache/hub/models--m-a-p--SheetSage2/snapshots/80af707174fc7ee521c25925d5f014729f0e61ae
 ENV YUE_MERT_DIR=/runpod-volume/huggingface-cache/hub/models--m-a-p--MERT-v2-FullSong/snapshots/d8ba1c745e733b3908ce6ad16ebeb17ac7600a42
 ENV HF_HUB_CACHE=/runpod-volume/huggingface-cache/hub
 RUN LD_LIBRARY_PATH=/opt/cover/lib /opt/cover/bin/python -c "import torch, torchaudio, transformers; from torchaudio.io import StreamReader; assert torch.__version__.startswith('2.8.0') and 'sm_120' in torch._C._cuda_getArchFlags(), torch.__version__"
 RUN python -c "from yue2 import YuE2Pipeline; import yue_handler; import soundfile; import boto3; import runpod"
 RUN python -c "import yue_handler, abc_tools; from yue2.protocol import SongRequest, Sampling; Sampling(max_tokens=2088); assert abc_tools.__file__ == '/app/instrumental/abc_tools.py', abc_tools.__file__"
+RUN python -c "import yue_handler, lyric_sync; assert {'lyric-sync', 'fit-score'} <= set(yue_handler.FEATURES)"
+RUN LD_LIBRARY_PATH=/opt/cover/lib /opt/cover/bin/python /app/align.py --selftest
 CMD ["python", "-u", "/app/yue_handler.py"]
