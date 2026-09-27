@@ -441,11 +441,10 @@ def _voiced_after(order, times):
     """Seconds each word is sung before the next word starts, less any quiet before that next
     word: long for a held note, short for a quick one, never counting a rest."""
     spans = {}
-    for k, i in enumerate(order):
-        t = times.get(i)
-        if not t:
-            continue
-        nxt = times.get(order[k + 1]) if k + 1 < len(order) else None
+    timed = [i for i in order if times.get(i)]
+    for k, i in enumerate(timed):
+        t = times[i]
+        nxt = times[timed[k + 1]] if k + 1 < len(timed) else None
         if nxt:
             spans[i] = max(0.0, nxt['start'] - t['start'] - (nxt.get('quiet_before') or 0.0))
         else:
