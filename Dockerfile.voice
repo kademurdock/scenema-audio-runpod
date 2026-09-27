@@ -1,0 +1,37 @@
+# "Sing it in my voice": RVC v2 voice conversion with RVC's bundled pymss separators, for its own RunPod serverless endpoint.
+# Separate from the YuE2 image (Dockerfile.yue) and built only from the voice-rvc branch (.github/workflows/voice.yml).
+#
+# Pinned: RVC WebUI 81eed5e (MIT); torch/torchaudio 2.7.1+cu118, the pair RVC names for pre-RTX-50 cards. It has NO RTX 50-series /
+# Blackwell kernels, so the endpoint must use older cards (RTX 4090, 3090, A5000, L4, L40S, A40, A6000); the worker refuses a card
+# it cannot run. The RVC venv is the exact set the Sep 27 2026 voice test froze on its pod. Base weights: HF
+# lj1995/VoiceConversionWebUI @ e6d0c1a1 (HuBERT, RMVPE) and pymss models from baicai1145/pymss @ f02318ef, baked in.
+# Personal voice models are never in the image: they are fetched per job from the private bucket and cached by hash.
+FROM python:3.12-slim-bookworm
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HF_HUB_DISABLE_TELEMETRY=1 PIP_NO_CACHE_DIR=1 UV_NO_CACHE=1 UV_LINK_MODE=copy \
+    VOICE_RVC_DIR=/opt/rvc VOICE_RVC_PYTHON=/opt/rvc-venv/bin/python PYMSS_MODEL_DIR=/opt/pymss_models \
+    PYMSS_ENDPOINT=https://huggingface.co/baicai1145/pymss/resolve/f02318ef92c43472777ed7aeeded3d2b29a68b58 \
+    VOICE_SELFTEST=/opt/voice/selftest.json OMP_NUM_THREADS=4
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsndfile1 git ca-certificates && rm -rf /var/lib/apt/lists/*
+# The handler's own Python (system 3.12): RunPod, the bucket, numpy for the remix. The tools run in /opt/rvc-venv.
+RUN pip install --no-cache-dir uv==0.12.19 'runpod>=1.7,<2' 'boto3>=1.35,<2' 'requests>=2.32,<3' numpy==1.26.4
+ARG RVC_COMMIT=81eed5e8f68b6bed1789f682fe78cdd324495afc
+RUN git init -q /opt/rvc && git -C /opt/rvc remote add origin https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git \
+ && git -C /opt/rvc fetch -q --depth 1 origin "$RVC_COMMIT" && git -C /opt/rvc checkout -q FETCH_HEAD \
+ && test "$(git -C /opt/rvc rev-parse HEAD)" = "$RVC_COMMIT" && rm -rf /opt/rvc/.git
+RUN uv venv -q --python /usr/local/bin/python3.12 /opt/rvc-venv \
+ && uv pip install -q --python /opt/rvc-venv/bin/python --index-url https://download.pytorch.org/whl/cu118 \
+    --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match torch==2.7.1+cu118 torchaudio==2.7.1+cu118
+COPY voice/requirements-rvc.txt /opt/voice/requirements-rvc.txt
+RUN printf 'torch==2.7.1\ntorchaudio==2.7.1\n' > /tmp/constraints-rvc.txt \
+ && uv pip install -q --python /opt/rvc-venv/bin/python -c /tmp/constraints-rvc.txt -r /opt/voice/requirements-rvc.txt \
+ && /opt/rvc-venv/bin/python -c "import torch, torchaudio, faiss, librosa, transformers, parselmouth, pymss_core, soundfile; assert torch.__version__ == '2.7.1+cu118', torch.__version__; print('rvc venv', torch.__version__, 'archs', torch.cuda.get_arch_list())" \
+ && cd /opt/rvc && /opt/rvc-venv/bin/python infer/cli.py --help > /dev/null
+COPY voice/voice_request.py voice/fetch_base_models.py /opt/voice/
+RUN /opt/rvc-venv/bin/python /opt/voice/fetch_base_models.py
+COPY voice/selftest.py /opt/voice/
+RUN /opt/rvc-venv/bin/python /opt/voice/selftest.py
+COPY voice/ /opt/voice/
+RUN cd /opt/voice && python -m unittest -v test_voice.py \
+ && python -c "import sys; sys.path.insert(0, '/opt/voice'); import voice_handler, runpod, boto3; print('handler ok', voice_handler.FEATURES)"
+WORKDIR /opt/voice
+CMD ["python", "-u", "/opt/voice/voice_handler.py"]
