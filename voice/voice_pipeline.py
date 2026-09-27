@@ -240,11 +240,23 @@ def finish(x, mp3, wav, target_lufs):
     return {"in_lufs": None if before is None else round(before, 2), "gain_db": round(gain, 2), "limit_db": round(limited, 2)}
 
 
+def load_input(audio_path):
+    """The recording as float32 [n, 2] at SR, at its own level. ffmpeg's mono-to-stereo upmix puts each side
+    3 dB down, so a mono file is decoded as mono and copied to both sides instead (Sep 27 2026: a mono upload
+    came back 3 dB quieter); more than two channels are folded to stereo by ffmpeg as before."""
+    x, _ = va.decode(audio_path, sr=SR)
+    if x.shape[1] == 1:
+        return np.repeat(x, 2, axis=1)
+    if x.shape[1] == 2:
+        return x
+    return va.decode(audio_path, sr=SR, channels=2)[0]
+
+
 def run(req, audio_path, model_path, index_path, work, runner, progress=lambda text: None):
     """-> {"files": {name: path}, "report": {...}}. ValueError carries a sentence for the person."""
     notes, timing = [], {}
     began = time.monotonic()
-    mix, _ = va.decode(audio_path, sr=SR, channels=2)
+    mix = load_input(audio_path)
     seconds = len(mix) / SR
     if seconds > MAX_SECONDS:
         raise ValueError(f"This recording is {int(seconds // 60)} minutes {int(seconds % 60)} seconds long. Use one up to six minutes.")

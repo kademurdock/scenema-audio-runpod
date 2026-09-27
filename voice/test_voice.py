@@ -398,6 +398,27 @@ class PipelineTests(Base):
         self.assertIn("up to six minutes", caught.exception.args[0])
 
 
+class InputLevelTests(unittest.TestCase):
+    def test_mono_keeps_its_level_and_stereo_is_unchanged(self):
+        work = tempfile.mkdtemp()
+        try:
+            sr = voice_pipeline.SR
+            t = np.arange(sr * 3) / sr
+            tone = (0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+            mono = os.path.join(work, 'mono.wav')
+            stereo = os.path.join(work, 'stereo.wav')
+            va.encode(mono, tone[:, None], sr, bits=32)
+            va.encode(stereo, np.stack([tone, tone], axis=1), sr, bits=32)
+            m = voice_pipeline.load_input(mono)
+            s = voice_pipeline.load_input(stereo)
+            self.assertEqual(m.shape[1], 2)
+            self.assertAlmostEqual(float(np.abs(m).max()), 0.3, delta=0.01, msg='mono is not 3 dB down')
+            self.assertAlmostEqual(float(np.abs(s).max()), 0.3, delta=0.01)
+            self.assertAlmostEqual(voice_pipeline.rms_db(m), voice_pipeline.rms_db(s), delta=0.1)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+
 class SoftSTests(unittest.TestCase):
     def test_s_hiss_comes_from_the_input_and_the_vowels_stay(self):
         """A sung tone with bursts of hiss (the S sounds) in; the 'converted' voice has the same tone but a louder, buzzy 6 kHz
