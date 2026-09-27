@@ -45,6 +45,7 @@ MAX_GROUP = 40                # words in one phrase, a bound for speed
 MIN_NOTE_MATCH = 0.5          # score notes that must match SheetSage2's MIDI notes
 MIN_HEARD = 0.5               # sung words the aligner must hear clearly
 MIN_COVERAGE = 0.5            # phrase notes that must end up with words
+MAX_OFFSET = 0.75             # median seconds between a phrase's first note and its first word
 TAG = re.compile(r'^\s*\[([^\]\n]+)\]\s*$')
 WORD = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)*")
 CLAUSE_MARK = re.compile(r'[,;:.…]+$')
@@ -260,8 +261,11 @@ def note_times(plan, midis):
                 b = [n[1] % 12 if classes else n[1] for n in notes]
                 matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
                 ratio = matcher.ratio()
-                if best is None or ratio > best[0] + 1e-9:
-                    best = (ratio, f'{name}#{key[0]}/{key[1]}', notes, matcher)
+                # SheetSage2's raw vocal melody keeps real timing; the notation companions the
+                # score was built from are grid-quantised, so they win only when it is missing.
+                rank = (name.rsplit('/', 1)[-1] == 'melody_vocal.mid' and ratio >= MIN_NOTE_MATCH, ratio)
+                if best is None or rank > best[0]:
+                    best = (rank, f'{name}#{key[0]}/{key[1]}', notes, matcher)
     if best is None:
         raise ValueError(REASONS['notes'])
     _, source, midi, matcher = best
@@ -513,6 +517,15 @@ def fit(abc, lyrics, timing, word_times, failed=None):
     report['coverage'] = round(covered / len(notes), 3)
     if covered < MIN_COVERAGE * len(notes):
         return refuse('words')
+    # Note times and word times must agree: a clearly heard first word sits near its phrase's
+    # first note. A large gap means the note timing followed the score's steady grid instead.
+    offsets = sorted(abs(onset[g[0]] - notes[phrases[j]['first']]['s'])
+                     for j, g in enumerate(groups) if g and weight[g[0]] >= 1.0)
+    if offsets:
+        middle = offsets[len(offsets) // 2]
+        report['onset_offset_s'] = dict(median=round(middle, 3), max=round(offsets[-1], 3))
+        if middle > MAX_OFFSET:
+            return refuse('notes')
     own = _owners(plan, groups, onset)
     commas = set()
     for j, group in enumerate(groups):

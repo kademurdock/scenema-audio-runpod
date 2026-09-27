@@ -196,6 +196,13 @@ class MidiTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             S.midi_notes(b'RIFF0000')
 
+    def test_the_raw_vocal_melody_wins_over_grid_notation(self):
+        plan = S.score_plan(SCORE)
+        grid = smf([[(float(n['on']), n['pitch'], float(n['dur'])) for n in plan['notes']]])
+        timing = S.note_times(plan, [('notation/song_melody.mid', grid), ('melody_vocal.mid', recording_midi(plan))])
+        self.assertEqual(timing['source'], 'melody_vocal.mid#1/0')
+        self.assertEqual(S.note_times(plan, [('notation/song_melody.mid', grid)])['source'], 'notation/song_melody.mid#1/0')
+
     def test_note_times_follow_the_recording(self):
         plan = S.score_plan(SCORE)
         timing = S.note_times(plan, [('melody_vocal.mid', recording_midi(plan)), ('broken.mid', b'nonsense')])
@@ -232,6 +239,7 @@ class FitTest(unittest.TestCase):
         self.assertEqual(report['commas_added'], 2)
         self.assertEqual(report['breaks_on_phrase_ends'], dict(before=2, after=5, of=5))
         self.assertEqual(report['her_breaks_inside_phrases'], 4)
+        self.assertLess(report['onset_offset_s']['median'], 0.1)
         held = [(h['phrase'], h['note'], h['word'], h['last'], h['clear']) for h in report['held_notes']]
         self.assertIn((2, 2, 18, False, True), held)          # the four-beat note keeps its word
         self.assertEqual(len(result['notes']), 2)
@@ -270,7 +278,9 @@ class FitTest(unittest.TestCase):
                  (S.fit(SCORE, MISBROKEN, self.timing, [dict(t, score=0.01) for t in times]), 'heard'),
                  (S.fit('not a score', MISBROKEN, self.timing, times), 'score'),
                  (S.fit(SCORE, '[Verse]\n', self.timing, []), 'empty'),
-                 (S.fit(SCORE, MISBROKEN, dict(self.timing, notes=self.timing['notes'][:-1]), times), 'notes')]
+                 (S.fit(SCORE, MISBROKEN, dict(self.timing, notes=self.timing['notes'][:-1]), times), 'notes'),
+                 (S.fit(SCORE, MISBROKEN, dict(self.timing, notes=[[a + 1.2, b + 1.2] for a, b in self.timing['notes']]),
+                        times), 'notes')]
         for result, reason in cases:
             with self.subTest(reason=reason):
                 self.assertFalse(result['applied'])
