@@ -160,7 +160,7 @@ def place(emission, dictionary, words, quiet, stars=None):
     if not any(o is not None for o in owner):
         return out
     labels, scores = torchaudio.functional.forced_align(
-        emission[None].float(), torch.tensor([tokens], dtype=torch.int32), blank=blank)
+        emission[None].float().contiguous(), torch.tensor([tokens], dtype=torch.int32), blank=blank)
     spans = torchaudio.functional.merge_tokens(labels[0], scores[0].exp(), blank=blank)
     if len(spans) != len(tokens):
         raise RuntimeError(f'aligner returned {len(spans)} spans for {len(tokens)} tokens')
