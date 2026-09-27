@@ -30,6 +30,6 @@ ENV HF_HUB_CACHE=/runpod-volume/huggingface-cache/hub
 RUN LD_LIBRARY_PATH=/opt/cover/lib /opt/cover/bin/python -c "import torch, torchaudio, transformers; from torchaudio.io import StreamReader; assert torch.__version__.startswith('2.8.0') and 'sm_120' in torch._C._cuda_getArchFlags(), torch.__version__"
 RUN python -c "from yue2 import YuE2Pipeline; import yue_handler; import soundfile; import boto3; import runpod"
 RUN python -c "import yue_handler, abc_tools; from yue2.protocol import SongRequest, Sampling; Sampling(max_tokens=2088); assert abc_tools.__file__ == '/app/instrumental/abc_tools.py', abc_tools.__file__"
-RUN python -c "import yue_handler, lyric_sync; assert {'lyric-sync', 'fit-score'} <= set(yue_handler.FEATURES)"
+RUN python -c "import yue_handler, lyric_sync; assert {'lyric-sync', 'fit-score', 'fit-tempo'} <= set(yue_handler.FEATURES)"
 RUN LD_LIBRARY_PATH=/opt/cover/lib /opt/cover/bin/python /app/align.py --selftest
 CMD ["python", "-u", "/app/yue_handler.py"]

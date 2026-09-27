@@ -1192,9 +1192,11 @@ def touched_from(original, touched):
     return i == len(va.notes)
 
 
-def measure(plan, order, take):
+def measure(plan, order, take, speed=1.0):
     """How well a finished take kept the plan (fit()'s plan). order: her word indices in the
     order the take sang them. take: per position of order, align.py's timing or None.
+    speed: how much faster than its score's written tempo the take was sung (fit_tempo); its
+    pauses shrink by the same factor, so the pause test is PAUSE / speed. 1.0 otherwise.
 
     Held notes: the planned word must be sung longer than the word either side of it (sung
     time up to the next word, less any quiet before it). A note counts toward the score only
@@ -1226,6 +1228,7 @@ def measure(plan, order, take):
                                sung_word_offset=position[winner] - k))
     held_hits, held_of = counts[True]
     pause_hits = pause_of = 0
+    pause = PAUSE / speed
     groups = plan['groups']
     for j, group in enumerate(groups):
         if not group or j == 0 or not any(groups[:j]):
@@ -1234,7 +1237,7 @@ def measure(plan, order, take):
         if first not in heard or not plan.get('source_pauses', {}).get(j, True):
             continue
         pause_of += 1
-        if (heard[first].get('quiet_before') or 0.0) >= PAUSE:
+        if (heard[first].get('quiet_before') or 0.0) >= pause:
             pause_hits += 1
         else:
             misses.append(dict(kind='pause', section=plan['sections'][j], phrase=j))

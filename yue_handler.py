@@ -6,7 +6,10 @@ match_score_tempo and mode. A request without them renders exactly as before.
 The lyric sync follow-up adds fit_lyrics, measure_fit, fit_score_touchup and mode=measure
 (lyric_sync.py, align.py); a request without them also renders exactly as before, except that
 the lyric_fit report now pairs sections by name and meter_check reports a style whose meter
-contradicts the score."""
+contradicts the score.
+Fit by tempo adds fit_tempo: a fixed score too long for YuE2's six minutes is sung a little
+faster (its Q: line only; same notes, same key) instead of being cut, up to 20%. A request
+without it renders exactly as before."""
 import difflib
 import os
 import hashlib
@@ -19,12 +22,13 @@ import math
 import re
 import sys
 from dataclasses import replace
+from fractions import Fraction
 from pathlib import Path
 
 # Upstream's MIT yue2-music instrumental helpers, standard library only, kept verbatim.
 # Appended, not prepended, so their plain module names never shadow an installed package.
 sys.path.append(str(Path(__file__).resolve().parent / 'instrumental'))
-from abc_tools import parse_abc  # noqa: E402
+from abc_tools import compare, parse_abc  # noqa: E402
 from common import sha256  # noqa: E402
 from instrumentalize import convert_score, section_starts  # noqa: E402
 import lyric_sync  # noqa: E402
@@ -35,12 +39,28 @@ STYLE_KEY = re.compile(r'^yue2-loras/[A-Za-z0-9._-]{1,80}\.pt$')
 TAKE_KEY = re.compile(r'^yue2/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/master\.(?:wav|mp3)$')
 # What this worker can do; the booth checks this before offering an option.
 # lyric-sync: fit_lyrics="timing"; fit-score: measure_fit and mode="measure"; score-touchup:
-# fit_score_touchup; lyric-fit-v2: lyric_fit rows paired by section name; meter-check: meter_check.
+# fit_score_touchup; lyric-fit-v2: lyric_fit rows paired by section name; meter-check: meter_check;
+# fit-tempo: fit_tempo and the tempo_fit report.
 FEATURES = ('keep-harmony', 'instrumental', 'transcribe', 'score-cache', 'length-guard',
             'match-tempo', 'sections', 'lyric-fit', 'chord-check', 'lyric-sync', 'fit-score',
-            'score-touchup', 'lyric-fit-v2', 'meter-check')
+            'score-touchup', 'lyric-fit-v2', 'meter-check', 'fit-tempo')
 ALIGN_REVISION = 'mmsfa-star-hdemucs-2'  # word timing cache revision (align.py's models and recipe)
 TOKENS_PER_SECOND, TOKEN_CAP, TOKEN_FLOOR, GUARD_HEADROOM = 25, 9000, 200, 1.10
+# Fit by tempo (COVER_SPEED design). YuE2 stops at 9,000 tokens, six minutes. A fixed score longer
+# than FIT_SECONDS gets the smallest whole-number tempo that brings its nominal length under it:
+# 8 s (2.2%) below the cap, 4.6 times the worst overrun seen on 60 takes. FIT_HARD is YuE2's own
+# published tempo edit (BPM x 1.2, followed within 4% on 95.7% of 764 takes); past it, no song.
+SOURCE_MAX = 360           # source recording seconds without fit_tempo: today's six minutes
+FIT_SECONDS = 352          # a sped score's nominal length at most
+FIT_HARD = Fraction(6, 5)  # never more than 20% faster
+FIT_BOOTH_SECONDS = 400    # what the booth accepts with fit_tempo (6:40, about 15% at most)
+FIT_SOURCE_MAX = 402       # what this worker accepts with fit_tempo: the booth's 400 s plus decoder slack
+TEMPO_LINE = re.compile(r'Q:1/4=([1-9][0-9]*)')
+TOO_FAST_NEXT = {
+    'recording': 'Import a shorter recording or an excerpt; nothing was trimmed.',
+    'score': 'Use a shorter score; nothing was trimmed.',
+    'YuE2': 'Try another seed; nothing was trimmed.',
+}
 NO_SINGING = ('no vocals', 'no singing', 'no choir', 'no spoken words')
 PLANNING_TAGS = '[Intro]\n\n[Verse]\n\n[Chorus]\n\n[Outro]\n'
 UNREADABLE = 'The melody could not be read from this recording. Try a clearer recording of the song.'
@@ -137,7 +157,8 @@ def cover_options(inp):
             raise ValueError(f'{key} must be true or false.')
         return value
     keep, instrumental, guard, tempo = map(flag, ('keep_harmony', 'instrumental', 'length_guard', 'match_score_tempo'))
-    new_shape = bool(keep or instrumental or tempo)
+    # fit_tempo (fit_option) is a new field too, so it turns the length guard on unless told.
+    new_shape = bool(keep or instrumental or tempo or inp.get('fit_tempo') is True)
     return dict(mode=mode, keep_harmony=keep, instrumental=bool(instrumental),
                 length_guard=new_shape if guard is None else guard, match_score_tempo=bool(tempo))
 
@@ -185,6 +206,107 @@ def check_combination(inp, options, reference):
         raise ValueError('Keeping the original chords needs a source recording or a score.')
     if options['match_score_tempo'] and not fixed and not options['instrumental']:
         raise ValueError("Matching the score's tempo needs a source recording, a score or an instrumental.")
+
+
+def fit_option(inp):
+    """fit_tempo (optional, true or false). Leaving it out keeps today's request exactly.
+
+    true: a recording up to FIT_SOURCE_MAX seconds is accepted, and a fixed score (a recording's
+    transcription, a given score or YuE2's instrumental plan) whose nominal length runs past
+    FIT_SECONDS is sung faster, just enough to fit, instead of being cut at six minutes. Only
+    the score's Q: line changes. It also turns the length guard on unless length_guard says."""
+    value = inp.get('fit_tempo')
+    if value is not None and type(value) is not bool:
+        raise ValueError('fit_tempo must be true or false.')
+    return bool(value)
+
+
+def source_limit(fit):
+    return FIT_SOURCE_MAX if fit else SOURCE_MAX
+
+
+def check_fit(inp, options, reference, fit):
+    if fit and not (reference or inp['abc'] or options['instrumental']):
+        raise ValueError('Speeding a song up to fit needs a source recording, a score or an instrumental.')
+
+
+def spoken_length(seconds):
+    """'7 minutes 5 seconds', the way the booth says a length."""
+    total = max(0, round(seconds))
+    minutes, rest = divmod(total, 60)
+    if not minutes:
+        return f"{rest} second{'s' if rest != 1 else ''}"
+    return f"{minutes} minute{'s' if minutes != 1 else ''}" + (f" {rest} second{'s' if rest != 1 else ''}" if rest else '')
+
+
+def score_tempo(abc):
+    """The score's quarter-note tempo from its native Q: line (line 5), or None."""
+    lines = (abc or '').splitlines()
+    match = TEMPO_LINE.fullmatch(lines[4]) if len(lines) > 4 else None
+    return int(match.group(1)) if match else None
+
+
+def with_tempo(abc, bpm):
+    """abc with only its Q: line (line 5) changed to bpm; ValueError when it has no such line."""
+    lines = abc.splitlines(keepends=True)
+    body = lines[4].rstrip('\r\n') if len(lines) > 4 else ''
+    if not TEMPO_LINE.fullmatch(body):
+        raise ValueError('The score has no tempo line to change.')
+    lines[4] = f'Q:1/4={bpm}' + lines[4][len(body):]
+    return ''.join(lines)
+
+
+def tempo_plan(abc, source_seconds=None, origin='recording'):
+    """How fast a fixed score must be sung to fit YuE2's six minutes (fit_tempo). Pure.
+
+    Returns dict(from_bpm, to_bpm, factor, before, after) with exact Fractions (to_bpm equals
+    from_bpm when the score already fits), or None when the score cannot be read. Raises a plain
+    ValueError before any render when fitting would take more than FIT_HARD, or when an
+    unreadable score comes from a recording longer than six minutes (it could only be cut)."""
+    try:
+        score = parse_abc(abc)
+        quarters, bpm = score.voices['Vocal'].time, score.bpm
+    except (ValueError, KeyError, TypeError, IndexError, ZeroDivisionError, AttributeError):
+        quarters, bpm = None, None
+    if not quarters or not bpm:
+        if source_seconds and source_seconds > SOURCE_MAX:
+            raise ValueError("This recording runs over six minutes, and its melody score could not be read to speed it "
+                             "up to fit YuE2's six minutes. " + TOO_FAST_NEXT['recording'])
+        return None
+    before = Fraction(quarters) * 60 / bpm
+    to_bpm = bpm if before <= FIT_SECONDS else math.ceil(Fraction(quarters) * 60 / FIT_SECONDS)
+    factor = Fraction(to_bpm, bpm)
+    if factor > FIT_HARD:
+        percent = math.ceil((factor - 1) * 100)
+        raise ValueError(f"This song's score runs {spoken_length(float(before))}. Fitting it into YuE2's six minutes "
+                         f"would mean speeding it up {percent}%, more than the {round((FIT_HARD - 1) * 100)}% a cover "
+                         f"allows. {TOO_FAST_NEXT.get(origin, TOO_FAST_NEXT['recording'])}")
+    return dict(from_bpm=bpm, to_bpm=to_bpm, factor=factor, before=before, after=Fraction(quarters) * 60 / to_bpm)
+
+
+def scale_style_bpm(style, factor):
+    """Every BPM her style names, sped by the same factor (rounded), so YuE2 is never told two
+    tempos: (style, [[was, now], ...])."""
+    changed = []
+
+    def faster(match):
+        was = float(match.group(1))
+        now = round(was * factor)
+        changed.append([int(was) if was.is_integer() else was, now])
+        return str(now) + match.group(2)
+    return re.sub(r'\b(\d{2,3}(?:\.\d+)?)(\s*bpm)\b', faster, style, flags=re.I), changed
+
+
+def tempo_note(report):
+    """The fit, in words: 'Sped up 8% to fit ...'."""
+    note = (f"Sped up {report['percent']}% to fit YuE2's six-minute limit ({report['from_bpm']} to "
+            f"{report['to_bpm']} BPM), in the same key; the notes are unchanged.")
+    said = []
+    for pair in report.get('style_bpm') or []:
+        if pair not in said:
+            said.append(pair)
+            note += f' The style named {pair[0]} BPM, so it now names {pair[1]} BPM to match.'
+    return note
 
 
 def instrumental_style(style):
@@ -408,17 +530,24 @@ def apply_sync(inp, abc, sync, render, extras, notes):
                   sync_words=[words[i]['norm'] for i in order], sync_stars=stars)
 
 
-def fixed_score_render(inp, options, abc, origin, source_seconds=None, sync=None):
+def fixed_score_render(inp, options, abc, origin, source_seconds=None, sync=None, fit_tempo=False):
     """The exact request YuE2 renders once its score is fixed: a recording's
     transcription, a given score or a YuE2 plan. Pure: no GPU, files or network.
     sync: the recording's measured timing when fit_lyrics or measure_fit was asked.
+    fit_tempo: a score too long for six minutes is sped up to fit (tempo_plan); everything else,
+    lyric sync included, works on the score as written and only the final Q: line changes.
 
     Returns (render request, semantic token budget or None, score facts, extras, notes)."""
     render, extras, notes = dict(inp, abc=abc), {}, []
     facts = score_facts(abc)
     style = inp['style']
+    plan = tempo_plan(abc, source_seconds, origin) if fit_tempo else None
+    sped = bool(plan) and plan['to_bpm'] != plan['from_bpm']
+    style_bpm = []
     if options['match_score_tempo'] and facts:
-        style = tempo_style(style, facts['score_bpm'])
+        style = tempo_style(style, plan['to_bpm'] if sped else facts['score_bpm'])
+    elif sped:
+        style, style_bpm = scale_style_bpm(style, plan['factor'])
     if options['instrumental']:
         keep = options['keep_harmony']
         if keep is None:
@@ -457,7 +586,31 @@ def fixed_score_render(inp, options, abc, origin, source_seconds=None, sync=None
             apply_sync(inp, abc, sync, render, extras, notes)
         extras['lyric_fit'] = lyric_fit(render['lyrics'], facts.get('sections', []))
     extras['meter_check'] = meter_check(render['style'], facts.get('score_meter'))
-    budget = semantic_budget(source_seconds, facts.get('score_seconds')) if options['length_guard'] else None
+    if fit_tempo:
+        report = dict(applied=sped, limit_seconds=SOURCE_MAX, fit_seconds=FIT_SECONDS,
+                      source_seconds=round(source_seconds, 2) if source_seconds else None)
+        if plan is None:
+            report['reason'] = 'score unreadable'
+        else:
+            report.update(factor=round(float(plan['factor']), 4), from_bpm=plan['from_bpm'], to_bpm=plan['to_bpm'],
+                          percent=max(1, round(float(plan['factor'] - 1) * 100)) if sped else 0,
+                          score_seconds_before=round(float(plan['before']), 2),
+                          score_seconds_after=round(float(plan['after']), 2), style_bpm=style_bpm)
+        if sped:
+            written = render['abc']
+            render['abc'] = with_tempo(written, plan['to_bpm'])
+            after = parse_abc(render['abc'])
+            if after.bpm != plan['to_bpm'] or not compare(parse_abc(written), after, allow_tempo_change=True)['match']:
+                raise ValueError('The score could not be sped up to fit without changing its notes. Nothing was made.')
+            facts = score_facts(with_tempo(abc, plan['to_bpm']))  # what the take sings: its tempo, length, sections
+            extras['take_speed'] = float(plan['factor'])
+            notes.append(tempo_note(report))
+        extras['tempo_fit'] = report
+    if sped:
+        # From the sped score, not the longer recording: always the 9,000 cap for a sped song.
+        budget = semantic_budget(facts.get('score_seconds')) if options['length_guard'] else None
+    else:
+        budget = semantic_budget(source_seconds, facts.get('score_seconds')) if options['length_guard'] else None
     return render, budget, facts, extras, notes
 
 
@@ -629,8 +782,9 @@ def cache_timing(client, bucket, key, timing):
         print('Note timing cache write skipped:', type(error).__name__, flush=True)
 
 
-def fetch_recording(reference, td):
-    """Download and decode a source recording once: (source path, decoded path, seconds)."""
+def fetch_recording(reference, td, limit=SOURCE_MAX):
+    """Download and decode a source recording once: (source path, decoded path, seconds).
+    limit: SOURCE_MAX (six minutes), or FIT_SOURCE_MAX with fit_tempo."""
     import soundfile as sf
     from auk_handler import ffmpeg, download
     source = Path(td) / 'source'
@@ -638,12 +792,15 @@ def fetch_recording(reference, td):
     decoded = Path(td) / 'source.wav'
     ffmpeg('-i', source, '-ar', 24000, '-ac', 1, decoded)
     seconds = sf.info(decoded).duration
-    if seconds > 360:
-        raise ValueError('Use a source recording up to six minutes long.')
+    if seconds > limit:
+        if limit <= SOURCE_MAX:
+            raise ValueError('Use a source recording up to six minutes long.')
+        raise ValueError(f'Use a source recording up to {spoken_length(FIT_BOOTH_SECONDS)} long.')
     return source, decoded, seconds
 
 
-def read_recording(reference, td, task, client, bucket, want_timing=False, fetched=None, cache_only=False):
+def read_recording(reference, td, task, client, bucket, want_timing=False, fetched=None, cache_only=False,
+                   limit=SOURCE_MAX):
     """Download, check and transcribe a source recording, once per recording and task.
 
     The score is cached in the private bucket by the recording's hash, the task
@@ -652,9 +809,9 @@ def read_recording(reference, td, task, client, bucket, want_timing=False, fetch
     transcription also caches its note timing (a few KB, from SheetSage2's MIDI);
     a cached score's timing is read only when lyric sync asks for it.
     fetched: fetch_recording()'s result, to skip the download. cache_only: None instead of a
-    fresh transcription when nothing is cached for this task."""
+    fresh transcription when nothing is cached for this task. limit: fetch_recording's."""
     timing, began = {}, time.monotonic()
-    source, decoded, seconds = fetched or fetch_recording(reference, td)
+    source, decoded, seconds = fetched or fetch_recording(reference, td, limit)
     timing['download_s'] = round(time.monotonic() - began, 1)
     key = score_cache_key(sha256(source), task)
     began = time.monotonic()
@@ -813,7 +970,8 @@ def measure_take(path, extras, td):
     timed = take['words']
     if extras.get('take_positions') is not None:
         timed = [timed[p] for p in extras['take_positions']]
-    score = lyric_sync.measure(extras['sync_plan'], extras['sync_order'], timed)
+    # A take sped up to fit (fit_tempo) pauses for a shorter time; take_speed scales the pause test.
+    score = lyric_sync.measure(extras['sync_plan'], extras['sync_order'], timed, speed=extras.get('take_speed', 1.0))
     score['take_align'] = {k: take.get(k) for k in ('timing', 'peak_gib')}
     return score
 
@@ -854,13 +1012,14 @@ def transcribe_only(job, inp, options, start):
     reference = inp.get('reference_voice_url')
     if not reference or not isinstance(reference, str) or len(reference) > 12000:
         raise ValueError('Reading a melody needs a source recording. Import it again.')
+    limit = source_limit(fit_option(inp))
     import runpod
     task = 'full' if options['keep_harmony'] else 'melody'
     with tempfile.TemporaryDirectory() as td:
         client, bucket = storage()
         runpod.serverless.progress_update(job, 'Reading the melody of your recording')
         began = time.monotonic()
-        read = read_recording(reference, td, task, client, bucket)
+        read = read_recording(reference, td, task, client, bucket, limit=limit)
         key = read['key']
         if key is None:
             key = f'yue2/{uuid.uuid4()}/score'
@@ -914,21 +1073,35 @@ def take_score(client, bucket, take_key):
         return None
 
 
-def measure_read(req, take_abc, td, client, bucket):
+def at_cached_tempo(take_abc, cached_abc):
+    """(take_abc at cached_abc's tempo, the take's speed over it) when the take's score differs
+    from the cached score's tempo by a fit_tempo speed-up (faster, at most FIT_HARD); otherwise
+    (take_abc, 1.0). Only the Q: line is compared away: every note must still match."""
+    take_bpm, cached_bpm = score_tempo(take_abc), score_tempo(cached_abc)
+    if not take_bpm or not cached_bpm or not 1 < Fraction(take_bpm, cached_bpm) <= FIT_HARD:
+        return take_abc, 1.0
+    return with_tempo(take_abc, cached_bpm), take_bpm / cached_bpm
+
+
+def measure_read(req, take_abc, td, client, bucket, limit=SOURCE_MAX):
     """The recording read into the score its take was rendered from: the recording's cached
     full and melody scores (cover_mode narrows them) matched against the take's score.abc, as
-    it is or touched up (fit_score_touchup). Nothing is transcribed afresh unless the take has
-    no score of its own and was a harmony cover; a melody score is never transcribed here.
+    it is or touched up (fit_score_touchup), at its own tempo or sped up to fit (fit_tempo; the
+    answer's `speed`). Nothing is transcribed afresh unless the take has no score of its own
+    and was a harmony cover; a melody score is never transcribed here.
     ValueError when the take's score is not one of this recording's."""
     tasks = {'harmony': ['full'], 'melody': ['melody']}.get(req['cover_mode'], ['full', 'melody'])
-    fetched = fetch_recording(req['reference'], td)
+    fetched = fetch_recording(req['reference'], td, limit)
     for task in tasks:
         read = read_recording(req['reference'], td, task, client, bucket, want_timing=True, fetched=fetched,
                               cache_only=True)
-        if read and (take_abc is None or read['abc'].strip() == take_abc.strip()):
-            return dict(read, touched=False)
-        if read and lyric_sync.touched_from(read['abc'], take_abc):
-            return dict(read, touched=True)
+        if not read:
+            continue
+        take, speed = at_cached_tempo(take_abc, read['abc']) if take_abc is not None else (None, 1.0)
+        if take is None or read['abc'].strip() == take.strip():
+            return dict(read, touched=False, speed=speed)
+        if lyric_sync.touched_from(read['abc'], take):
+            return dict(read, touched=True, speed=speed)
     if take_abc is not None or 'full' not in tasks:
         raise ValueError(NOT_THE_TAKES_SCORE)
     return read_recording(req['reference'], td, 'full', client, bucket, want_timing=True, fetched=fetched)
@@ -939,6 +1112,7 @@ def measure_only(job, inp, options, start):
     the recording's held notes, and whether its phrases start after a pause. About the GPU cost
     of two word timings; the recording's side is cached for later takes."""
     req = measure_request(inp)
+    limit = source_limit(fit_option(inp))
     take_key, lyrics = req['take'], req['lyrics']
     import runpod
     with tempfile.TemporaryDirectory() as td:
@@ -946,7 +1120,7 @@ def measure_only(job, inp, options, start):
         runpod.serverless.progress_update(job, 'Timing the words of the recording')
         began = time.monotonic()
         take_abc = take_score(client, bucket, take_key)
-        read = measure_read(req, take_abc, td, client, bucket)
+        read = measure_read(req, take_abc, td, client, bucket, limit)
         state = source_sync(read, lyrics, td, client, bucket, read['task'])
         sync_s = round(time.monotonic() - began, 1)
         inp_like = dict(lyrics=lyrics)
@@ -955,6 +1129,9 @@ def measure_only(job, inp, options, start):
         report = extras['lyric_sync']
         report.update(words_cached=state['words_cached'], source_align=state['align'], score_task=read['task'],
                       score_is_takes=take_abc is not None, score_touched=bool(read.get('touched')))
+        if read.get('speed', 1.0) != 1.0:
+            extras['take_speed'] = read['speed']
+            report['take_speed'] = round(read['speed'], 4)
         if req['lyrics_used'] and extras['sync_plan']:
             order, positions = lyric_sync.sung_order(req['lyrics_used'], lyrics)
             used = lyric_sync.lyric_words(req['lyrics_used'])[0]
@@ -1009,6 +1186,10 @@ def handler(job):
         check_combination(inp, options, reference)
         sync_opts = sync_options(raw)
         check_sync(inp, options, sync_opts, reference)
+        fit = fit_option(raw)
+        check_fit(inp, options, reference, fit)
+        if fit and inp['abc']:
+            tempo_plan(inp['abc'], None, 'score')  # past the limit: refused before any GPU work
         wants_sync = sync_opts['fit_lyrics'] or sync_opts['measure_fit']
         import runpod
         import soundfile as sf
@@ -1020,9 +1201,12 @@ def handler(job):
             if reference:
                 runpod.serverless.progress_update(job, 'Transcribing the source melody for your cover')
                 task = 'full' if options['keep_harmony'] else 'melody'
-                read = read_recording(reference, td, task, client, bucket, want_timing=wants_sync)
+                read = read_recording(reference, td, task, client, bucket, want_timing=wants_sync,
+                                      limit=source_limit(fit))
                 warnings = read['warnings']
                 timing.update(read['timing'])
+                if fit:
+                    tempo_plan(read['abc'], read['seconds'], 'recording')  # past the limit: no timing, no render
             cover_s = round(time.monotonic() - cover_began, 1) if reference else 0
             sync = None
             if wants_sync:
@@ -1059,7 +1243,7 @@ def handler(job):
             if fixed is not None:
                 began = time.monotonic()
                 render, budget, facts, extras, notes = fixed_score_render(
-                    inp, options, fixed, origin, read['seconds'] if read else None, sync=sync)
+                    inp, options, fixed, origin, read['seconds'] if read else None, sync=sync, fit_tempo=fit)
                 timing['convert_s'] = round(time.monotonic() - began, 2)
             else:
                 origin = 'YuE2' if inp['cot'] != 'off' else None
@@ -1126,6 +1310,8 @@ def handler(job):
                 'features': list(FEATURES)})
             if sync is not None:
                 output['lyric_sync'] = extras.get('lyric_sync')
+            if fit:
+                output['tempo_fit'] = extras.get('tempo_fit')
             if render['lyrics'] != inp['lyrics']:
                 output['lyrics_used'] = render['lyrics']
             if render['style'] != inp['style']:

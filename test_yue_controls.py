@@ -1,12 +1,19 @@
 import hashlib
+import sys
+import types
 import unittest
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
+from unittest import mock
+import yue_handler
 from yue_handler import sound_controls, render_song, request_input, style_request
 from yue_handler import (cover_options, check_combination, fixed_score_render, instrumental_style, lyric_tags,
                          tempo_style, semantic_budget, score_facts, lyric_fit, planning_request, PLANNING_TAGS,
                          FEATURES, UNMOVABLE, NO_CHORDS, score_has_chords)
-from abc_tools import parse_abc
+from yue_handler import (fit_option, check_fit, source_limit, tempo_plan, with_tempo, score_tempo, scale_style_bpm,
+                         fetch_recording, spoken_length, handler, SOURCE_MAX, FIT_SOURCE_MAX)
+from abc_tools import compare, parse_abc
 
 
 @dataclass(frozen=True)
@@ -453,6 +460,212 @@ class ScoreReportTest(unittest.TestCase):
         self.assertTrue(lyric_fit('[Verse]\n' + 'la ' * 50, sections)['same_order'])
         self.assertIsNone(lyric_fit('', sections))
         self.assertIsNone(lyric_fit('words', []))
+
+
+def long_score(groups, bpm=86):
+    """An invented native score of four-bar 4/4 groups, 16 quarter notes each, with chords;
+    sections change every four groups. 36 groups at 86 BPM run 401.86 s, a 6:40 recording's."""
+    head = ['X:1', 'T:', 'M:4/4', 'L:1/8', f'Q:1/4={bpm}', 'V: Vocal clef=treble name="Vocal Melody" snm="Vocal"',
+            'V: Ins clef=treble name="Ins Melody" snm="Inst."', 'K:C']
+    body = []
+    for group in range(groups):
+        if group % 4 == 0:
+            body.append('% ' + ('verse', 'chorus')[(group // 4) % 2])
+        body += ['V: Vocal', '"C"c2d2e2f2|"G"g4z4|"F"e2d2c2d2|"C"e4z4|', 'V: Ins', 'Z4|']
+    return '\n'.join(head + body) + '\n'
+
+
+LONG = long_score(36)
+LONG_COVER = dict(BOOTH_COVER, keep_harmony=True, length_guard=True, fit_tempo=True)
+SPED_NOTE = "Sped up 15% to fit YuE2's six-minute limit (86 to 99 BPM), in the same key; the notes are unchanged."
+
+
+def fetch(seconds, limit):
+    """fetch_recording with the download and decoder faked: the file measures `seconds`."""
+    fakes = {'soundfile': types.SimpleNamespace(info=lambda path: types.SimpleNamespace(duration=seconds)),
+             'auk_handler': types.SimpleNamespace(ffmpeg=lambda *args: None, download=lambda url, dest: None)}
+    with mock.patch.dict(sys.modules, fakes):
+        return fetch_recording('https://example.invalid/original.mp3', '/tmp', limit)
+
+
+class FitTempoTest(unittest.TestCase):
+    """fit_tempo: a score too long for YuE2's six minutes is sung a little faster instead of cut."""
+
+    def test_the_option_is_checked_and_todays_requests_ignore_it(self):
+        self.assertIn('fit-tempo', FEATURES)
+        self.assertFalse(fit_option({}))
+        self.assertFalse(fit_option(BOOTH_COVER))
+        self.assertFalse(fit_option({'fit_tempo': False}))
+        self.assertTrue(fit_option({'fit_tempo': True}))
+        for bad in ('yes', 1, 'true', [True]):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, 'fit_tempo must be true or false'):
+                fit_option({'fit_tempo': bad})
+            self.assertIn('fit_tempo', handler({'input': dict(BOOTH_COVER, fit_tempo=bad)})['error'])
+        self.assertEqual((source_limit(False), source_limit(True)), (360, 402))
+        # A new field, so it turns the length guard on unless told; without it nothing changes.
+        self.assertTrue(cover_options({'fit_tempo': True})['length_guard'])
+        self.assertFalse(cover_options({'fit_tempo': True, 'length_guard': False})['length_guard'])
+        self.assertEqual(cover_options({'fit_tempo': False}), CoverOptionsTest.TODAY)
+        song = request_input({'style': 'pop', 'lyrics': 'la'})
+        with self.assertRaisesRegex(ValueError, 'needs a source recording, a score or an instrumental'):
+            check_fit(song, cover_options({}), None, True)
+        check_fit(song, cover_options({'instrumental': True}), None, True)
+        check_fit(song, cover_options({}), 'https://example.invalid/a.mp3', True)
+        check_fit(song, cover_options({}), None, False)
+
+    def test_without_the_field_nothing_changes(self):
+        for abc, seconds in ((TRANSCRIBED, 72.6), (LONG, 399.0)):
+            raw = dict(BOOTH_COVER, keep_harmony=True, length_guard=True)
+            inp = request_input(raw)
+            render, budget, facts, extras, notes = fixed_score_render(inp, cover_options(raw), abc, 'recording', seconds)
+            self.assertEqual(render['abc'], abc)
+            self.assertNotIn('tempo_fit', extras)
+            self.assertNotIn('take_speed', extras)
+            self.assertEqual(budget, semantic_budget(seconds, score_facts(abc)['score_seconds']))
+            self.assertEqual(fixed_score_render(inp, cover_options(raw), abc, 'recording', seconds, fit_tempo=False)[:3],
+                             (render, budget, facts))
+
+    def test_a_score_that_fits_is_untouched(self):
+        raw = dict(BOOTH_COVER, keep_harmony=True, length_guard=True)
+        inp = request_input(raw)
+        plain = fixed_score_render(inp, cover_options(raw), PLANNED, 'recording', 72.6)
+        fitted = fixed_score_render(inp, cover_options(dict(raw, fit_tempo=True)), PLANNED, 'recording', 72.6,
+                                    fit_tempo=True)
+        self.assertEqual(fitted[:3], plain[:3])
+        self.assertEqual(fitted[4], plain[4])
+        self.assertEqual(fitted[3]['tempo_fit'], dict(
+            applied=False, limit_seconds=360, fit_seconds=352, source_seconds=72.6, factor=1.0, from_bpm=84, to_bpm=84,
+            percent=0, score_seconds_before=72.86, score_seconds_after=72.86, style_bpm=[]))
+        self.assertNotIn('take_speed', fitted[3])
+
+    def test_a_long_score_is_sped_up_just_enough_in_its_tempo_line_only(self):
+        inp = request_input(LONG_COVER)
+        render, budget, facts, extras, notes = fixed_score_render(inp, cover_options(LONG_COVER), LONG, 'recording',
+                                                                  399.0, fit_tempo=True)
+        before, after = LONG.splitlines(), render['abc'].splitlines()
+        self.assertEqual([k for k in range(len(before)) if before[k] != after[k]], [4])
+        self.assertEqual(after[4], 'Q:1/4=99')
+        self.assertEqual(len(after), len(before))
+        self.assertTrue(compare(parse_abc(LONG), parse_abc(render['abc']), allow_tempo_change=True)['match'])
+        self.assertFalse(compare(parse_abc(LONG), parse_abc(render['abc']))['match'])
+        self.assertEqual((facts['score_bpm'], facts['score_seconds']), (99, 349.09))
+        self.assertLessEqual(facts['score_seconds'], 352)
+        self.assertEqual(sum(s['seconds'] for s in facts['sections']) // 1, 349)   # sections describe the take
+        self.assertEqual(budget, 9000)
+        self.assertEqual(render['cot'], 'full')
+        self.assertEqual(render['style'], 'Warm soul ballad')
+        self.assertEqual(extras['take_speed'], 99 / 86)
+        self.assertEqual(extras['tempo_fit'], dict(
+            applied=True, limit_seconds=360, fit_seconds=352, source_seconds=399.0, factor=1.1512, from_bpm=86,
+            to_bpm=99, percent=15, score_seconds_before=401.86, score_seconds_after=349.09, style_bpm=[]))
+        self.assertEqual(notes, [SPED_NOTE])
+        # The sped score and the six-minute budget reach the pipeline.
+        _, args = render_song(Pipeline(), render, sound_controls(LONG_COVER), budget)
+        self.assertEqual(args['abc'].splitlines()[4], 'Q:1/4=99')
+        self.assertEqual(args['semantic_sampling']['max_tokens'], 9000)
+        # Asked to leave the length guard off, the score is still sped and YuE2 keeps its own 9,000.
+        raw = dict(LONG_COVER, length_guard=False)
+        render, budget, _, _, _ = fixed_score_render(request_input(raw), cover_options(raw), LONG, 'recording', 399.0,
+                                                     fit_tempo=True)
+        self.assertIsNone(budget)
+        self.assertEqual(render['abc'].splitlines()[4], 'Q:1/4=99')
+
+    def test_worked_examples_and_the_limit(self):
+        # Four-bar groups at 86 BPM: 30 fit; 32, 34 and 36 need 2%, 8% and 15%; 38 would need 21%.
+        for groups, bpm, percent in ((30, 86, 0), (32, 88, 2), (34, 93, 8), (36, 99, 15)):
+            with self.subTest(groups=groups):
+                plan = tempo_plan(long_score(groups))
+                self.assertEqual(plan['to_bpm'], bpm)
+                self.assertLessEqual(plan['after'], 352)
+                if percent:  # the smallest whole tempo that fits: one BPM slower would not
+                    self.assertGreater(Fraction(groups * 16 * 60, bpm - 1), 352)
+                raw = dict(LONG_COVER)
+                _, _, _, extras, _ = fixed_score_render(request_input(raw), cover_options(raw), long_score(groups),
+                                                        'recording', None, fit_tempo=True)
+                self.assertEqual(extras['tempo_fit']['percent'], percent)
+        with self.assertRaises(ValueError) as caught:
+            fixed_score_render(request_input(LONG_COVER), cover_options(LONG_COVER), long_score(38), 'recording', 420.0,
+                               fit_tempo=True)
+        self.assertEqual(str(caught.exception), "This song's score runs 7 minutes 4 seconds. Fitting it into YuE2's six "
+                         'minutes would mean speeding it up 21%, more than the 20% a cover allows. Import a shorter '
+                         'recording or an excerpt; nothing was trimmed.')
+        with self.assertRaisesRegex(ValueError, 'Use a shorter score; nothing was trimmed.'):
+            tempo_plan(long_score(38), None, 'score')
+        with self.assertRaisesRegex(ValueError, 'Try another seed; nothing was trimmed.'):
+            tempo_plan(long_score(38), None, 'YuE2')
+        # Just under 20% and exactly 20% faster are allowed.
+        self.assertEqual(tempo_plan(long_score(36, bpm=83))['factor'], Fraction(99, 83))
+        self.assertEqual(tempo_plan(long_score(22, bpm=50))['factor'], Fraction(60, 50))
+
+    def test_a_given_score_past_the_limit_is_refused_before_any_gpu_work(self):
+        # The handler answers before importing runpod or loading YuE2: this test has neither.
+        raw = {'style': 'pop', 'lyrics': 'la la', 'abc': long_score(38), 'cot': 'melody', 'fit_tempo': True}
+        answer = handler({'input': raw})
+        self.assertIn('speeding it up 21%', answer['error'])
+        self.assertIn('Use a shorter score', answer['error'])
+
+    def test_the_style_follows_the_new_tempo(self):
+        raw = dict(LONG_COVER, match_score_tempo=True)
+        render, *_ = fixed_score_render(request_input(raw), cover_options(raw), LONG, 'recording', 399.0, fit_tempo=True)
+        self.assertEqual(render['style'], 'Warm soul ballad, 99 BPM')
+        raw = dict(LONG_COVER, style='Soul ballad at 86 BPM, a slow 86bpm groove, 70.5 bpm hi-hats')
+        render, _, _, extras, notes = fixed_score_render(request_input(raw), cover_options(raw), LONG, 'recording', 399.0,
+                                                         fit_tempo=True)
+        self.assertEqual(render['style'], 'Soul ballad at 99 BPM, a slow 99bpm groove, 81 bpm hi-hats')
+        self.assertEqual(extras['tempo_fit']['style_bpm'], [[86, 99], [86, 99], [70.5, 81]])
+        self.assertEqual(notes, [SPED_NOTE + ' The style named 86 BPM, so it now names 99 BPM to match. The style '
+                                 'named 70.5 BPM, so it now names 81 BPM to match.'])
+        self.assertEqual(scale_style_bpm('No tempo named', Fraction(99, 86)), ('No tempo named', []))
+
+    def test_instrumentals_and_given_scores_are_sped_the_same_way(self):
+        for raw, origin in (({'style': 'Piano trio', 'abc': LONG, 'instrumental': True, 'fit_tempo': True}, 'score'),
+                            ({'style': 'Piano trio', 'instrumental': True, 'fit_tempo': True}, 'YuE2'),
+                            ({'style': 'pop', 'lyrics': 'la la', 'abc': LONG, 'cot': 'full', 'fit_tempo': True}, 'score')):
+            with self.subTest(origin=origin, instrumental=raw.get('instrumental')):
+                render, budget, facts, extras, notes = fixed_score_render(request_input(raw), cover_options(raw), LONG,
+                                                                          origin, fit_tempo=True)
+                sped = parse_abc(render['abc'])
+                self.assertEqual(sped.bpm, 99)
+                self.assertEqual(budget, 9000)
+                self.assertEqual(extras['tempo_fit']['percent'], 15)
+                self.assertIn(SPED_NOTE, notes)
+                if raw.get('instrumental'):
+                    self.assertEqual(sped.voices['Vocal'].notes, [])
+                    self.assertEqual(sped.voices['Ins'].notes, parse_abc(LONG).voices['Vocal'].notes)
+                else:
+                    self.assertEqual(render['abc'], with_tempo(LONG, 99))
+
+    def test_source_limits_with_and_without_the_field(self):
+        self.assertEqual(fetch(360.0, SOURCE_MAX)[2], 360.0)
+        with self.assertRaisesRegex(ValueError, '^Use a source recording up to six minutes long.$'):
+            fetch(390.0, SOURCE_MAX)
+        self.assertEqual(fetch(390.0, FIT_SOURCE_MAX)[2], 390.0)
+        self.assertEqual(fetch(401.9, FIT_SOURCE_MAX)[2], 401.9)
+        with self.assertRaisesRegex(ValueError, '^Use a source recording up to 6 minutes 40 seconds long.$'):
+            fetch(402.5, FIT_SOURCE_MAX)
+
+    def test_an_unreadable_score_is_never_guessed_at(self):
+        broken = LONG.replace('K:C', 'K:H')
+        self.assertIsNone(tempo_plan(broken, 300.0))
+        raw = dict(LONG_COVER)
+        render, _, _, extras, notes = fixed_score_render(request_input(raw), cover_options(raw), broken, 'recording', 300.0,
+                                                         fit_tempo=True)
+        self.assertEqual(render['abc'], broken)
+        self.assertEqual(extras['tempo_fit'], dict(applied=False, limit_seconds=360, fit_seconds=352, source_seconds=300.0,
+                                                   reason='score unreadable'))
+        self.assertEqual(notes, [])
+        with self.assertRaisesRegex(ValueError, 'runs over six minutes, and its melody score could not be read'):
+            tempo_plan(broken, 380.0)
+
+    def test_tempo_line_helpers(self):
+        self.assertEqual(score_tempo(LONG), 86)
+        self.assertIsNone(score_tempo('not a score'))
+        self.assertEqual(with_tempo(LONG.replace('\n', '\r\n'), 99), with_tempo(LONG, 99).replace('\n', '\r\n'))
+        with self.assertRaises(ValueError):
+            with_tempo('X:1\nT:\n', 99)
+        self.assertEqual((spoken_length(424.19), spoken_length(400), spoken_length(360), spoken_length(61)),
+                         ('7 minutes 4 seconds', '6 minutes 40 seconds', '6 minutes', '1 minute 1 second'))
+        self.assertEqual(yue_handler.FIT_HARD, Fraction(6, 5))
 
 
 class VendoredHelpersTest(unittest.TestCase):

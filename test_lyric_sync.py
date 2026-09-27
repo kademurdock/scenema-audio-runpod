@@ -1,6 +1,7 @@
 """CPU tests for lyric_sync (Part 295 follow-up). Every lyric here is invented for these tests."""
 import json
 import unittest
+from unittest import mock
 
 import lyric_sync as S
 import yue_handler as Y
@@ -895,7 +896,7 @@ class MeasureModeTest(unittest.TestCase):
             if task in cached:
                 return dict(abc=cached[task], task=task, cached=True)
             return None if cache_only else dict(abc='fresh-' + task, task=task, cached=False)
-        Y.fetch_recording, Y.read_recording = (lambda reference, td: ('s', 'd', 10.0)), read
+        Y.fetch_recording, Y.read_recording = (lambda reference, td, limit=Y.SOURCE_MAX: ('s', 'd', 10.0)), read
         try:
             req = dict(reference='https://x/a.mp3', take=TAKE, lyrics=MISBROKEN, lyrics_used=None, cover_mode=cover_mode)
             return Y.measure_read(req, take_abc, '/tmp', None, 'b'), calls
@@ -1054,6 +1055,110 @@ class RoundThreeTest(unittest.TestCase):
         self.assertEqual(extras['lyric_sync']['reason'], 'error')
         self.assertIsNone(extras['sync_plan'])
         self.assertIn('kept as written', notes[-1])
+
+
+class FitTempoSyncTest(unittest.TestCase):
+    """fit_tempo changes only the final Q: line, after lyric sync has worked on the score as
+    written, so the same words go on the same notes; a sped take's shorter pauses and its
+    faster score are recognised when it is scored. SCORE runs 52 s at 60 BPM, so the tests
+    lower FIT_SECONDS to 45 to make it too long: it is sung at 70 BPM, 17% faster."""
+
+    def setUp(self):
+        self.plan = S.score_plan(SCORE)
+        self.timing = S.note_times(self.plan, [('melody_vocal.mid', recording_midi(self.plan))])
+        self.words = word_times(self.plan, MISBROKEN, STARTS)
+
+    def render(self, fit_tempo, **sync):
+        inp = Y.request_input(COVER)
+        state = dict(timing=self.timing, words=self.words, error=None, fit=True, measure=True)
+        state.update(sync)
+        with mock.patch.object(Y, 'FIT_SECONDS', 45):
+            return Y.fixed_score_render(inp, Y.cover_options(COVER), SCORE, 'recording', 50.0, sync=state,
+                                        fit_tempo=fit_tempo)
+
+    def take(self, extras, quiet):
+        """What align.py would hear in the take: the recording's word times in the order sung, with
+        every phrase-start pause `quiet` seconds long."""
+        times = []
+        for i in extras['sync_order']:
+            t = dict(self.words[i])
+            if t['quiet_before'] > 0:
+                t['quiet_before'] = quiet
+            times.append(t)
+        return times
+
+    def test_the_same_words_land_on_the_same_notes(self):
+        plain, plain_budget, _, plain_extras, plain_notes = self.render(False)
+        sped, budget, facts, extras, notes = self.render(True)
+        self.assertEqual(sped['lyrics'], FITTED)
+        self.assertEqual(sped['lyrics'], plain['lyrics'])
+        for key in ('sync_plan', 'sync_order', 'sync_words', 'sync_stars', 'lyric_sync', 'lyric_fit', 'meter_check'):
+            with self.subTest(key=key):
+                self.assertEqual(extras[key], plain_extras[key])
+        self.assertEqual(plain['abc'], SCORE)
+        self.assertEqual(sped['abc'], Y.with_tempo(SCORE, 70))
+        self.assertEqual((plain['style'], sped['style']), ('Warm folk ballad, 60 BPM', 'Warm folk ballad, 70 BPM'))
+        self.assertEqual(facts['score_bpm'], 70)
+        self.assertEqual(extras['take_speed'], 70 / 60)
+        self.assertEqual(extras['tempo_fit']['percent'], 17)
+        self.assertEqual(notes[:-1], plain_notes)
+        self.assertTrue(notes[-1].startswith("Sped up 17% to fit YuE2's six-minute limit (60 to 70 BPM)"))
+        self.assertNotIn('take_speed', plain_extras)
+
+    def test_a_touched_up_score_is_touched_up_then_sped(self):
+        _, timing, times = touch_times(TOUCH)
+        cover = dict(COVER, lyrics=TOUCH_LYRICS)
+        inp = Y.request_input(cover)
+        state = dict(timing=timing, words=times, error=None, fit=True, measure=False, touchup=True)
+        plain = Y.fixed_score_render(inp, Y.cover_options(cover), TOUCH, 'recording', 20.0, sync=state)[0]
+        with mock.patch.object(Y, 'FIT_SECONDS', 20):   # TOUCH runs 24 s at 60 BPM: exactly 20% faster
+            sped, _, _, extras, notes = Y.fixed_score_render(inp, Y.cover_options(cover), TOUCH, 'recording', 20.0,
+                                                             sync=state, fit_tempo=True)
+        self.assertNotEqual(plain['abc'], TOUCH)
+        self.assertEqual(sped['abc'], Y.with_tempo(plain['abc'], 72))
+        self.assertEqual(sped['lyrics'], plain['lyrics'])
+        self.assertIn('touched up in 1 place', notes[-2])
+        self.assertEqual(extras['tempo_fit']['percent'], 20)
+
+    def test_a_sped_take_pauses_for_a_shorter_time(self):
+        _, _, _, extras, _ = self.render(True)
+        plan, order = extras['sync_plan'], extras['sync_order']
+        take = self.take(extras, 0.14)     # a 0.16 s pause sung 17% faster
+        plain = S.measure(plan, order, take)
+        self.assertEqual(plain, S.measure(plan, order, take, speed=1.0))
+        self.assertEqual(plain['phrase_starts_after_pause']['hits'], 0)
+        sped = S.measure(plan, order, take, speed=70 / 60)
+        self.assertEqual(sped['phrase_starts_after_pause']['hits'], sped['phrase_starts_after_pause']['of'])
+        self.assertGreater(sped['phrase_starts_after_pause']['of'], 0)
+        self.assertEqual(sped['held_words_on_note'], plain['held_words_on_note'])
+        # measure_take hands the take's speed on from the render.
+        saved = Y.align_audio
+        Y.align_audio = lambda path, words, td, tag, stars=None: dict(words=take, timing={}, peak_gib=1.0)
+        try:
+            self.assertEqual(Y.measure_take('/tmp/take.wav', extras, '/tmp')['phrase_starts_after_pause'],
+                             sped['phrase_starts_after_pause'])
+            unsped = {k: v for k, v in extras.items() if k != 'take_speed'}
+            self.assertEqual(Y.measure_take('/tmp/take.wav', unsped, '/tmp')['phrase_starts_after_pause'],
+                             plain['phrase_starts_after_pause'])
+        finally:
+            Y.align_audio = saved
+
+    def test_a_sped_take_is_scored_against_its_recording(self):
+        run_read = MeasureModeTest().run_read
+        read, _ = run_read({'full': SCORE, 'melody': 'MELODY'}, Y.with_tempo(SCORE, 70))
+        self.assertEqual((read['task'], read['touched'], read['abc'], read['speed']), ('full', False, SCORE, 70 / 60))
+        read, _ = run_read({'full': SCORE}, SCORE)
+        self.assertEqual(read['speed'], 1.0)
+        _, result = TouchUpTest().fitted(TOUCH)
+        read, _ = run_read({'full': TOUCH, 'melody': 'MELODY'}, Y.with_tempo(result['abc'], 66))
+        self.assertEqual((read['task'], read['touched'], read['abc'], read['speed']), ('full', True, TOUCH, 1.1))
+        for take in (Y.with_tempo(SCORE, 80),          # more than 20% faster: never a fit_tempo take
+                     Y.with_tempo(SCORE, 50),          # slower
+                     Y.with_tempo(SCORE.replace('f4z4', 'g4z4'), 70)):   # sped, but a note differs too
+            with self.subTest(take=take.splitlines()[4]):
+                with self.assertRaisesRegex(ValueError, 'not one this recording was read into'):
+                    run_read({'full': SCORE}, take)
+        self.assertEqual(Y.at_cached_tempo('MELODY', SCORE), ('MELODY', 1.0))
 
 
 if __name__ == '__main__':
