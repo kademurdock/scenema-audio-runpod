@@ -2,8 +2,8 @@
 
   HF lj1995/VoiceConversionWebUI @ HF_RVC_REV   hubert_base/{config.json, preprocessor_config.json, pytorch_model.bin} and rmvpe.pt
                                                  into /opt/rvc/assets (RVC's own layout: assets/hubert_base, assets/rmvpe)
-  HF baicai1145/pymss @ PYMSS_ENDPOINT's commit  the baked separators (voice_request.EXTRACTORS marked baked, the karaoke lead
-                                                 model and the dereverb model) through pymss's own downloader; each file's size is
+  HF baicai1145/pymss @ PYMSS_ENDPOINT's commit  the baked separators (voice_request.EXTRACTORS and LEAD_MODELS marked baked,
+                                                 and the dereverb model) through pymss's own downloader; each file's size is
                                                  checked against pymss's catalog
 Writes /opt/voice/models.json (path, bytes, sha256 of every file) so the image says exactly which weights it carries.
 Voice models are NOT here: they are personal, live in the private bucket and are fetched per job (voice_models.py)."""
@@ -14,7 +14,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from voice_request import DEREVERB_MODEL, EXTRACTORS, LEAD_MODEL  # noqa: E402
+from voice_request import DEREVERB_MODEL, EXTRACTORS, LEAD_MODELS  # noqa: E402
 
 RVC = os.environ.get("VOICE_RVC_DIR", "/opt/rvc")
 MODELS = os.environ.get("PYMSS_MODEL_DIR", "/opt/pymss_models")
@@ -39,7 +39,8 @@ def main():
     got.append(hf_hub_download(repo_id=HF_RVC, filename="rmvpe.pt", revision=HF_RVC_REV, local_dir=os.path.join(assets, "rmvpe")))
     catalog = json.load(open(os.path.join(RVC, "tools", "pymss", "resources", "model_catalog.json"), encoding="utf-8"))
     catalog = {m["name"]: m for m in (catalog["models"] if isinstance(catalog, dict) else catalog)}
-    wanted = [e["model"] for e in EXTRACTORS.values() if e["baked"]] + [LEAD_MODEL, DEREVERB_MODEL]
+    wanted = [e["model"] for e in EXTRACTORS.values() if e["baked"]] + [m["model"] for m in LEAD_MODELS.values() if m["baked"]]
+    wanted.append(DEREVERB_MODEL)
     for name in wanted:
         entry = catalog[name]
         subprocess.run([sys.executable, "-m", "tools.pymss.cli", "download", name, "--model-dir", MODELS, "--endpoint", ENDPOINT],

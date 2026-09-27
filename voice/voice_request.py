@@ -10,7 +10,8 @@ Input (RunPod job "input"):
   index_key / index_sha256   optional retrieval index (.index) from the same voice-models/<owner>/ folder
   pitch         "auto" (the octave rule, needs voice_range) or whole semitones -24..24
   voice_range   optional {"p05", "p50", "p95"}: the singer's own low, middle and high notes as MIDI numbers
-  options       extractor, fallback, lead_split, dereverb, room, index_rate, protect, rms_mix_rate, f0_method (DEFAULTS below)
+  options       extractor, fallback, lead_split, lead_model, dereverb, room, soft_s, index_rate, protect, rms_mix_rate, f0_method
+                (DEFAULTS below)
   output_prefix optional "voice/<8-64 letters, digits, - or _>"; default voice/<random>
 Nothing here names a person: the owner is whatever the caller's registry put in the model key."""
 import ipaddress
@@ -23,21 +24,35 @@ import uuid
 # Vocal extractors: pymss models (RVC's bundled separator). Baked into the image unless marked on demand, which download once per
 # worker from the pinned model endpoint. "demucs" is the vocals model of htdemucs_ft.
 EXTRACTORS = {
+    "hyperace": {"model": "bs_roformer_voc_hyperacev2.ckpt", "label": "BS-RoFormer HyperACE v2", "baked": True},
     "bs_roformer": {"model": "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "label": "BS-RoFormer ep 317", "baked": True},
     "melband_kim": {"model": "Kim_MelBandRoformer.ckpt", "label": "Mel-band RoFormer (Kim)", "baked": True},
     "melband_becruily": {"model": "mel_band_roformer_vocals_becruily.ckpt", "label": "Mel-band RoFormer (becruily)", "baked": False},
     "demucs": {"model": "HTDemucs4_FT_vocals_official.th", "label": "HTDemucs ft (vocals)", "baked": True},
 }
-LEAD_MODEL = "model_mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"
+# Lead vs backing (karaoke) models. lead_stem names the output that IS the lead (pymss writes <input>_<instrument>.wav); None means
+# the lead is found by listening (the louder, steadier-pitched part), as round 1 did with aufr33's model.
+LEAD_MODELS = {
+    "frazer": {"model": "bs_roformer_karaoke_frazer_becruily.ckpt", "label": "BS-RoFormer karaoke (frazer & becruily)",
+               "lead_stem": "vocals", "baked": True},
+    "aufr33": {"model": "model_mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+               "label": "Mel-band RoFormer karaoke (aufr33 & viperx)", "lead_stem": None, "baked": True},
+}
 DEREVERB_MODEL = "dereverb_mel_band_roformer_less_aggressive_anvuew_sdr_18.8050.ckpt"
-# Today's chain (the Sep 27 test): BS-RoFormer vocals, Demucs if it fails, karaoke lead split, gentle dereverb, the room added back;
-# RVC index rate 0.5, protect 0.33, RMS mix 0.25, RMVPE pitch.
+# The round 2 chain (Sep 27 2026, voice-persona RUNBOOK section 17, measured with Whisper against the lyrics on the three songs
+# with the most backing singers): HyperACE v2 vocals (BS-RoFormer ep 317 if it fails), the frazer & becruily lead split, NO
+# dereverb (so no room is added back), RVC index rate 0.5, protect 0.33, RMS mix 0.25, RMVPE pitch, then the input's own S hiss
+# above ~4 kHz in its unvoiced frames (soft_s). The lead that reached RVC lost 4 of 591 sung words instead of 105, her voice sang
+# 494 of them right instead of 322, and the S sounds matched the original singer's level (within 0.1 dB) and texture.
+# Round 1's chain is still one request away: extractor bs_roformer, fallback demucs, lead_model aufr33, dereverb on, soft_s off.
 DEFAULTS = {
-    "extractor": "bs_roformer",
-    "fallback": "demucs",
+    "extractor": "hyperace",
+    "fallback": "bs_roformer",
     "lead_split": True,
-    "dereverb": True,
+    "lead_model": "frazer",
+    "dereverb": False,
     "room": True,
+    "soft_s": True,
     "index_rate": 0.5,
     "protect": 0.33,
     "rms_mix_rate": 0.25,
@@ -158,12 +173,17 @@ def parse(raw, resolve=True):
     f0_method = options.get("f0_method", DEFAULTS["f0_method"])
     if f0_method not in ("rmvpe", "pm"):
         raise ValueError("Pitch tracking must be rmvpe or pm.")
+    lead_model = options.get("lead_model", DEFAULTS["lead_model"])
+    if lead_model not in LEAD_MODELS:
+        raise ValueError("Choose one of the listed lead split models.")
     clean = {
         "extractor": extractor,
         "fallback": None if fallback in ("none", extractor) else fallback,
         "lead_split": _flag(options, "lead_split"),
+        "lead_model": lead_model,
         "dereverb": _flag(options, "dereverb"),
         "room": _flag(options, "room"),
+        "soft_s": _flag(options, "soft_s"),
         "index_rate": _number(options, "index_rate", 0, 1, "Voice likeness (index rate)"),
         "protect": _number(options, "protect", 0, 0.5, "Protect"),
         "rms_mix_rate": _number(options, "rms_mix_rate", 0, 1, "Loudness follow (RMS mix rate)"),

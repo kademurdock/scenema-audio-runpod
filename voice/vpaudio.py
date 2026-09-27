@@ -360,6 +360,103 @@ def limiter(x, sr, ceiling_db=-1.0, lookahead_ms=5.0, release_ms=80.0, blk=32):
     return (x * gs[:, None]).astype(np.float32), float(-20 * np.log10(gs.min()))
 
 
+# ---------------------------------------------------------------- S sounds (round 2, voice-persona improve/pod/ana_i.py)
+def stft(x, n_fft=2048, hop=512):
+    """Hann-window STFT, frames centred (n_fft // 2 of zeros in front) -> complex64 [frames, n_fft // 2 + 1]."""
+    x = np.asarray(x, np.float32)
+    pad = n_fft // 2
+    xp = np.concatenate([np.zeros(pad, np.float32), x, np.zeros(pad + n_fft, np.float32)])
+    n = 1 + (len(xp) - n_fft) // hop
+    win = np.hanning(n_fft + 1)[:-1].astype(np.float32)
+    out = np.empty((n, n_fft // 2 + 1), np.complex64)
+    for b in range(0, n, 4096):
+        idx = np.arange(b, min(n, b + 4096))
+        fr = np.stack([xp[i * hop:i * hop + n_fft] for i in idx]) * win
+        out[idx] = np.fft.rfft(fr, axis=1).astype(np.complex64)
+    return out
+
+
+def istft(S, length, n_fft=2048, hop=512):
+    """Weighted overlap-add inverse of stft(); exact for an unchanged spectrogram."""
+    win = np.hanning(n_fft + 1)[:-1].astype(np.float32)
+    n = S.shape[0]
+    total = (n - 1) * hop + n_fft
+    y = np.zeros(total, np.float64)
+    wsum = np.zeros(total, np.float64)
+    for b in range(0, n, 4096):
+        idx = np.arange(b, min(n, b + 4096))
+        fr = np.fft.irfft(S[idx], n_fft, axis=1) * win
+        for k, i in enumerate(idx):
+            y[i * hop:i * hop + n_fft] += fr[k]
+            wsum[i * hop:i * hop + n_fft] += win ** 2
+    y = y / np.maximum(wsum, 1e-8)
+    pad = n_fft // 2
+    return y[pad:pad + length].astype(np.float32)
+
+
+def _band(sr, n_fft, lo, hi):
+    f = np.arange(n_fft // 2 + 1) * sr / n_fft
+    return (f >= lo) & (f < hi)
+
+
+def _smooth(v, k):
+    return v if k <= 1 else np.convolve(v, np.ones(k) / k, mode="same")
+
+
+def _movmax(v, k):
+    if k <= 1 or not len(v):
+        return v
+    pad = k // 2
+    vp = np.concatenate([np.full(pad, v[0]), v, np.full(pad, v[-1])])
+    return np.max(np.stack([vp[i:i + len(v)] for i in range(k)]), axis=0)
+
+
+def _db(p):
+    return 10 * np.log10(np.maximum(p, 1e-12))
+
+
+def sib_frames(src, sr, n_fft=2048, hop=512):
+    """STFT frames where a voice is hissy and unvoiced (an S, SH, T or F): 4-11 kHz holds more than 40% of the 80 Hz-11 kHz energy,
+    no confident pitch nearby, and the frame is not silence. -> (bool mask, the voice's STFT)."""
+    S = stft(src, n_fft, hop)
+    pw = np.abs(S) ** 2
+    hf = pw[:, _band(sr, n_fft, 4000, 11000)].sum(1)
+    tot = pw[:, _band(sr, n_fft, 80, 11000)].sum(1)
+    del pw
+    ratio = hf / np.maximum(tot, 1e-12)
+    lvl = _db(tot)
+    tr = pitch_track(src, sr)
+    tt = np.arange(len(tr["voiced"])) * tr["hop_s"]
+    ft = np.arange(S.shape[0]) * hop / sr
+    voiced = np.interp(ft, tt, tr["voiced"].astype(np.float64)) > 0.25 if len(tt) else np.zeros(len(ft), bool)
+    return (ratio > 0.4) & ~voiced & (lvl > np.percentile(lvl, 95) - 45), S
+
+
+def unvoiced_blend(conv, src, sr, lo=3500, hi_x=4500, n_fft=2048, hop=512):
+    """Softer S sounds: in the input voice's S frames (sib_frames), the converted voice above ~4 kHz is replaced by the input's own
+    hiss (3.5-4.5 kHz crossover, ~30 ms fades), the input first scaled so its loud level matches the converted voice's, so each S
+    keeps the input's natural S-to-vowel balance. S hiss carries little of who is singing; RVC rebuilds every S, which is the
+    slightly robotic edge. conv and src: mono, lined up, same length. -> (mono float32, info)."""
+    conv = np.asarray(conv, np.float32)
+    m, Ss = sib_frames(src, sr, n_fft, hop)
+    Sc = stft(conv, n_fft, hop)
+    n = min(len(m), len(Sc))
+    m, Ss, Sc = m[:n].astype(np.float64), Ss[:n], Sc[:n]
+    if m.sum() < 1:
+        return conv, {"blend_frames": 0, "blend_s": 0.0, "src_gain_db": 0.0}
+    k = max(1, int(round(0.03 * sr / hop)))
+    w = np.clip(_smooth(_movmax(m, 3), 2 * k + 1) * 1.5, 0, 1)
+    ls = np.percentile(_db((np.abs(Ss) ** 2).sum(1)), 95)
+    lc = np.percentile(_db((np.abs(Sc) ** 2).sum(1)), 95)
+    g = 10 ** ((lc - ls) / 20)
+    f = np.arange(n_fft // 2 + 1) * sr / n_fft
+    fx = np.clip((f - lo) / (hi_x - lo), 0, 1)
+    W = (w[:, None] * fx[None, :]).astype(np.float32)
+    y = istft(Sc * (1 - W) + Ss * np.float32(g) * W, len(conv), n_fft, hop)
+    return y, {"blend_frames": int((w > 0.5).sum()), "blend_s": round(float((w > 0.5).sum()) * hop / sr, 1),
+               "src_gain_db": round(float(lc - ls), 2)}
+
+
 def master(path, x, sr, target_lufs=-16.0, ceiling_db=-1.0):
     """The one listening path: gain to target_lufs, peak-limit to ceiling_db, write (mp3/flac/wav). Returns the measurements."""
     before = measure(x, sr)

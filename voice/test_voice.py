@@ -27,8 +27,8 @@ MODEL = "voice-models/u123/abc/model.pth"
 INDEX = "voice-models/u123/abc/model.index"
 
 PYMSS_STANDIN = textwrap.dedent('''
-    """Stand-in for RVC's pymss CLI. FAKE_PLAN (JSON) says what each model does: vocals / karaoke / karaoke_weak / dereverb /
-    fail / silent. Records every call to FAKE_LOG."""
+    """Stand-in for RVC's pymss CLI. FAKE_PLAN (JSON) says what each model does: vocals / karaoke / karaoke_weak / named /
+    named_weak / dereverb / fail / silent. Records every call to FAKE_LOG."""
     import glob, json, os, sys
     sys.path.insert(0, os.environ["FAKE_VOICE_DIR"])
     import numpy as np
@@ -55,6 +55,10 @@ PYMSS_STANDIN = textwrap.dedent('''
             out("karaoke", x * 0.8); out("instrumental", x * 0.2)
         elif what == "karaoke_weak":
             out("karaoke", x * 0.3); out("instrumental", x * 0.3)
+        elif what == "named":  # the frazer & becruily layout: Vocals is the lead, Instrumental the rest
+            out("Vocals", x * 0.8); out("Instrumental", x * 0.2)
+        elif what == "named_weak":
+            out("Vocals", x * 0.3); out("Instrumental", x * 0.7)
         elif what == "dereverb":
             out("noreverb", x * 0.9); out("reverb", x * 0.1)
 ''')
@@ -113,6 +117,17 @@ class FakeS3:
         return f"https://bucket.example/{Params['Key']}?X-Amz-Expires={ExpiresIn}"
 
 
+def EX(name):
+    return voice_request.EXTRACTORS[name]["model"]
+
+
+def LEAD(name):
+    return voice_request.LEAD_MODELS[name]["model"]
+
+
+ROUND1 = {"extractor": "bs_roformer", "fallback": "demucs", "lead_model": "aufr33", "dereverb": True, "soft_s": False}
+
+
 def request(**over):
     raw = {"mode": "song", "audio_key": "yue2/abc/master.wav", "model_key": MODEL, "index_key": INDEX, "pitch": "auto"}
     raw.update(over)
@@ -143,8 +158,8 @@ class Base(unittest.TestCase):
         shutil.rmtree(self.td, ignore_errors=True)
 
     def plan(self, extra):
-        plan = {voice_request.EXTRACTORS["bs_roformer"]["model"]: "vocals", voice_request.EXTRACTORS["demucs"]["model"]: "vocals",
-                voice_request.LEAD_MODEL: "karaoke", voice_request.DEREVERB_MODEL: "dereverb"}
+        plan = {EX("hyperace"): "vocals", EX("bs_roformer"): "vocals", EX("demucs"): "vocals", LEAD("frazer"): "named",
+                LEAD("aufr33"): "karaoke", voice_request.DEREVERB_MODEL: "dereverb"}
         plan.update(extra)
         os.environ["FAKE_PLAN"] = json.dumps(plan)
 
@@ -175,10 +190,12 @@ class Base(unittest.TestCase):
 
 
 class RequestTests(unittest.TestCase):
-    def test_defaults_are_todays_chain(self):
+    def test_defaults_are_the_round2_chain(self):
         r = request()
-        self.assertEqual(r["options"], {"extractor": "bs_roformer", "fallback": "demucs", "lead_split": True, "dereverb": True,
-                                        "room": True, "index_rate": 0.5, "protect": 0.33, "rms_mix_rate": 0.25, "f0_method": "rmvpe"})
+        self.assertEqual(r["options"], {"extractor": "hyperace", "fallback": "bs_roformer", "lead_split": True,
+                                        "lead_model": "frazer", "dereverb": False, "room": True, "soft_s": True, "index_rate": 0.5,
+                                        "protect": 0.33, "rms_mix_rate": 0.25, "f0_method": "rmvpe"})
+        self.assertEqual({k: request(options=ROUND1)["options"][k] for k in ROUND1}, ROUND1)  # round 1 is one request away
         self.assertEqual(r["pitch"], "auto")
         self.assertTrue(r["output_prefix"].startswith("voice/"))
 
@@ -187,13 +204,14 @@ class RequestTests(unittest.TestCase):
                                         "protect": 0.2})
         self.assertEqual((r["pitch"], r["options"]["extractor"], r["options"]["fallback"], r["options"]["lead_split"]),
                          (-12, "melband_kim", None, False))
-        self.assertEqual(request(options={"extractor": "demucs"})["options"]["fallback"], None)  # never itself
+        self.assertEqual(request(options={"extractor": "bs_roformer"})["options"]["fallback"], None)  # never itself
 
     def test_refusals_are_sentences(self):
         bad = [dict(audio_key="../etc/passwd"), dict(audio_key="private/other.wav"), dict(model_key="voice-models/u1/x.bin"),
                dict(model_key="models/u1/x.pth"), dict(index_key="voice-models/u999/abc/model.index"), dict(pitch=30),
                dict(pitch=1.5), dict(pitch=True), dict(options={"extractor": "magic"}), dict(options={"protect": 0.9}),
                dict(options={"index_rate": "high"}), dict(options={"lead_split": "maybe"}), dict(mode="karaoke"),
+               dict(options={"lead_model": "magic"}), dict(options={"soft_s": "sometimes"}),
                dict(output_prefix="yue2/x"), dict(voice_range={"p05": 70, "p50": 60, "p95": 80}), dict(model_sha256="xyz"),
                dict(audio_url="https://bucket.example/a.wav")]
         for over in bad:
@@ -260,12 +278,34 @@ class ModelCacheTests(unittest.TestCase):
 
 
 class PipelineTests(Base):
-    def test_song_chain_and_command_lines(self):
-        out, said = self.run_job(request(pitch=3))
+    def test_default_song_chain(self):
+        out, said = self.run_job(request())
+        r = out["report"]
+        self.assertEqual([c["argv"][1] for c in self.calls("pymss")], [EX("hyperace"), LEAD("frazer")])  # no dereverb
+        sep = r["separation"]
+        self.assertEqual((sep["vocals_by"], sep["lead_split"], sep["lead_model"], sep["dereverb"]),
+                         ("hyperace", "used", "frazer", "off"))
+        self.assertAlmostEqual(sep["lead_energy_share"], 0.64, delta=0.02)  # the named Vocals stem (0.8 of the vocals), not a guess
+        self.assertNotIn("room_db", r["placed"])  # no dereverb, so no room added back
+        self.assertIn("soft_s", r["placed"])
+        self.assertTrue(r["settings"]["soft_s"])
+        self.assertEqual(r["notes"], [])
+        self.assertEqual(said, ["Splitting the voice from the music", "Finding the lead singer", "Singing it in your voice",
+                                "Putting the song back together"])
+        mix, _ = va.decode(out["files"]["mix.wav"])
+        self.assertEqual(mix.shape, (len(tone_song()), 2))
+
+    def test_named_lead_stem_missing_is_not_guessed(self):
+        self.plan({LEAD("frazer"): "karaoke"})  # outputs named karaoke/instrumental: no Vocals stem to trust
+        out, _ = self.run_job(request())
+        self.assertTrue(out["report"]["separation"]["lead_split"].startswith("failed"))
+        self.assertTrue(any("every voice was re-sung" in note for note in out["report"]["notes"]))
+
+    def test_round1_chain_and_command_lines(self):
+        out, said = self.run_job(request(pitch=3, options=ROUND1))
         r = out["report"]
         pymss = self.calls("pymss")
-        self.assertEqual([c["argv"][1] for c in pymss], [voice_request.EXTRACTORS["bs_roformer"]["model"], voice_request.LEAD_MODEL,
-                                                         voice_request.DEREVERB_MODEL])
+        self.assertEqual([c["argv"][1] for c in pymss], [EX("bs_roformer"), LEAD("aufr33"), voice_request.DEREVERB_MODEL])
         argv = pymss[0]["argv"]
         self.assertEqual(argv[2:4], ["--endpoint", "https://models.example/pinned"])  # the pinned endpoint, right after the model
         self.assertIn("--device", argv)
@@ -282,6 +322,7 @@ class PipelineTests(Base):
         self.assertAlmostEqual(sep["reverb_ratio_db"], 20 * np.log10(0.1 / 0.9), delta=0.2)
         self.assertAlmostEqual(r["placed"]["lag_ms"], 25.0, delta=2.0)  # the stand-in's 25 ms is taken back out
         self.assertTrue(-30 <= r["placed"]["room_db"] <= -6)
+        self.assertNotIn("soft_s", r["placed"])
         self.assertEqual(r["notes"], [])
         self.assertEqual(said, ["Splitting the voice from the music", "Finding the lead singer", "Taking the room off the voice",
                                 "Singing it in your voice", "Putting the song back together"])
@@ -296,28 +337,30 @@ class PipelineTests(Base):
         self.assertAlmostEqual(va.measure(mix, SR)["I"], orig, delta=1.0)  # back to the original's loudness
 
     def test_fallback_extractor(self):
-        self.plan({voice_request.EXTRACTORS["bs_roformer"]["model"]: "fail"})
+        self.plan({EX("hyperace"): "fail"})
         out, _ = self.run_job(request())
         sep = out["report"]["separation"]
-        self.assertEqual((sep["vocals_by"], sep["fallback_used"]), ("demucs", "demucs"))
+        self.assertEqual((sep["vocals_by"], sep["fallback_used"]), ("bs_roformer", "bs_roformer"))
         self.assertTrue(any("could not split" in note for note in out["report"]["notes"]))
 
     def test_no_voice_anywhere_is_a_sentence(self):
-        self.plan({voice_request.EXTRACTORS["bs_roformer"]["model"]: "silent", voice_request.EXTRACTORS["demucs"]["model"]: "fail"})
+        self.plan({EX("hyperace"): "silent", EX("bs_roformer"): "fail"})
         with self.assertRaises(ValueError) as caught:
             self.run_job(request())
         self.assertIn("another vocal extractor", caught.exception.args[0])
         self.assertEqual(self.calls("rvc"), [])  # nothing converted, nothing spent on RVC
 
     def test_weak_lead_split_resings_every_voice(self):
-        self.plan({voice_request.LEAD_MODEL: "karaoke_weak"})
-        out, _ = self.run_job(request())
-        self.assertTrue(out["report"]["separation"]["lead_split"].startswith("misfired"))
-        self.assertTrue(any("every voice was re-sung" in note for note in out["report"]["notes"]))
+        for model, kind, opts in ((LEAD("frazer"), "named_weak", {}), (LEAD("aufr33"), "karaoke_weak", {"lead_model": "aufr33"})):
+            self.plan({model: kind})
+            out, _ = self.run_job(request(options=opts))
+            self.assertTrue(out["report"]["separation"]["lead_split"].startswith("misfired"), kind)
+            self.assertTrue(any("every voice was re-sung" in note for note in out["report"]["notes"]), kind)
 
     def test_switches_off(self):
-        out, _ = self.run_job(request(options={"lead_split": False, "dereverb": False, "index_rate": 0}), index=True)
-        self.assertEqual([c["argv"][1] for c in self.calls("pymss")], [voice_request.EXTRACTORS["bs_roformer"]["model"]])
+        out, _ = self.run_job(request(options={"lead_split": False, "dereverb": False, "soft_s": False, "index_rate": 0}), index=True)
+        self.assertEqual([c["argv"][1] for c in self.calls("pymss")], [EX("hyperace")])
+        self.assertNotIn("soft_s", out["report"]["placed"])
         flags = self.calls("rvc")[0]["argv"]
         self.assertNotIn("--index", flags)  # index rate 0: no index
         self.assertNotIn("room_db", out["report"]["placed"])  # no dereverb, so no room added back
@@ -331,9 +374,9 @@ class PipelineTests(Base):
 
     def test_extractor_that_failed_the_build_check_is_skipped(self):
         with open(os.environ["VOICE_SELFTEST"], "w") as f:
-            json.dump({"extractors": {"bs_roformer": False, "demucs": True}}, f)
+            json.dump({"extractors": {"hyperace": False, "bs_roformer": True}}, f)
         out, _ = self.run_job(request())
-        self.assertEqual(out["report"]["separation"]["vocals_by"], "demucs")
+        self.assertEqual(out["report"]["separation"]["vocals_by"], "bs_roformer")
         self.assertTrue(any("failed the worker's own check" in note for note in out["report"]["notes"]))
 
     def test_octave_rule(self):
@@ -356,10 +399,49 @@ class PipelineTests(Base):
         self.assertIn("up to six minutes", caught.exception.args[0])
 
 
+class SoftSTests(unittest.TestCase):
+    def test_s_hiss_comes_from_the_input_and_the_vowels_stay(self):
+        """A sung tone with bursts of hiss (the S sounds) in; the 'converted' voice has the same tone but a louder, buzzy 6 kHz
+        whistle where each S was. After the blend the S frames carry the input's own hiss at the input's S-to-vowel balance, and
+        the vowels are untouched."""
+        rng = np.random.default_rng(5)
+        n = SR * 4
+        t = np.arange(n) / SR
+        tone = sum(np.sin(2 * np.pi * 220 * k * t) / k for k in range(1, 8)).astype(np.float32) * 0.3
+        s_mask = ((t % 1.0) > 0.7).astype(np.float32)  # 0.3 s of S every second
+        spec = np.fft.rfft(rng.standard_normal(n))
+        spec[np.fft.rfftfreq(n, 1 / SR) < 4500] = 0
+        hiss = (np.fft.irfft(spec, n) * 0.1).astype(np.float32)
+        src = tone * (1 - s_mask) + hiss * s_mask
+        conv = tone * (1 - s_mask) + (0.2 * np.sin(2 * np.pi * 6000 * t)).astype(np.float32) * s_mask
+        y, info = va.unvoiced_blend(conv, src, SR)
+        self.assertEqual(len(y), n)
+        self.assertGreater(info["blend_frames"], 50)
+        band = va._band(SR, 2048, 4500, 11000)
+        m, _ = va.sib_frames(src, SR)
+        core = m & np.roll(m, 3) & np.roll(m, -3)  # away from the fades
+
+        def hf_db(x):
+            return 10 * np.log10((np.abs(va.stft(x)[: len(m)][core][:, band]) ** 2).sum(1).mean())
+        self.assertLess(abs(hf_db(y) - (hf_db(src) + info["src_gain_db"])), 1.5)  # the input's hiss, level-matched
+        self.assertGreater(hf_db(conv) - hf_db(y), 3)  # the whistle is gone
+        vowels = s_mask[: len(y)] == 0
+        vowels &= np.roll(vowels, SR // 10) & np.roll(vowels, -SR // 10)
+        self.assertLess(float(np.abs(y[vowels] - conv[vowels]).max()), 1e-3)  # vowels exactly as converted
+
+    def test_no_s_sounds_leaves_the_voice_as_it_was(self):
+        t = np.arange(SR * 3) / SR
+        tone = sum(np.sin(2 * np.pi * 220 * k * t) / k for k in range(1, 8)).astype(np.float32) * 0.3
+        y, info = va.unvoiced_blend(tone, tone, SR)
+        self.assertEqual(info["blend_frames"], 0)
+        self.assertLess(float(np.abs(y - tone).max()), 1e-3)
+
+
 class HandlerTests(Base):
     def test_output_shape_and_one_copy_in_vocal_mode(self):
         import voice_handler
-        s3 = FakeS3({"voice/abcdefgh12/in.wav": open(self.song_file(), "rb").read(), MODEL: b"m", INDEX: b"i"})
+        with open(self.song_file(), "rb") as f:
+            s3 = FakeS3({"voice/abcdefgh12/in.wav": f.read(), MODEL: b"m", INDEX: b"i"})
         progress = []
         fake_runpod = types.SimpleNamespace(serverless=types.SimpleNamespace(progress_update=lambda job, text: progress.append(text)))
         sys.modules["runpod"] = fake_runpod

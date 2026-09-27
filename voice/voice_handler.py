@@ -20,7 +20,7 @@ import voice_models  # noqa: E402
 import voice_pipeline  # noqa: E402
 import voice_request  # noqa: E402
 
-FEATURES = ["song", "vocal", "auto-octave", "extractors", "lead-split", "dereverb", "room", "model-cache"]
+FEATURES = ["song", "vocal", "auto-octave", "extractors", "lead-split", "lead-models", "dereverb", "room", "soft-s", "model-cache"]
 PRESIGN_S = 7 * 24 * 3600
 GPU = {}
 

@@ -6,7 +6,8 @@
     weights (the same checkpoint layout RVC's trainer saves), through HuBERT and RMVPE, so the whole inference path is exercised
     without anybody's voice
 Writes /opt/voice/selftest.json; the worker skips (and says so) any extractor that failed here. Exits 1 when RVC or any part of
-today's default chain (BS-RoFormer vocals, karaoke lead split, dereverb) fails; a failing optional extractor is only recorded."""
+the default chain (voice_request.DEFAULTS: the vocal extractor and its fallback, the lead split model, and dereverb when it is on)
+fails; a failing optional model is only recorded."""
 import glob
 import json
 import os
@@ -19,7 +20,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from voice_request import DEFAULTS, DEREVERB_MODEL, EXTRACTORS, LEAD_MODEL  # noqa: E402
+from voice_request import DEFAULTS, DEREVERB_MODEL, EXTRACTORS, LEAD_MODELS  # noqa: E402
 
 RVC = os.environ.get("VOICE_RVC_DIR", "/opt/rvc")
 MODELS = os.environ.get("PYMSS_MODEL_DIR", "/opt/pymss_models")
@@ -87,17 +88,25 @@ def main():
             ok = ok and has_stem(os.path.join(td, name), "mix", "vocals")
             report["extractors"][name], report["seconds"][name] = ok, secs
             print(f"extractor {name}: {'ok' if ok else 'FAILED'} in {secs} s", flush=True)
-            if not ok and name in (DEFAULTS["extractor"],):
+            if not ok and name in (DEFAULTS["extractor"], DEFAULTS["fallback"]):
                 fatal.append(name)
         kin = os.path.join(td, "kin")
         os.makedirs(kin)
         write_wav(os.path.join(kin, "vocals.wav"), np.stack([voice, voice], 1), SR)
-        ok, secs = pymss(LEAD_MODEL, kin, os.path.join(td, "kout"))
-        ok = ok and len(glob.glob(os.path.join(td, "kout", "**", "vocals_*.wav"), recursive=True)) >= 2
-        report["lead_split"], report["seconds"]["lead_split"] = ok, secs
-        print(f"lead split: {'ok' if ok else 'FAILED'} in {secs} s", flush=True)
-        if not ok:
-            fatal.append("lead_split")
+        report["lead_models"] = {}
+        for name, entry in LEAD_MODELS.items():
+            if not entry["baked"]:
+                continue
+            kout = os.path.join(td, f"kout_{name}")
+            ok, secs = pymss(entry["model"], kin, kout)
+            parts = glob.glob(os.path.join(kout, "**", "vocals_*.wav"), recursive=True)
+            # a model that names its lead must write that stem (the worker reads exactly it); the other kind needs both parts
+            ok = ok and (has_stem(kout, "vocals", entry["lead_stem"]) if entry["lead_stem"] else len(parts) >= 2)
+            report["lead_models"][name], report["seconds"][f"lead_{name}"] = ok, secs
+            print(f"lead split {name}: {'ok' if ok else 'FAILED'} in {secs} s {[os.path.basename(p) for p in parts]}", flush=True)
+            if not ok and name == DEFAULTS["lead_model"]:
+                fatal.append(f"lead_{name}")
+        report["lead_split"] = report["lead_models"].get(DEFAULTS["lead_model"], False)
         din = os.path.join(td, "din")
         os.makedirs(din)
         write_wav(os.path.join(din, "lead.wav"), np.stack([voice, voice], 1), SR)
@@ -105,7 +114,7 @@ def main():
         ok = ok and has_stem(os.path.join(td, "dout"), "lead", "noreverb")
         report["dereverb"], report["seconds"]["dereverb"] = ok, secs
         print(f"dereverb: {'ok' if ok else 'FAILED'} in {secs} s", flush=True)
-        if not ok:
+        if not ok and DEFAULTS["dereverb"]:
             fatal.append("dereverb")
         model = os.path.join(td, "selftest.pth")
         tiny_rvc_model(model)

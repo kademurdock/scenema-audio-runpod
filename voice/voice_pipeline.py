@@ -4,14 +4,18 @@ step with stand-in separators and a stand-in RVC.
 
 song mode:
   1. vocals: the chosen pymss extractor on the mix; if it fails or finds nothing, the fallback extractor. band = mix - vocals.
-  2. lead split (optional): the karaoke model; the louder, steadier-pitched part is the lead, kept only when it holds at least a
-     quarter of the vocal energy. backing = vocals - lead, left as it was sung.
-  3. dereverb (optional): the gentle dereverb model; the dry lead is converted, and the reverb-to-dry ratio is remembered.
+  2. lead split (optional): the chosen karaoke model (voice_request.LEAD_MODELS). The frazer & becruily model names its lead
+     stem; for aufr33's the louder, steadier-pitched part is the lead. Kept only when it holds at least a quarter of the vocal
+     energy. backing = vocals - lead, left as it was sung.
+  3. dereverb (optional, off by default since round 2): the gentle dereverb model; the dry lead is converted, and the
+     reverb-to-dry ratio is remembered.
   4. pitch: the octave rule (vpaudio.choose_shift) against the singer's range, or the semitones asked for.
-  5. RVC (infer/cli.py of the pinned RVC) re-sings the dry lead.
-  6. remix: aligned to the lead it replaces (+-300 ms), exactly as loud as that lead, a synthetic room at the measured reverb ratio
-     (-30..-6 dB), + backing + band; then the whole song back to the original's loudness through a -1 dBFS limiter.
-vocal mode: the recording is converted as it is (no separation, no room) and matched to its own loudness.
+  5. RVC (infer/cli.py of the pinned RVC) re-sings the (dry) lead.
+  6. softer S (optional, on by default): the input's own S hiss above ~4 kHz in its unvoiced frames (vpaudio.unvoiced_blend).
+  7. remix: aligned to the lead it replaces (+-300 ms), exactly as loud as that lead, a synthetic room at the measured reverb ratio
+     (-30..-6 dB) when dereverb ran, + backing + band; then the whole song back to the original's loudness through a -1 dBFS
+     limiter.
+vocal mode: the recording is converted as it is (no separation, no room; softer S when asked) and matched to its own loudness.
 Outputs (in the work folder): mix.mp3 + mix.wav (24-bit) and vocal.mp3 + vocal.wav (24-bit mono, the dry converted voice)."""
 import glob
 import json
@@ -26,7 +30,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import vpaudio as va  # noqa: E402
-from voice_request import DEREVERB_MODEL, EXTRACTORS, LEAD_MODEL, MAX_SECONDS  # noqa: E402
+from voice_request import DEREVERB_MODEL, EXTRACTORS, LEAD_MODELS, MAX_SECONDS  # noqa: E402
 
 SR = 44100
 ROOM_RT60 = 1.2
@@ -155,14 +159,23 @@ def separate(mix, work, opts, runner, progress, notes):
     lead, backing = vocals, None
     if opts["lead_split"]:
         progress("Finding the lead singer")
+        lead_model = LEAD_MODELS[opts["lead_model"]]
+        info["lead_model"] = opts["lead_model"]
         kin, kout = os.path.join(work, "lead_in"), os.path.join(work, "lead_out")
         os.makedirs(kin, exist_ok=True)
         va.encode(os.path.join(kin, "vocals.wav"), vocals, SR, bits=32)
-        ok, secs = runner.pymss(LEAD_MODEL, kin, kout)
+        ok, secs = runner.pymss(lead_model["model"], kin, kout)
         info["lead_split"] = "failed: all vocals re-sung"
         parts = [p for p in glob.glob(os.path.join(kout, "**", "vocals_*"), recursive=True) if p.lower().endswith(".wav")] if ok else []
-        if len(parts) >= 2:
-            cands = []
+        named, cands = lead_model["lead_stem"], []
+        if named:  # the model says which output is the lead: exactly that one
+            hit = [p for p in parts if os.path.splitext(os.path.basename(p))[0].lower() == f"vocals_{named}"]
+            if hit:
+                y = fit(va.decode(hit[0], sr=SR, channels=2)[0], n)
+                cands.append({"y": y, "rms_db": rms_db(y), "file": os.path.basename(hit[0])})
+            elif ok:
+                print(f"lead split: no {named} stem in {[os.path.basename(p) for p in parts]}", flush=True)
+        elif len(parts) >= 2:  # otherwise the louder, steadier-pitched part is the lead
             for p in parts:
                 y = fit(va.decode(p, sr=SR, channels=2)[0], n)
                 tr = va.pitch_track(y.mean(1), SR)
@@ -170,6 +183,7 @@ def separate(mix, work, opts, runner, progress, notes):
                 vfrac = float(tr["voiced"][act].mean()) if act.any() else 0.0
                 cands.append({"y": y, "rms_db": rms_db(y), "voiced_frac": vfrac, "file": os.path.basename(p)})
             cands.sort(key=lambda c: -(c["rms_db"] + 30 * c["voiced_frac"]))
+        if cands:
             share = 10 ** ((cands[0]["rms_db"] - rms_db(vocals)) / 10)
             info.update({"lead_energy_share": round(share, 3), "lead_s": secs})
             if share >= 0.25:
@@ -264,9 +278,13 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
     l_ref, l_conv = lufs(voice), lufs(conv)
     vgain = float(np.clip(l_ref - l_conv, -20, 20)) if (l_ref is not None and l_conv is not None) else 0.0
     conv = (conv * 10 ** (vgain / 20)).astype(np.float32)
+    placed = {"lag_ms": round(1000 * lag / SR, 1), "align_peak": round(peak, 3), "vocal_gain_db": round(vgain, 2)}
+    if opts["soft_s"]:
+        began_s = time.monotonic()
+        conv, placed["soft_s"] = va.unvoiced_blend(conv, voice, SR)
+        timing["soft_s_s"] = round(time.monotonic() - began_s, 1)
     files = {name: os.path.join(work, name) for name in ("vocal.mp3", "vocal.wav", "mix.mp3", "mix.wav")}
     vocal_master = finish(conv, files["vocal.mp3"], files["vocal.wav"], None)
-    placed = {"lag_ms": round(1000 * lag / SR, 1), "align_peak": round(peak, 3), "vocal_gain_db": round(vgain, 2)}
     if song:
         vocal = np.repeat(conv[:, None], 2, axis=1)
         ratio = sep["reverb_ratio_db"]
