@@ -12,6 +12,8 @@ Input (RunPod job "input"):
   voice_range   optional {"p05", "p50", "p95"}: the singer's own low, middle and high notes as MIDI numbers
   options       extractor, fallback, lead_split, lead_model, dereverb, room, soft_s, index_rate, protect, rms_mix_rate, f0_method
                 (DEFAULTS below)
+  vocal_fx      optional studio effect on the converted lead (vocalfx.py): "none" (the default: output exactly as before),
+                "studio", "plate", "hall", "slapback", "echo" or "dreamy"; the dry vocal files stay dry either way
   output_prefix optional "voice/<8-64 letters, digits, - or _>"; default voice/<random>
 Nothing here names a person: the owner is whatever the caller's registry put in the model key."""
 import ipaddress
@@ -58,6 +60,8 @@ DEFAULTS = {
     "rms_mix_rate": 0.25,
     "f0_method": "rmvpe",
 }
+# Vocal effects (vocalfx.PRESETS; listed here too because this file is copied into the image before the audio code is).
+VOCAL_FX = ("none", "studio", "plate", "hall", "slapback", "echo", "dreamy")
 MAX_SECONDS = 6 * 60 + 5
 MAX_BYTES = 256 * 1024 * 1024
 KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/=-]{0,1023}$")
@@ -189,6 +193,10 @@ def parse(raw, resolve=True):
         "rms_mix_rate": _number(options, "rms_mix_rate", 0, 1, "Loudness follow (RMS mix rate)"),
         "f0_method": f0_method,
     }
+    vocal_fx = raw.get("vocal_fx")
+    vocal_fx = "none" if vocal_fx is None else (vocal_fx.strip().lower() if isinstance(vocal_fx, str) else vocal_fx)
+    if not isinstance(vocal_fx, str) or vocal_fx not in VOCAL_FX:
+        raise ValueError("Choose one of the listed vocal effects, or none.")
     prefix = raw.get("output_prefix")
     if prefix is not None and (not isinstance(prefix, str) or not PREFIX_RE.match(prefix)):
         raise ValueError("The output folder name is not allowed.")
@@ -203,5 +211,6 @@ def parse(raw, resolve=True):
         "pitch": pitch,
         "voice_range": voice_range,
         "options": clean,
+        "vocal_fx": vocal_fx,
         "output_prefix": prefix or f"voice/{uuid.uuid4().hex}",
     }

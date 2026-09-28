@@ -1,7 +1,8 @@
 """RunPod serverless handler: "Sing it in my voice". A recording in, the same recording sung by a trained RVC voice out.
 
 The request contract is voice_request.py; the audio work is voice_pipeline.py. Everything lands in the private bucket under
-voice/<random>/ (mix.mp3, mix.wav, vocal.mp3, vocal.wav, report.json) and comes back as signed links good for seven days.
+voice/<random>/ (mix.mp3, mix.wav, vocal.mp3, vocal.wav, report.json, and vocal_fx.mp3 + vocal_fx.wav when a vocal effect was
+asked for) and comes back as signed links good for seven days.
 Voice models come from the private bucket and are cached on the worker by content hash (voice_models.py).
 A failure answers {"error": sentence}; nothing is retried automatically.
 
@@ -20,7 +21,8 @@ import voice_models  # noqa: E402
 import voice_pipeline  # noqa: E402
 import voice_request  # noqa: E402
 
-FEATURES = ["song", "vocal", "auto-octave", "extractors", "lead-split", "lead-models", "dereverb", "room", "soft-s", "model-cache"]
+FEATURES = ["song", "vocal", "auto-octave", "extractors", "lead-split", "lead-models", "dereverb", "room", "soft-s", "model-cache",
+            "vocal-fx"]
 PRESIGN_S = 7 * 24 * 3600
 GPU = {}
 
@@ -81,6 +83,16 @@ def fetch_audio(req, client, bucket, dest):
                 f.write(block)
 
 
+def fx_summary(fx):
+    """The vocal effect in a few fields for the Sound Booth (the whole account is in report.json); None when there was none."""
+    if not fx:
+        return None
+    tempo = fx.get("tempo") or {}
+    return {"preset": fx["preset"], "label": fx["label"], "tempo_bpm": tempo.get("bpm"), "tempo_source": tempo.get("source"),
+            "delay_ms": (fx.get("delay") or {}).get("delay_ms"), "reverb_s": (fx.get("reverb") or {}).get("seconds"),
+            "level_match_db": fx.get("level_match_db"), "tail_s": fx.get("tail_s")}
+
+
 CONTENT_TYPES = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".json": "application/json"}
 
 
@@ -115,8 +127,9 @@ def handler(job):
             began = time.monotonic()
             prefix = req["output_prefix"]
             uploaded, by_path = {}, {}
-            for name, path in result["files"].items():
-                if path in by_path:  # vocal mode: the "mix" is the vocal itself, stored once
+            # the mix last: in vocal mode it is the (effected) vocal itself, stored once under the vocal's own name
+            for name, path in sorted(result["files"].items(), key=lambda item: item[0].startswith("mix.")):
+                if path in by_path:
                     uploaded[name] = by_path[path]
                     continue
                 key = f"{prefix}/{name}"
@@ -128,7 +141,7 @@ def handler(job):
                 return client.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": uploaded[name]},
                                                      ExpiresIn=PRESIGN_S)
             report = result["report"]
-            return {
+            out = {
                 "engine": "rvc", "mode": req["mode"],
                 "key": uploaded["mix.mp3"], "url": url("mix.mp3"),
                 "wav_key": uploaded["mix.wav"], "wav_url": url("mix.wav"),
@@ -141,7 +154,12 @@ def handler(job):
                 "models": {"model_cached": model_info["cached"], "index_cached": index_info["cached"] if index_info else None},
                 "timing": {**timing, **report["timing"]},
                 "processing_ms": int((time.monotonic() - start) * 1000), "features": FEATURES,
+                "vocal_fx": fx_summary(report.get("vocal_fx")),
             }
+            if "vocal_fx.mp3" in uploaded:
+                out.update({"vocal_fx_key": uploaded["vocal_fx.mp3"], "vocal_fx_url": url("vocal_fx.mp3"),
+                            "vocal_fx_wav_key": uploaded["vocal_fx.wav"], "vocal_fx_wav_url": url("vocal_fx.wav")})
+            return out
     except ValueError as error:
         return {"error": str(error)}
     except Exception as error:

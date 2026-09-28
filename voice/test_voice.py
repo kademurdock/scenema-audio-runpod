@@ -19,6 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import voice_models  # noqa: E402
 import voice_pipeline  # noqa: E402
+import vocalfx  # noqa: E402
 import voice_request  # noqa: E402
 import vpaudio as va  # noqa: E402
 
@@ -212,11 +213,21 @@ class RequestTests(unittest.TestCase):
                dict(options={"index_rate": "high"}), dict(options={"lead_split": "maybe"}), dict(mode="karaoke"),
                dict(options={"lead_model": "magic"}), dict(options={"soft_s": "sometimes"}),
                dict(output_prefix="yue2/x"), dict(voice_range={"p05": 70, "p50": 60, "p95": 80}), dict(model_sha256="xyz"),
-               dict(audio_url="https://bucket.example/a.wav")]
+               dict(audio_url="https://bucket.example/a.wav"), dict(vocal_fx="cathedral"), dict(vocal_fx=3),
+               dict(vocal_fx=True), dict(vocal_fx="")]
         for over in bad:
             with self.assertRaises(ValueError, msg=over) as caught:
                 request(**over)
             self.assertTrue(caught.exception.args[0].endswith("."), over)
+
+    def test_vocal_fx_is_optional_and_named(self):
+        self.assertEqual(request()["vocal_fx"], "none")  # nothing asked: exactly today's output
+        self.assertEqual(request(vocal_fx=None)["vocal_fx"], "none")
+        self.assertEqual(voice_request.VOCAL_FX, vocalfx.NAMES)  # the contract and the effects list the same presets
+        for name in vocalfx.NAMES:
+            self.assertEqual(request(vocal_fx=name)["vocal_fx"], name)
+        self.assertEqual(request(vocal_fx=" Plate ")["vocal_fx"], "plate")
+        self.assertEqual(request(vocal_fx="echo")["options"], request()["options"])  # the chain before the effect is untouched
 
     def test_urls_need_an_allowed_host(self):
         os.environ["VOICE_AUDIO_HOSTS"] = "s3.example.com"
@@ -334,6 +345,72 @@ class PipelineTests(Base):
         self.assertLessEqual(float(np.abs(mix).max()), 10 ** (-1 / 20) + 1e-3)  # the limiter's ceiling
         orig = va.measure(va.decode(self.song_file())[0], SR)["I"]
         self.assertAlmostEqual(va.measure(mix, SR)["I"], orig, delta=1.0)  # back to the original's loudness
+
+    def test_no_vocal_fx_is_byte_identical(self):
+        """vocal_fx left out and vocal_fx "none" make the same files, byte for byte, and no effect files."""
+        song = self.song_file()
+        plain, said = self.run_job(request(), audio=song)
+        none, _ = self.run_job(request(vocal_fx="none"), audio=song)
+        for name in ("mix.wav", "mix.mp3", "vocal.wav", "vocal.mp3"):
+            with open(plain["files"][name], "rb") as a, open(none["files"][name], "rb") as b:
+                self.assertEqual(a.read(), b.read(), name)
+        for out in (plain, none):
+            self.assertNotIn("vocal_fx.wav", out["files"])
+            self.assertIsNone(out["report"]["vocal_fx"])
+        self.assertNotIn("Adding the vocal effect", said)
+
+    def test_vocal_fx_goes_on_the_lead_and_the_dry_vocal_stays_dry(self):
+        song = self.song_file()
+        dry, _ = self.run_job(request(), audio=song)
+        wet, said = self.run_job(request(vocal_fx="echo"), audio=song)
+        with open(dry["files"]["vocal.wav"], "rb") as a, open(wet["files"]["vocal.wav"], "rb") as b:
+            self.assertEqual(a.read(), b.read())  # the plain dry vocal is never touched
+        self.assertIn("Adding the vocal effect", said)
+        self.assertEqual(said[-1], "Putting the song back together")
+        fx = wet["report"]["vocal_fx"]
+        self.assertEqual((fx["preset"], fx["label"], fx["tempo"]["source"]), ("echo", "Echo", "assumed"))  # 6 s: too short
+        self.assertAlmostEqual(fx["delay"]["delay_ms"], 375.0, delta=0.5)  # a dotted eighth at the assumed 120 BPM
+        n = len(tone_song())
+        voice_dry, _ = va.decode(dry["files"]["vocal.wav"])
+        voice_fx, _ = va.decode(wet["files"]["vocal_fx.wav"])
+        self.assertEqual((voice_dry.shape[1], voice_fx.shape[1]), (1, 2))
+        self.assertGreaterEqual(len(voice_fx), n)  # same start, plus the echo's tail
+        self.assertGreater(len(voice_fx), n + SR // 2)
+        lead = np.repeat(voice_dry, 2, axis=1)
+        self.assertAlmostEqual(va.measure(voice_fx, SR)["I"], va.measure(lead, SR)["I"], delta=0.7)  # as loud as the dry lead
+        self.assertLessEqual(float(np.abs(voice_fx).max()), 10 ** (-1 / 20) + 1e-3)
+        mix_dry, _ = va.decode(dry["files"]["mix.wav"])
+        mix_wet, _ = va.decode(wet["files"]["mix.wav"])
+        self.assertEqual(mix_wet.shape, mix_dry.shape)  # the song keeps its length
+        self.assertGreater(float(np.abs(mix_wet - mix_dry).max()), 1e-3)
+        self.assertAlmostEqual(va.measure(mix_wet, SR)["I"], va.measure(mix_dry, SR)["I"], delta=1.0)
+        self.assertIn("vocal_fx_s", wet["report"]["timing"])
+
+    def test_every_vocal_fx_in_vocal_mode(self):
+        """A dry vocal with each effect: the result is the effected voice, the dry vocal beside it is the same every time."""
+        song = self.song_file(tone_song(band_level=0), "dry.wav")
+        base, _ = self.run_job(request(mode="vocal"), audio=song, index=False)
+        with open(base["files"]["vocal.wav"], "rb") as f:
+            dry_bytes = f.read()
+        ref = va.measure(np.repeat(va.decode(base["files"]["vocal.wav"])[0], 2, axis=1), SR)["I"]
+        for name in vocalfx.PRESETS:
+            out, said = self.run_job(request(mode="vocal", vocal_fx=name), audio=song, index=False)
+            files = out["files"]
+            self.assertEqual((files["mix.wav"], files["mix.mp3"]), (files["vocal_fx.wav"], files["vocal_fx.mp3"]), name)
+            with open(files["vocal.wav"], "rb") as f:
+                self.assertEqual(f.read(), dry_bytes, name)
+            y, _ = va.decode(files["vocal_fx.wav"])
+            self.assertTrue(np.isfinite(y).all(), name)
+            self.assertEqual(y.shape[1], 2, name)
+            self.assertAlmostEqual(va.measure(y, SR)["I"], ref, delta=0.7, msg=name)
+            self.assertEqual(out["report"]["master"], out["report"]["vocal_fx"]["master"], name)
+            self.assertEqual(said, ["Singing it in your voice", "Adding the vocal effect", "Finishing your vocal"], name)
+
+    def test_vocal_fx_replaces_the_put_back_room(self):
+        out, _ = self.run_job(request(options=ROUND1, vocal_fx="plate"))
+        placed = out["report"]["placed"]
+        self.assertEqual(placed.get("room"), "replaced by the vocal effect")
+        self.assertNotIn("room_db", placed)  # one space on the voice, not two
 
     def test_fallback_extractor(self):
         self.plan({EX("hyperace"): "fail"})
@@ -457,6 +534,153 @@ class SoftSTests(unittest.TestCase):
         self.assertLess(float(np.abs(y - tone).max()), 1e-3)
 
 
+def click_track(bpm, seconds=12.0, sr=SR, seed=4):
+    """Kick-like noise bursts on every beat (accented each bar), a quieter hat between, over a soft tone."""
+    rng = np.random.default_rng(seed)
+    n = int(seconds * sr)
+    x = 0.05 * np.sin(2 * np.pi * 220 * np.arange(n) / sr)
+    beat, k, t = 60.0 / bpm, 0, 0.0
+    burst = int(0.01 * sr)
+    while t + beat / 2 < seconds - 0.1:
+        i, j = int(t * sr), int((t + beat / 2) * sr)
+        x[i:i + burst] += (1.0 if k % 4 == 0 else 0.6) * rng.standard_normal(burst) * np.exp(-np.arange(burst) / 200)
+        x[j:j + burst // 3] += 0.2 * rng.standard_normal(burst // 3)
+        t, k = t + beat, k + 1
+    return (0.5 * x / np.abs(x).max()).astype(np.float32)
+
+
+def schroeder_rt60(ir, fc, sr=SR):
+    """RT60 of one channel in the octave around fc, from the -5 to -25 dB slope of its backward-integrated energy."""
+    n = len(ir)
+    nf = 4 * n
+    f = np.fft.rfftfreq(nf, 1 / sr)
+    w = np.exp(-0.5 * (np.log2(np.maximum(f, 1) / fc) / 0.25) ** 2)
+    b = np.fft.irfft(np.fft.rfft(ir, nf) * w, nf)[:n + n // 2]
+    e = np.cumsum((b ** 2)[::-1])[::-1]
+    db = 10 * np.log10(e / e[0] + 1e-30)
+    return (np.argmax(db < -25) - np.argmax(db < -5)) / sr * 3
+
+
+class VocalFxTests(unittest.TestCase):
+    def test_tempo_from_a_steady_beat(self):
+        for bpm in (90, 100, 128):
+            found = vocalfx.detect_tempo(click_track(bpm), SR)
+            self.assertIsNotNone(found, bpm)
+            self.assertLess(abs(found["bpm"] - bpm) / bpm, 0.015, (bpm, found))
+        rng = np.random.default_rng(9)
+        t = np.arange(SR * 12) / SR
+        for what, x in (("silence", np.zeros(SR * 12)), ("tone", 0.2 * np.sin(2 * np.pi * 300 * t)),
+                        ("noise", 0.1 * rng.standard_normal(SR * 12)), ("short", click_track(100, seconds=5))):
+            self.assertIsNone(vocalfx.detect_tempo(np.asarray(x, np.float32), SR), what)
+
+    def test_delay_times_follow_the_tempo(self):
+        self.assertAlmostEqual(vocalfx.delay_seconds("dotted_eighth", 120), 0.375)
+        self.assertAlmostEqual(vocalfx.delay_seconds("dotted_eighth", None), 0.375)  # no beat: 120 BPM
+        self.assertAlmostEqual(vocalfx.delay_seconds("dotted_eighth", 60), 0.375)  # 0.75 s halved: still on the beat
+        self.assertAlmostEqual(vocalfx.delay_seconds("dotted_eighth", 180), 0.25)
+        self.assertAlmostEqual(vocalfx.delay_seconds("quarter", 100), 0.6)
+        self.assertAlmostEqual(vocalfx.delay_seconds("quarter", 200), 0.3)  # 0.3 s is in range
+        self.assertAlmostEqual(vocalfx.delay_seconds("quarter", 240), 0.5)  # 0.25 s doubled
+        self.assertAlmostEqual(vocalfx.delay_seconds("sixteenth", 120), 0.125)
+        self.assertAlmostEqual(vocalfx.delay_seconds("sixteenth", 70), 0.110)  # 214 ms is no slapback: the classic 110 ms
+
+    def test_echo_repeats_ping_pong_and_darken(self):
+        d = 0.375
+        ir, info = vocalfx.delay_ir(SR, d, feedback=0.38, first_db=-9.0, lp_hz=4200, hp_hz=180, pingpong=True)
+        self.assertGreaterEqual(info["repeats"], 4)
+        step = int(round(d * SR))
+        levels, centroids = [], []
+        f = np.fft.rfftfreq(8192, 1 / SR)
+        at_1k = int(np.argmin(np.abs(f - 1000)))
+        for k in range(1, info["repeats"] + 1):
+            seg = ir[k * step:k * step + 4096]
+            e = (seg.astype(np.float64) ** 2).sum(0)
+            louder = 0 if k % 2 else 1
+            self.assertGreater(e[louder], 8 * e[1 - louder], k)  # left, right, left...
+            spec = np.abs(np.fft.rfft(seg[:, louder], 8192))
+            levels.append(20 * np.log10(spec[at_1k]))  # the repeat's level where a voice lives
+            centroids.append((f * spec ** 2).sum() / (spec ** 2).sum())
+        self.assertTrue(all(b < a for a, b in zip(levels, levels[1:])), levels)
+        self.assertTrue(all(b < a for a, b in zip(centroids, centroids[1:])), centroids)
+        self.assertLess(float(np.abs(ir[:step - 50]).max()), 1e-6)  # nothing before the first repeat
+        self.assertAlmostEqual(levels[0], -9.0, delta=0.3)  # the first repeat 9 dB down
+        self.assertAlmostEqual(levels[1] - levels[0], 20 * np.log10(0.38), delta=0.3)  # then 0.38 of the one before
+        slap, info = vocalfx.delay_ir(SR, 0.11, feedback=0.0, first_db=-10.0, lp_hz=4500, hp_hz=250, pingpong=False)
+        self.assertEqual(info["repeats"], 1)
+
+    def test_reverbs_decay_as_named(self):
+        for name in ("studio", "plate", "hall", "dreamy"):
+            rv = vocalfx.PRESETS[name]["reverb"]
+            ir = vocalfx.reverb_ir(SR, **rv)
+            self.assertTrue(np.array_equal(ir, vocalfx.reverb_ir(SR, **rv)), name)  # same seed, same space
+            self.assertAlmostEqual(schroeder_rt60(ir[:, 0], 1000), rv["rt60"], delta=0.15 * rv["rt60"], msg=name)
+            self.assertLess(schroeder_rt60(ir[:, 0], 8000), schroeder_rt60(ir[:, 0], 1000), name)  # highs die first
+            pre = int(SR * rv["predelay_ms"] / 1000)
+            self.assertLess(float(np.abs(ir[:pre]).max()), 1e-6, name)
+            self.assertLess(abs(float(np.corrcoef(ir[:, 0], ir[:, 1])[0, 1])), 0.35, name)  # a wide, stereo space
+            self.assertTrue(np.allclose((ir.astype(np.float64) ** 2).sum(0), 1.0, atol=1e-3), name)
+
+    def test_compressor_evens_loud_and_soft_phrases(self):
+        t = np.arange(SR * 4) / SR
+        tone = np.sin(2 * np.pi * 220 * t)
+        loud = (t % 1.0) < 0.5
+        x = (tone * np.where(loud, 0.5, 0.1)).astype(np.float32)
+        y, info = vocalfx.compress(x, SR)
+        self.assertTrue(info["applied"])
+        core_loud = loud & ((t % 1.0) > 0.2)
+        core_soft = ~loud & ((t % 1.0) > 0.7)
+        before = voice_pipeline.rms_db(x[core_loud]) - voice_pipeline.rms_db(x[core_soft])
+        after = voice_pipeline.rms_db(y[core_loud]) - voice_pipeline.rms_db(y[core_soft])
+        self.assertGreater(before - after, 2.5)  # the loud phrases came down
+        self.assertLess(before - after, 6.0)  # gently
+        self.assertAlmostEqual(voice_pipeline.rms_db(y[core_soft]), voice_pipeline.rms_db(x[core_soft]), delta=0.3)
+
+    def test_de_esser_takes_only_the_loud_hiss_down(self):
+        rng = np.random.default_rng(6)
+        n = SR * 4
+        t = np.arange(n) / SR
+        tone = (0.3 * sum(np.sin(2 * np.pi * 220 * k * t) / k for k in range(1, 6))).astype(np.float32)
+        spec = np.fft.rfft(rng.standard_normal(n))
+        spec[np.fft.rfftfreq(n, 1 / SR) < 6000] = 0
+        hiss = (np.fft.irfft(spec, n) / np.std(np.fft.irfft(spec, n)) * 0.25).astype(np.float32)
+        s_mask = (t % 1.0) > 0.8
+        x = np.where(s_mask, hiss, tone).astype(np.float32)
+        y, info = vocalfx.deess(x, SR)
+        self.assertTrue(info["applied"])
+        core_s = s_mask & ((t % 1.0) > 0.85) & ((t % 1.0) < 0.97)
+        drop = voice_pipeline.rms_db(x[core_s]) - voice_pipeline.rms_db(y[core_s])
+        self.assertGreater(drop, 2.0)
+        self.assertLessEqual(drop, 5.5)
+        vowels = ~s_mask & ((t % 1.0) > 0.1) & ((t % 1.0) < 0.7)
+        self.assertLess(float(np.abs(y[vowels] - x[vowels]).max()), 2e-3)  # the vowels untouched
+
+    def test_ducking_clears_the_way_while_singing(self):
+        rng = np.random.default_rng(8)
+        n = SR * 4
+        wet = (0.1 * rng.standard_normal((n, 2))).astype(np.float32)
+        dry = np.zeros(n, np.float32)
+        dry[: n // 2] = 0.3 * np.sin(2 * np.pi * 220 * np.arange(n // 2) / SR)
+        y = vocalfx.duck(wet, dry, SR, 6.0)
+        sung = voice_pipeline.rms_db(y[SR // 2:SR * 3 // 2]) - voice_pipeline.rms_db(wet[SR // 2:SR * 3 // 2])
+        gap = voice_pipeline.rms_db(y[SR * 3:]) - voice_pipeline.rms_db(wet[SR * 3:])
+        self.assertAlmostEqual(sung, -6.0, delta=0.5)
+        self.assertAlmostEqual(gap, 0.0, delta=0.2)
+
+    def test_every_preset_is_stereo_finite_and_starts_with_the_voice(self):
+        t = np.arange(SR * 3) / SR
+        voice = (0.3 * np.sin(2 * np.pi * 220 * t) * (np.sin(2 * np.pi * 1.5 * t) > 0)).astype(np.float32)
+        for name in vocalfx.PRESETS:
+            y, info = vocalfx.apply(voice, SR, name, {"bpm": 100.0, "confidence": 0.9})
+            self.assertEqual(y.shape[1], 2, name)
+            self.assertGreaterEqual(len(y), len(voice), name)
+            self.assertTrue(np.isfinite(y).all(), name)
+            self.assertEqual(info["preset"], name)
+            if "delay" in vocalfx.PRESETS[name]:
+                self.assertEqual(info["tempo"], {"bpm": 100.0, "confidence": 0.9, "source": "detected"})
+            first = y[:SR // 10].mean(1)  # the first 100 ms: the polished voice itself, no effect yet
+            self.assertGreater(float(np.corrcoef(first, voice[:SR // 10])[0, 1]), 0.9, name)
+
+
 class HandlerTests(Base):
     def test_output_shape_and_one_copy_in_vocal_mode(self):
         import voice_handler
@@ -484,6 +708,20 @@ class HandlerTests(Base):
             self.assertEqual(progress[0], "Fetching the recording and your voice")
             bad = voice_handler.handler({"input": {"audio_key": "voice/x/in.wav", "model_key": "nope"}})
             self.assertEqual(set(bad), {"error"})
+            self.assertIsNone(out["vocal_fx"])
+            self.assertNotIn("vocal_fx_url", out)
+            self.assertIn("vocal-fx", out["features"])
+            fx = voice_handler.handler({"input": {"mode": "vocal", "audio_key": "voice/abcdefgh12/in.wav", "model_key": MODEL,
+                                                  "output_prefix": "voice/testjob0002", "vocal_fx": "studio"}})
+            self.assertNotIn("error", fx, fx)
+            self.assertEqual((fx["key"], fx["vocal_key"], fx["vocal_fx_key"], fx["vocal_fx_wav_key"]),
+                             ("voice/testjob0002/vocal_fx.mp3", "voice/testjob0002/vocal.mp3", "voice/testjob0002/vocal_fx.mp3",
+                              "voice/testjob0002/vocal_fx.wav"))  # vocal mode: the result is the effected voice
+            self.assertEqual(sorted(k for k, _, _ in s3.uploads if k.startswith("voice/testjob0002/")),
+                             ["voice/testjob0002/report.json", "voice/testjob0002/vocal.mp3", "voice/testjob0002/vocal.wav",
+                              "voice/testjob0002/vocal_fx.mp3", "voice/testjob0002/vocal_fx.wav"])
+            self.assertEqual((fx["vocal_fx"]["preset"], fx["vocal_fx"]["label"]), ("studio", "Studio polish"))
+            self.assertTrue(fx["vocal_fx_url"].startswith("https://bucket.example/voice/testjob0002/vocal_fx.mp3"))
             voice_handler.GPU.update({"supported": False, "name": "NVIDIA GeForce RTX 5090"})
             refused = voice_handler.handler({"input": {"mode": "vocal", "audio_key": "voice/abcdefgh12/in.wav", "model_key": MODEL}})
             self.assertIn("RTX 50", refused["error"])

@@ -16,7 +16,12 @@ song mode:
      (-30..-6 dB) when dereverb ran, + backing + band; then the whole song back to the original's loudness through a -1 dBFS
      limiter.
 vocal mode: the recording is converted as it is (no separation, no room; softer S when asked) and matched to its own loudness.
-Outputs (in the work folder): mix.mp3 + mix.wav (24-bit) and vocal.mp3 + vocal.wav (24-bit mono, the dry converted voice)."""
+vocal effect (optional, request vocal_fx, "none" by default; vocalfx.py): a studio preset on the converted lead after step 6,
+matched to the dry lead's loudness; the effected lead replaces the dry one in the remix (and replaces step 7's synthetic room,
+which would double the space). The dry vocal files are never touched.
+Outputs (in the work folder): mix.mp3 + mix.wav (24-bit) and vocal.mp3 + vocal.wav (24-bit mono, the dry converted voice); with a
+vocal effect also vocal_fx.mp3 + vocal_fx.wav (24-bit stereo, the effected voice with its tail; in vocal mode it is the mix).
+With vocal_fx "none" every audio file is byte for byte what the worker made before vocal effects existed."""
 import glob
 import json
 import os
@@ -29,6 +34,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import vocalfx  # noqa: E402
 import vpaudio as va  # noqa: E402
 from voice_request import DEREVERB_MODEL, EXTRACTORS, LEAD_MODELS, MAX_SECONDS  # noqa: E402
 
@@ -252,6 +258,18 @@ def load_input(audio_path):
     return va.decode(audio_path, sr=SR, channels=2)[0]
 
 
+def vocal_effect(conv, name, beat_source):
+    """The converted lead (mono) -> (stereo effected lead, report), at the dry lead's loudness as it sits in the mix (the same
+    voice on both sides), so the singer is exactly as loud against the band as without the effect. The delays follow the tempo
+    found in beat_source (the whole recording in song mode, the voice itself in vocal mode), or 120 BPM with no clear beat."""
+    tempo = vocalfx.detect_tempo(beat_source, SR) if "delay" in vocalfx.PRESETS[name] else None
+    fx, report = vocalfx.apply(conv, SR, name, tempo)
+    ref, got = lufs(np.repeat(conv[:, None], 2, axis=1)), lufs(fx)
+    gain = float(np.clip(ref - got, -20, 20)) if (ref is not None and got is not None) else 0.0
+    report["level_match_db"] = round(gain, 2)
+    return (fx * np.float32(10 ** (gain / 20))).astype(np.float32), report
+
+
 def run(req, audio_path, model_path, index_path, work, runner, progress=lambda text: None):
     """-> {"files": {name: path}, "report": {...}}. ValueError carries a sentence for the person."""
     notes, timing = [], {}
@@ -281,7 +299,9 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
         print(f"RVC failed\n{log_tail(runner.log_path)}", flush=True)
         raise RuntimeError("RVC conversion failed")
     timing["convert_s"] = round(time.monotonic() - began, 1)
-    progress("Putting the song back together" if song else "Finishing your vocal")
+    want_fx = req.get("vocal_fx", "none") != "none"
+    if not want_fx:
+        progress("Putting the song back together" if song else "Finishing your vocal")
     began = time.monotonic()
     n = len(voice)
     conv = va.decode(conv_path, sr=SR, channels=1)[0][:, 0]
@@ -297,10 +317,21 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
         timing["soft_s_s"] = round(time.monotonic() - began_s, 1)
     files = {name: os.path.join(work, name) for name in ("vocal.mp3", "vocal.wav", "mix.mp3", "mix.wav")}
     vocal_master = finish(conv, files["vocal.mp3"], files["vocal.wav"], None)
+    fx, fx_report = None, None
+    if want_fx:
+        progress("Adding the vocal effect")
+        began_fx = time.monotonic()
+        fx, fx_report = vocal_effect(conv, req["vocal_fx"], mix if song else voice)
+        files["vocal_fx.mp3"], files["vocal_fx.wav"] = os.path.join(work, "vocal_fx.mp3"), os.path.join(work, "vocal_fx.wav")
+        fx_report["master"] = finish(fx, files["vocal_fx.mp3"], files["vocal_fx.wav"], None)
+        timing["vocal_fx_s"] = round(time.monotonic() - began_fx, 1)
+        progress("Putting the song back together" if song else "Finishing your vocal")
     if song:
-        vocal = np.repeat(conv[:, None], 2, axis=1)
+        vocal = np.repeat(conv[:, None], 2, axis=1) if fx is None else fx[:n]
         ratio = sep["reverb_ratio_db"]
-        if ratio is not None and opts["room"]:
+        if ratio is not None and opts["room"] and fx is not None:
+            placed["room"] = "replaced by the vocal effect"
+        elif ratio is not None and opts["room"]:
             wet_db = float(np.clip(ratio, -30, -6))
             wet = va.convolve(conv, va.room_ir(SR, rt60=ROOM_RT60, seed=7))[:n]
             e_c, e_w = float((conv ** 2).mean()), float((wet ** 2).mean())
@@ -312,13 +343,16 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
         target = lufs(mix)
         target = None if target is None else float(np.clip(target, -23, -9))
         mix_master = finish(sep["band"] + vocal, files["mix.mp3"], files["mix.wav"], target)
+    elif fx is not None:  # vocal mode with an effect: the effected voice is the result, the dry one stays beside it
+        files["mix.mp3"], files["mix.wav"] = files["vocal_fx.mp3"], files["vocal_fx.wav"]
+        mix_master = fx_report["master"]
     else:
         files["mix.mp3"], files["mix.wav"] = files["vocal.mp3"], files["vocal.wav"]
         mix_master = vocal_master
     timing["mix_s"] = round(time.monotonic() - began, 1)
     report = {
         "mode": req["mode"], "seconds": round(seconds, 2), "pitch": pitch, "placed": placed,
-        "separation": sep["info"] if song else None, "master": mix_master, "vocal_master": vocal_master,
+        "separation": sep["info"] if song else None, "master": mix_master, "vocal_master": vocal_master, "vocal_fx": fx_report,
         "settings": {**opts, "index_used": bool(index_path and opts["index_rate"] > 0), "rvc_s": secs},
         "notes": notes, "timing": timing,
     }
