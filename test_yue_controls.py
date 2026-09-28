@@ -689,3 +689,39 @@ class VendoredHelpersTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ModelFolderTest(unittest.TestCase):
+    """Sep 28 2026: a machine whose model cache holds another snapshot than the pinned one still finds the model."""
+
+    def test_pinned_then_cached_then_missing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            hub = Path(td) / 'hub'
+            pinned = hub / 'models--m-a-p--SheetSage2' / 'snapshots' / ('a' * 40)
+            other = hub / 'models--m-a-p--SheetSage2' / 'snapshots' / ('b' * 40)
+            other.mkdir(parents=True)
+            (other / 'config.json').write_text('{}')
+            folder, how = yue_handler.model_folder(pinned, 'm-a-p/SheetSage2', roots=[hub])
+            self.assertEqual((folder, how), (other, 'cached ' + 'b' * 12))
+            pinned.mkdir(parents=True)
+            self.assertEqual(yue_handler.model_folder(pinned, 'm-a-p/SheetSage2', roots=[hub])[1], 'cached ' + 'b' * 12, 'an empty pinned folder is not the model')
+            (pinned / 'config.json').write_text('{}')
+            self.assertEqual(yue_handler.model_folder(pinned, 'm-a-p/SheetSage2', roots=[hub]), (pinned, 'pinned'))
+            self.assertEqual(yue_handler.model_folder(hub / 'models--m-a-p--MERT-v2-FullSong' / 'snapshots' / ('c' * 40), 'm-a-p/MERT-v2-FullSong', roots=[hub]), (None, 'missing'))
+
+    def test_resolve_points_the_environment_at_the_folder_found(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            hub = Path(td) / 'hub'
+            have = hub / 'models--m-a-p--MERT-v2-FullSong' / 'snapshots' / ('d' * 40)
+            have.mkdir(parents=True)
+            (have / 'config.json').write_text('{}')
+            pinned = str(hub / 'models--m-a-p--MERT-v2-FullSong' / 'snapshots' / ('e' * 40))
+            env = {'YUE_MERT_DIR': pinned, 'HF_HUB_CACHE': str(hub)}
+            with mock.patch.dict(os.environ, env, clear=False), mock.patch.dict(yue_handler.RESOLVED, {'done': False}), \
+                    mock.patch.object(yue_handler, 'MODELS', (('YUE_MERT_DIR', 'm-a-p/MERT-v2-FullSong'),)):
+                yue_handler.resolve_models(download=False)
+                self.assertEqual(os.environ['YUE_MERT_DIR'], str(have))
+                self.assertTrue(yue_handler.RESOLVED['done'])

@@ -35,6 +35,75 @@ import lyric_sync  # noqa: E402
 
 PIPE = None
 STYLE = {'applied': None, 'plain': None}
+
+# Sep 28 2026: the four models come from RunPod's model cache, pinned by snapshot folder in Dockerfile.yue. SheetSage2
+# and MERT got a new Hugging Face revision on Sep 26 (code and README only; the weights are the same), and every
+# machine that filled its cache after that failed each job at once with FileNotFoundError. A pinned folder that is
+# missing now falls back to the snapshot the machine does have, and a model it lacks altogether is downloaded at the
+# pinned revision once. Which folder each model came from is printed at boot.
+MODELS = (('YUE_MODEL_DIR', 'm-a-p/YuE2-3B'), ('YUE_VAE_DIR', 'm-a-p/YuE2-Vae'),
+          ('YUE_SCORE_DIR', 'm-a-p/SheetSage2'), ('YUE_MERT_DIR', 'm-a-p/MERT-v2-FullSong'))
+RESOLVED = {'done': False}
+
+
+def _filled(folder):
+    try:
+        return folder.is_dir() and any(folder.iterdir())
+    except OSError:
+        return False
+
+
+def model_folder(pinned, repo, roots=None):
+    """(folder, how) for one model: the pinned snapshot, else the newest snapshot of that repo in the cache."""
+    pinned = Path(pinned)
+    if _filled(pinned):
+        return pinned, 'pinned'
+    name = 'models--' + repo.replace('/', '--')
+    if roots is None:
+        roots = [pinned.parents[2] if len(pinned.parents) > 2 else pinned.parent,
+                 Path(os.environ.get('HF_HUB_CACHE', '/runpod-volume/huggingface-cache/hub')),
+                 Path('/runpod-volume/huggingface-cache/hub')]
+    for root in roots:
+        snaps = Path(root) / name / 'snapshots'
+        if not snaps.is_dir():
+            continue
+        found = sorted((s for s in snaps.iterdir() if _filled(s)), key=lambda s: s.stat().st_mtime, reverse=True)
+        if found:
+            return found[0], 'cached ' + found[0].name[:12]
+    return None, 'missing'
+
+
+def fetch_model(repo, revision):
+    """The pinned revision from Hugging Face, for a machine whose cache has none of it."""
+    try:
+        os.environ['HF_HUB_OFFLINE'] = '0'
+        import huggingface_hub
+        huggingface_hub.constants.HF_HUB_OFFLINE = False
+        return Path(huggingface_hub.snapshot_download(repo, revision=revision, cache_dir='/tmp/hf-hub'))
+    except Exception as error:
+        print(f'{repo} download failed: {type(error).__name__}', flush=True)
+        return None
+    finally:
+        os.environ['HF_HUB_OFFLINE'] = '1'
+
+
+def resolve_models(download=True):
+    if RESOLVED['done']:
+        return
+    report = []
+    for env, repo in MODELS:
+        pinned = os.environ.get(env)
+        if not pinned:
+            continue
+        folder, how = model_folder(pinned, repo)
+        if folder is None and download:
+            folder = fetch_model(repo, Path(pinned).name)
+            how = 'downloaded' if folder else 'missing'
+        if folder is not None:
+            os.environ[env] = str(folder)
+        report.append(f'{repo.split("/")[1]} {how}')
+    RESOLVED['done'] = all(not r.endswith('missing') for r in report)
+    print('YuE2 models:', '; '.join(report), flush=True)
 STYLE_KEY = re.compile(r'^yue2-loras/[A-Za-z0-9._-]{1,80}\.pt$')
 TAKE_KEY = re.compile(r'^yue2/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/master\.(?:wav|mp3)$')
 # What this worker can do; the booth checks this before offering an option.
@@ -668,6 +737,7 @@ def apply_style(pipe, wanted, fetch):
 def engine():
     global PIPE
     if PIPE is None:
+        resolve_models()
         from yue2 import YuE2Pipeline
         PIPE = YuE2Pipeline.from_pretrained(
             os.environ['YUE_MODEL_DIR'], vae=os.environ['YUE_VAE_DIR'],
@@ -1173,6 +1243,7 @@ def warm():
 def handler(job):
     start = time.monotonic()
     try:
+        resolve_models()  # a cover reads SheetSage2 and MERT before YuE2 loads
         raw = job.get('input') or {}
         options = cover_options(raw)
         if options['mode'] == 'transcribe':
@@ -1320,7 +1391,8 @@ def handler(job):
     except ValueError as error:
         return {'error':str(error)}
     except Exception as error:
-        print('YuE2 failed:',type(error).__name__,flush=True)
+        # a missing file names its path in the worker log (only that error is spelled out: others can carry a URL)
+        print('YuE2 failed:',type(error).__name__, str(error)[:300] if isinstance(error, FileNotFoundError) else '',flush=True)
         return {'error':f'YuE2 could not finish ({type(error).__name__}). Your writing is saved.'}
 
 
