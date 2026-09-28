@@ -11,8 +11,8 @@ with an impulse response generated here from a fixed seed (so the same song give
 
 Every preset is the same polish plus its own space:
   polish    high-pass 80 Hz, -2.5 dB at 320 Hz (the mud), +1.5 dB at 3.2 kHz (presence), +2 dB shelf from 10 kHz (air), a 3:1
-            soft-knee compressor that takes the loud phrases about 4 dB down, and a split-band de-esser above 5.5 kHz (at most
-            5 dB, only on the loudest S sounds)
+            soft-knee compressor that takes the loudest moments about 4 dB down (about 2 dB over a real take's loud phrases),
+            and a split-band de-esser above 5.5 kHz (at most 5 dB, only on the loudest S sounds)
   studio    polish + a short, quiet plate (0.9 s) that glues the voice to the band without sounding like an effect
   plate     polish + a lush plate (2 s, 25 ms pre-delay), dense and bright, the classic pop vocal plate
   hall      polish + a big hall (2.8 s, 40 ms pre-delay, early reflections, darker tail)
@@ -20,8 +20,14 @@ Every preset is the same polish plus its own space:
   echo      polish + a dotted-eighth ping-pong echo at the song's tempo, each repeat darker than the last, ducked while the voice
             sings so the words stay clear and the repeats bloom in the gaps + a touch of plate
   dreamy    polish + a slight stereo chorus + a quarter-note echo + a 3.8 s hall fed by the voice and its echo
-Wet levels are set against the polished voice's own energy (reverbs) or as the first repeat's level (delays); the result is
-matched to the dry voice's loudness afterwards, so the voice sits in the band exactly as loud as the dry version does."""
+Wet levels are set per channel against the polished voice as it sits in the song, on both sides (reverbs and chorus), or as the
+first repeat's level (delays); the result is matched to the dry voice's loudness afterwards, so the voice sits in the band exactly
+as loud as the dry version does.
+Review, Sep 27 2026: the first cut compared the stereo effect's two channels together against the one-channel voice, so every
+reverb sat 3 dB under its number, and on the booth's own take of "1 soul full" a Plate or Hall tail was 24-27 dB under the band
+right after each line: too faint to hear in the song. Now the numbers mean what they say, Plate and Hall sit 5 dB higher than
+that first cut (a tail about 19-22 dB under the band after a line, the loudest quarter 9-12 dB under), Dreamy's hall 3 dB higher,
+and Studio, Slapback, Echo and the chorus as they were (within 0.01 dB)."""
 import numpy as np
 
 import vpaudio as va
@@ -29,25 +35,25 @@ import vpaudio as va
 PRESETS = {
     "studio": {"label": "Studio polish",
                "reverb": {"rt60": 0.9, "low_x": 0.9, "high_x": 0.6, "predelay_ms": 12, "onset_ms": 1.0, "hp_hz": 250,
-                          "lp_hz": 9000, "width": 0.9, "seed": 11, "wet_db": -21.0, "duck_db": 0.0}},
+                          "lp_hz": 9000, "width": 0.9, "seed": 11, "wet_db": -24.0, "duck_db": 0.0}},
     "plate": {"label": "Plate reverb",
               "reverb": {"rt60": 2.0, "low_x": 0.85, "high_x": 0.7, "predelay_ms": 25, "onset_ms": 1.5, "hp_hz": 220,
-                         "lp_hz": 10000, "width": 1.0, "seed": 23, "wet_db": -14.0, "duck_db": 2.0}},
+                         "lp_hz": 10000, "width": 1.0, "seed": 23, "wet_db": -12.0, "duck_db": 2.0}},
     "hall": {"label": "Hall reverb",
              "reverb": {"rt60": 2.8, "low_x": 1.2, "high_x": 0.5, "predelay_ms": 40, "onset_ms": 25.0, "hp_hz": 160,
-                        "lp_hz": 6500, "width": 0.9, "seed": 37, "early": True, "wet_db": -14.0, "duck_db": 3.0}},
+                        "lp_hz": 6500, "width": 0.9, "seed": 37, "early": True, "wet_db": -12.0, "duck_db": 3.0}},
     "slapback": {"label": "Slapback",
                  "delay": {"note": "sixteenth", "feedback": 0.0, "first_db": -10.0, "lp_hz": 4500, "hp_hz": 250,
                            "pingpong": False, "duck_db": 0.0},
                  "reverb": {"rt60": 0.9, "low_x": 0.9, "high_x": 0.6, "predelay_ms": 12, "onset_ms": 1.0, "hp_hz": 250,
-                            "lp_hz": 9000, "width": 0.9, "seed": 11, "wet_db": -25.0, "duck_db": 0.0}},
+                            "lp_hz": 9000, "width": 0.9, "seed": 11, "wet_db": -28.0, "duck_db": 0.0}},
     "echo": {"label": "Echo",
              "delay": {"note": "dotted_eighth", "feedback": 0.38, "first_db": -9.0, "lp_hz": 4200, "hp_hz": 180,
                        "pingpong": True, "duck_db": 6.0},
              "reverb": {"rt60": 1.6, "low_x": 0.85, "high_x": 0.7, "predelay_ms": 20, "onset_ms": 1.5, "hp_hz": 220,
-                        "lp_hz": 9000, "width": 1.0, "seed": 23, "wet_db": -22.0, "duck_db": 2.0, "echo_send": 0.6}},
+                        "lp_hz": 9000, "width": 1.0, "seed": 23, "wet_db": -25.0, "duck_db": 2.0, "echo_send": 0.6}},
     "dreamy": {"label": "Dreamy",
-               "chorus": {"wet_db": -15.0},
+               "chorus": {"wet_db": -18.0},
                "delay": {"note": "quarter", "feedback": 0.45, "first_db": -11.0, "lp_hz": 3500, "hp_hz": 220,
                          "pingpong": True, "duck_db": 5.0},
                "reverb": {"rt60": 3.8, "low_x": 1.1, "high_x": 0.5, "predelay_ms": 55, "onset_ms": 45.0, "hp_hz": 200,
@@ -341,8 +347,10 @@ def energy(x):
 
 
 def at_level(wet, ref, db):
-    """wet scaled so its energy sits db under (or over) ref's."""
-    e_w, e_r = energy(wet), energy(ref)
+    """wet scaled so its energy per channel sits db under (or over) ref's per channel: a stereo effect against the mono voice
+    as it sits in the song, the same voice on both sides."""
+    e_w = energy(wet) / (np.shape(wet)[1] if np.ndim(wet) == 2 else 1)
+    e_r = energy(ref) / (np.shape(ref)[1] if np.ndim(ref) == 2 else 1)
     if e_w <= 0 or e_r <= 0:
         return wet
     return (wet * np.float32(np.sqrt(e_r / e_w * 10 ** (db / 10)))).astype(np.float32)

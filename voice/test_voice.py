@@ -680,6 +680,33 @@ class VocalFxTests(unittest.TestCase):
             first = y[:SR // 10].mean(1)  # the first 100 ms: the polished voice itself, no effect yet
             self.assertGreater(float(np.corrcoef(first, voice[:SR // 10])[0, 1]), 0.9, name)
 
+    def test_wet_levels_are_per_channel_against_the_voice(self):
+        """A stereo effect at -12 dB sits 12 dB under the voice on each side (the first cut left every reverb 3 dB under)."""
+        rng = np.random.default_rng(3)
+        ref = (0.2 * rng.standard_normal(SR)).astype(np.float32)
+        wet = (0.05 * rng.standard_normal((SR * 2, 2))).astype(np.float32)
+        y = vocalfx.at_level(wet, ref, -12.0)
+        per_side = 10 * np.log10(vocalfx.energy(y) / 2 / vocalfx.energy(ref))
+        self.assertAlmostEqual(per_side, -12.0, delta=0.01)
+        self.assertAlmostEqual(10 * np.log10(vocalfx.energy(vocalfx.at_level(ref[:SR // 2], ref, -6.0)) / vocalfx.energy(ref)),
+                               -6.0, delta=0.01)  # mono against mono: as before
+
+    def test_reverbs_sit_at_their_numbers(self):
+        """Studio, Plate and Hall on a held note: the reverb alone (the effected voice minus the polished voice) sits at its
+        wet_db against the polished voice on each side, less the ducking while the note sounds, never more."""
+        t = np.arange(SR * 3) / SR
+        voice = (0.3 * sum(np.sin(2 * np.pi * 220 * k * t) / k for k in range(1, 5))).astype(np.float32)
+        pol, _ = vocalfx.polish(voice, SR)
+        levels = {}
+        for name in ("studio", "plate", "hall"):
+            rv = vocalfx.PRESETS[name]["reverb"]
+            y, _ = vocalfx.apply(voice, SR, name)
+            effect = y - np.pad(np.repeat(pol[:, None], 2, axis=1), ((0, len(y) - len(pol)), (0, 0)))
+            levels[name] = 10 * np.log10(vocalfx.energy(effect) / 2 / vocalfx.energy(pol))
+            self.assertGreaterEqual(levels[name], rv["wet_db"] - rv["duck_db"] - 0.5, name)
+            self.assertLessEqual(levels[name], rv["wet_db"] + 0.5, name)
+        self.assertLess(levels["studio"] + 8, min(levels["plate"], levels["hall"]))  # the glue is far under the rooms
+
 
 class HandlerTests(Base):
     def test_output_shape_and_one_copy_in_vocal_mode(self):
