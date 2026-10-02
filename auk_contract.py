@@ -75,4 +75,27 @@ def plan(inp):
             result.append(piece)
     if not result:
         raise ValueError("The screenplay contains no spoken words.")
+    if inp.get("voice_sample") is True and not inp.get("reference_voice_url"):
+        result.insert(0, voice_sample_piece(result[0], pace))
     return result
+
+
+def voice_sample_piece(first, pace=1):
+    """A private opening take that only sets the voice (Oct 2 2026).
+
+    Instruct TTS sometimes speaks the voice description aloud: a preview began
+    with the description's own words before the script. With voice_sample on,
+    the description meets only this throwaway take of the script's opening
+    words; the handler keeps its first eight seconds as the reference and
+    every piece the listener hears is same-voice speech. Never in the output.
+    """
+    tokens = first["text"].split()
+    end = min(12, len(tokens))
+    for i in range(min(16, len(tokens)), 5, -1):
+        if re.search(r'[.!?;][\"\u201d\u2019]*$', tokens[i - 1]):
+            end = i
+            break
+    piece = {"direction": first["direction"], "text": " ".join(tokens[:end]),
+             "seconds": max(1, end * pace / 2.6 + 0.5), "seed": first["seed"], "sample": True}
+    piece["instruction"] = model_instruction(piece)
+    return piece

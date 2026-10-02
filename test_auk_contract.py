@@ -41,6 +41,40 @@ class ContractTests(unittest.TestCase):
         piece = plan({"prompt": 'She said, "Hello."', "voice_description": 'Warm with a Southern accent'})[0]
         self.assertEqual(model_instruction(piece), 'Generate speech based on the following description: "Warm with a Southern accent". The content to speak is: "She said, \\"Hello.\\"".')
 
+    def test_voice_sample_keeps_the_description_away_from_heard_speech(self):
+        import json
+        script = ('<speak voice="A small child with a thick accent. Studio audio.">'
+                  'The thunder rolled outside like a warning drum. I stood at the window. ' +
+                  ('Another synthetic sentence for the speaker. ' * 30) + '</speak>')
+        plain = plan({"prompt": script})
+        sampled = plan({"prompt": script, "voice_sample": True})
+        self.assertTrue(sampled[0]["sample"])
+        self.assertEqual(sampled[0]["text"], "The thunder rolled outside like a warning drum. I stood at the window.")
+        self.assertIn("thick accent", sampled[0]["instruction"])
+        heard = [p for p in sampled if not p.get("sample")]
+        self.assertEqual(heard, plain)
+        self.assertEqual(" ".join(p["text"] for p in heard), " ".join(p["text"] for p in plain))
+        for piece in heard:
+            instruction = model_instruction(piece, has_reference=True)
+            self.assertEqual(instruction, 'Say the following with the same voice: ' + json.dumps(piece['text'], ensure_ascii=False))
+            self.assertNotIn('thick accent', instruction)
+
+    def test_voice_sample_is_off_unless_asked_and_never_with_a_clip_or_edit(self):
+        script = '<speak voice="Warm">Hello there, friend. How are you today?</speak>'
+        self.assertFalse(any(p.get("sample") for p in plan({"prompt": script})))
+        self.assertFalse(any(p.get("sample") for p in plan({"prompt": script, "voice_sample": "yes"})))
+        with_clip = plan({"prompt": script, "voice_sample": True, "reference_voice_url": "https://example.test/a"})
+        self.assertFalse(any(p.get("sample") for p in with_clip))
+        edit = plan({"auk_task": "edit", "instruction": "Make it brighter.", "voice_sample": True,
+                     "reference_voice_url": "https://example.test/a"})
+        self.assertFalse(any(p.get("sample") for p in edit))
+
+    def test_voice_sample_of_a_short_line_is_the_whole_line(self):
+        sampled = plan({"prompt": "Hi.", "voice_sample": True})
+        self.assertEqual([p["text"] for p in sampled], ["Hi.", "Hi."])
+        self.assertTrue(sampled[0]["sample"])
+        self.assertNotIn("sample", sampled[1])
+
     def test_bad_requests_do_not_reach_the_model(self):
         for values in ({"auk_task": "edit"}, {"prompt": "<speak></speak>"},
                        {"prompt": "Hi", "pace": float("nan")},

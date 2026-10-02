@@ -101,8 +101,10 @@ def handler(job):
                     source = ref
                 steps = pieces
             paths = []
+            heard = sum(1 for s in steps if not s.get("sample"))
             for n, piece in enumerate(steps):
-                runpod.serverless.progress_update(job, f"AuK HQ: part {n + 1} of {len(steps)}")
+                runpod.serverless.progress_update(job, "AuK HQ: setting the voice" if piece.get("sample")
+                                                  else f"AuK HQ: part {len(paths) + 1} of {heard}")
                 reference = piece.get("source", source)
                 instruction = model_instruction(piece, has_reference=bool(reference))
                 content = [{"type": "text", "text": instruction}]
@@ -111,7 +113,9 @@ def handler(job):
                 audio, sr = engine().generate([{"role": "user", "content": content}],
                     gen_seconds=piece["seconds"], nfe=32, cfg_strength=2.0, seed=piece["seed"])
                 output = work / f"part{n}.wav"
-                save_audio(audio, sr, str(output)); paths.append(output)
+                save_audio(audio, sr, str(output))
+                if not piece.get("sample"):
+                    paths.append(output)
                 if not editing and source is None:
                     source = work / "voice.wav"
                     ffmpeg("-i", output, "-t", 8, source)
@@ -133,7 +137,8 @@ def handler(job):
                     "wav_key": key + ".wav", "wav_url": s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key + ".wav"}, ExpiresIn=604800), "url": url, "duration_s": round(duration, 2),
                     "processing_ms": int((time.monotonic() - start) * 1000),
                     "bytes": mp3.stat().st_size, "seed": pieces[0]["seed"],
-                    "has_reference_voice": bool(inp.get("reference_voice_url")), "parts": len(steps)}
+                    "has_reference_voice": bool(inp.get("reference_voice_url")), "parts": heard,
+                    "voice_sample": any(s.get("sample") for s in steps)}
     except Exception as error:
         # Do not return URLs, signed queries, or storage credentials in errors.
         missing = getattr(error, "name", None) if isinstance(error, ModuleNotFoundError) else None
