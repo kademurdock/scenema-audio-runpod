@@ -40,6 +40,18 @@ def engine():
     return ENGINE
 
 
+def generate(messages, **kwargs):
+    runtime = engine()
+    # Pinned AuK clears projected text only after successful sampling when
+    # CPU offload is disabled. A failed ODE step must not condition the next
+    # request with a previous user's instruction on the reused engine.
+    runtime.model.transformer.clear_cache()
+    try:
+        return runtime.generate(messages, **kwargs)
+    finally:
+        runtime.model.transformer.clear_cache()
+
+
 def download(url, dest):
     import requests
     # Only the configured private asset host is allowed. Redirects cannot turn
@@ -122,7 +134,7 @@ def handler(job):
                 content = [{"type": "text", "text": instruction}]
                 if reference:
                     content.append({"type": "audio", "audio": str(reference)})
-                audio, sr = engine().generate([{"role": "user", "content": content}],
+                audio, sr = generate([{"role": "user", "content": content}],
                     gen_seconds=piece["seconds"], nfe=32, cfg_strength=2.0, seed=piece["seed"])
                 output = work / f"part{n}.wav"
                 save_audio(audio, sr, str(output))
