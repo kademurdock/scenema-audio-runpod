@@ -25,10 +25,27 @@ def edit_windows(total, inp):
     } for i in range(count)]
 
 
+def prepare_edit_instruction(instruction):
+    """Put single voice-change requests in AuK's documented timbre template."""
+    match = re.fullmatch(
+        r'(?:please\s+)?(?:make|change|turn|convert)\s+(?:this|the)\s+'
+        r'(?:speaking\s+)?voice\s+(?:sound\s+like|into|to)\s+([^\r\n.!?;]+?)[.!]?',
+        instruction, re.IGNORECASE)
+    if not match:
+        return instruction
+    description = match.group(1).strip()
+    if not description or re.search(
+            r'\b(?:replace|insert|remove|delete|add|then|say|sing|words|lyrics|content|'
+            r'raise|lower|adjust|increase|decrease|separate)\b', description, re.IGNORECASE):
+        return instruction
+    return ('Keep the spoken content unchanged and change the timbre to: ' +
+            json.dumps(description, ensure_ascii=False) + '.')
+
+
 def model_instruction(piece, has_reference=False):
-    """Use AuK's distinct speech contracts; edit requests keep their own words."""
+    """Use AuK's speech and edit contracts while preserving the saved request."""
     if "text" not in piece:
-        return piece["instruction"]
+        return prepare_edit_instruction(piece["instruction"])
     text = json.dumps(piece["text"], ensure_ascii=False)
     if has_reference:
         return f"Say the following with the same voice: {text}"

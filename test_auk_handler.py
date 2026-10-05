@@ -56,7 +56,12 @@ class AudioTests(unittest.TestCase):
                 'boto3': types.SimpleNamespace(client=lambda *a, **k: Storage()),
                 'runpod': types.SimpleNamespace(serverless=types.SimpleNamespace(progress_update=lambda *a: None)),
             }
-            for instruction in ('Give this voice an Irish accent.', 'Turn this voice into a twelve year old child.'):
+            edits = (
+                ('Give this voice an Irish accent.', 'Give this voice an Irish accent.'),
+                ('Turn this voice into a twelve year old child.',
+                 'Keep the spoken content unchanged and change the timbre to: "a twelve year old child".'),
+            )
+            for instruction, prepared in edits:
                 with self.subTest(instruction=instruction), patch.dict(sys.modules, modules), \
                         patch.dict('os.environ', {'AWS_ENDPOINT_URL': 'https://example.invalid', 'AWS_BUCKET_NAME': 'test'}), \
                         patch.object(worker, 'download', lambda url, dest: shutil.copy(source, dest)), \
@@ -69,7 +74,7 @@ class AudioTests(unittest.TestCase):
                     self.assertEqual(sr, rate)
                     self.assertEqual(rendered.shape, original.shape)
                     np.testing.assert_array_equal(rendered, np.full(original.shape, 0.125))
-                    self.assertEqual(calls[-1], (instruction, {
+                    self.assertEqual(calls[-1], (prepared, {
                         'gen_seconds': 13, 'nfe': 32, 'cfg_strength': 2.0, 'seed': 777}))
                     self.assertEqual(result['parts'], 1)
                     self.assertFalse(result['voice_sample'])
