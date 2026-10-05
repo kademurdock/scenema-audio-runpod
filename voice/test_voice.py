@@ -5,6 +5,7 @@ so voice_pipeline.Runner starts real subprocesses with the real command lines, a
 environment it was given. The bucket is a fake with the three boto3 calls the worker makes.
 Run: python -m unittest -v test_voice.py   (ffmpeg on PATH or VP_FFMPEG)"""
 import json
+import io
 import os
 import shutil
 import sys
@@ -12,6 +13,8 @@ import tempfile
 import textwrap
 import types
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 
 import numpy as np
 
@@ -22,6 +25,7 @@ import voice_pipeline  # noqa: E402
 import vocalfx  # noqa: E402
 import voice_request  # noqa: E402
 import vpaudio as va  # noqa: E402
+import hardware  # noqa: E402
 
 SR = 44100
 MODEL = "voice-models/u123/abc/model.pth"
@@ -708,6 +712,61 @@ class VocalFxTests(unittest.TestCase):
         self.assertLess(levels["studio"] + 8, min(levels["plate"], levels["hall"]))  # the glue is far under the rooms
 
 
+class HardwareTests(unittest.TestCase):
+    def test_same_major_cubin_runs_on_higher_minor(self):
+        self.assertTrue(hardware.supports_device(8, 9, ["sm_80", "sm_86"]))
+        self.assertTrue(hardware.supports_device(8, 6, ["sm_86"]))
+        self.assertTrue(hardware.supports_device(8, 9, ["sm_89"]))
+
+    def test_higher_minor_cubin_needs_a_lower_compatible_target(self):
+        self.assertFalse(hardware.supports_device(8, 6, ["sm_89"]))
+        self.assertTrue(hardware.supports_device(8, 6, ["sm_89", "sm_80"]))
+
+    def test_new_major_is_not_proved_by_older_cubins(self):
+        self.assertFalse(hardware.supports_device(12, 0, ["sm_80", "sm_86", "sm_89"]))
+        self.assertFalse(hardware.supports_device(9, 0, ["sm_86"]))
+        self.assertTrue(hardware.supports_device(12, 0, ["sm_120"]))
+
+    def test_missing_malformed_and_ptx_only_information_is_not_support(self):
+        for archs in ([], None, "sm_86", [None, 86], ["sm_"], ["sm_86extra"], ["sm_90a"], ["compute_86"]):
+            with self.subTest(archs=archs):
+                self.assertFalse(hardware.supports_device(8, 9, archs))
+        for major, minor in ((None, 9), (8, None), (True, 9), (8, 10), (0, 9), (8, -1)):
+            with self.subTest(device=(major, minor)):
+                self.assertFalse(hardware.supports_device(major, minor, ["sm_86"]))
+
+    def test_worker_probe_uses_cubin_compatibility_without_launching_kernels(self):
+        import voice_handler
+        cuda = types.SimpleNamespace(is_available=lambda: True, get_device_capability=lambda device: (8, 9),
+                                     get_device_name=lambda device: "NVIDIA GeForce RTX 4090",
+                                     get_arch_list=lambda: ["sm_80", "sm_86"])
+        output = io.StringIO()
+        with mock.patch.dict(sys.modules, {"torch": types.SimpleNamespace(cuda=cuda)}), \
+                mock.patch.object(sys, "argv", ["probe", HERE]), mock.patch.object(sys, "path", list(sys.path)), \
+                redirect_stdout(output):
+            exec(voice_handler.GPU_PROBE, {})
+        report = json.loads(output.getvalue())
+        self.assertTrue(report["supported"])
+        self.assertEqual(report["capability"], "sm_89")
+        self.assertEqual(report["compiled_archs"], ["sm_80", "sm_86"])
+
+    def test_unconfirmed_gpu_is_refused_before_recording_or_model_fetch(self):
+        import voice_handler
+        request = {"input": {"mode": "vocal", "audio_key": "voice/abcdefgh12/in.wav", "model_key": MODEL}}
+        for gpu in ({"cuda": True, "supported": False, "name": "NVIDIA GeForce RTX 5090", "capability": "sm_120"},
+                    {"cuda": True, "supported": None}, {"cuda": False}, {"cuda": None}):
+            with self.subTest(gpu=gpu), mock.patch.object(voice_handler, "GPU", dict(gpu)), \
+                    mock.patch.object(voice_handler, "storage") as storage, \
+                    mock.patch.object(voice_models, "fetch") as fetch_model, \
+                    mock.patch.object(voice_pipeline, "run") as inference:
+                result = voice_handler.handler(request)
+                self.assertIn("CUDA support", result["error"])
+                self.assertNotIn("before the RTX 50", result["error"])
+                storage.assert_not_called()
+                fetch_model.assert_not_called()
+                inference.assert_not_called()
+
+
 class HandlerTests(Base):
     def test_output_shape_and_one_copy_in_vocal_mode(self):
         import voice_handler
@@ -751,7 +810,7 @@ class HandlerTests(Base):
             self.assertTrue(fx["vocal_fx_url"].startswith("https://bucket.example/voice/testjob0002/vocal_fx.mp3"))
             voice_handler.GPU.update({"supported": False, "name": "NVIDIA GeForce RTX 5090"})
             refused = voice_handler.handler({"input": {"mode": "vocal", "audio_key": "voice/abcdefgh12/in.wav", "model_key": MODEL}})
-            self.assertIn("RTX 50", refused["error"])
+            self.assertIn("compatible compiled CUDA support", refused["error"])
         finally:
             voice_handler.storage, voice_pipeline.Runner = saved[0], saved[1]
             voice_handler.GPU.clear()

@@ -27,28 +27,32 @@ PRESIGN_S = 7 * 24 * 3600
 GPU = {}
 
 GPU_PROBE = r"""
-import json, torch
+import json, sys, torch
+sys.path.insert(0, sys.argv[1])
+from hardware import supports_device
 out = {"cuda": torch.cuda.is_available()}
 if out["cuda"]:
     major, minor = torch.cuda.get_device_capability(0)
     out["name"] = torch.cuda.get_device_name(0)
     out["capability"] = f"sm_{major}{minor}"
-    out["supported"] = out["capability"] in torch.cuda.get_arch_list()
+    out["compiled_archs"] = torch.cuda.get_arch_list()
+    out["supported"] = supports_device(major, minor, out["compiled_archs"])
 print(json.dumps(out))
 """
 
 
 def gpu_check():
-    """Once per worker: the card's name (for pricing) and whether the pinned torch 2.7.1+cu118 has kernels for it.
-    An RTX 50-series / Blackwell card has none, and would fail every job part-way through."""
+    """Once per worker: the card's name (for pricing) and compatible compiled CUDA cubins.
+    Same-major cubins run on equal or higher minor capabilities, including sm_86 on Ada sm_89."""
     if not GPU:
         try:
-            r = subprocess.run([os.environ.get("VOICE_RVC_PYTHON", "/opt/rvc-venv/bin/python"), "-c", GPU_PROBE],
+            r = subprocess.run([os.environ.get("VOICE_RVC_PYTHON", "/opt/rvc-venv/bin/python"), "-c", GPU_PROBE, HERE],
                                capture_output=True, text=True, timeout=120)
             GPU.update(json.loads(r.stdout.strip().splitlines()[-1]))
         except Exception as error:
             GPU.update({"cuda": None, "error": type(error).__name__})
-        print("voice worker GPU:", {k: GPU.get(k) for k in ("name", "capability", "supported", "cuda")}, flush=True)
+        print("voice worker GPU:", {k: GPU.get(k) for k in ("name", "capability", "compiled_archs", "supported", "cuda")},
+              flush=True)
     return GPU
 
 
@@ -101,9 +105,14 @@ def handler(job):
     try:
         req = voice_request.parse(job.get("input") or {})
         gpu = gpu_check()
-        if gpu.get("cuda") and gpu.get("supported") is False:
-            raise ValueError(f"The voice worker cannot run on this graphics card ({gpu.get('name')}). Nothing was changed; "
-                             "the endpoint needs a card from before the RTX 50 series.")
+        if gpu.get("cuda") is not True:
+            raise ValueError("The voice worker could not confirm CUDA support on its graphics card. "
+                             "Use a worker image and graphics card that support CUDA.")
+        if gpu.get("supported") is not True:
+            card = gpu.get("name") or "unknown card"
+            capability = gpu.get("capability") or "unknown capability"
+            raise ValueError(f"The voice worker could not confirm compatible compiled CUDA support for this graphics card "
+                             f"({card}, {capability}). Update the worker image or choose a graphics card its CUDA build supports.")
         import runpod
         timing = {}
         with tempfile.TemporaryDirectory() as td:
