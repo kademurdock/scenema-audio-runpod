@@ -12,7 +12,7 @@ import time
 import urllib.parse
 import uuid
 
-from auk_contract import plan, model_instruction
+from auk_contract import plan, model_instruction, edit_windows
 
 log = logging.getLogger("auk-worker")
 logging.basicConfig(level=logging.INFO)
@@ -29,9 +29,14 @@ def engine():
         if not (qwen_dir / 'config.json').is_file():
             raise ValueError('The Qwen model cache is not ready. No audio was generated.')
         from auk.infer.infer_auk import AukInfer
+        import torch
+        offload_setting = os.environ.get('AUK_CPU_OFFLOAD', 'auto').lower()
+        offload = (torch.cuda.get_device_properties(0).total_memory < 40 * 1024**3
+                   if offload_setting == 'auto' else offload_setting not in ('0', 'false'))
+        log.info('AuK CPU offload: %s', offload)
         ENGINE = AukInfer(str(model_dir / 'config.yaml'), str(model_dir / 'auk_base.safetensors'),
                           qwen_path=str(qwen_dir), dtype="bf16", device="cuda",
-                          cpu_offload=True)
+                          cpu_offload=offload)
     return ENGINE
 
 
@@ -75,29 +80,36 @@ def handler(job):
         with tempfile.TemporaryDirectory() as td:
             work = Path(td)
             source = None
+            editing = inp.get("auk_task") == "edit"
             if inp.get("reference_voice_url"):
                 download(inp["reference_voice_url"], work / "import")
                 source = work / "source.wav"
-                ffmpeg("-i", work / "import", "-ar", 24000, "-ac", 1, source)
-            editing = inp.get("auk_task") == "edit"
+                ffmpeg("-i", work / "import", "-vn", "-c:a", "pcm_s24le", source)
+            before = None
+            after = None
             if editing:
                 source_info = sf.info(source)
                 # Apply the instruction to every source window, retaining all
                 # of the recording. Content edits across a join need review.
                 total = source_info.duration
-                target = pieces[0]["seconds"] or total
-                windows = max(1, __import__("math").ceil((total + target) / 28))
+                windows = edit_windows(total, inp)
                 steps = []
-                for n in range(windows):
+                if windows[0]['start'] > 0 and inp.get('preserve_before', True):
+                    before = work / 'before.wav'
+                    ffmpeg('-i', source, '-t', windows[0]['start'], '-c:a', 'pcm_s24le', before)
+                if windows[-1]['end'] < total and inp.get('preserve_after', True):
+                    after = work / 'after.wav'
+                    ffmpeg('-i', source, '-ss', windows[-1]['end'], '-c:a', 'pcm_s24le', after)
+                for n, window in enumerate(windows):
                     ref = work / f"ref{n}.wav"
-                    ffmpeg("-i", source, "-ss", n * total / windows,
-                           "-t", total / windows, ref)
-                    steps.append({**pieces[0], "seconds": target / windows, "source": ref})
+                    ffmpeg("-i", source, "-ss", window['start'],
+                           "-t", window['end'] - window['start'], '-ar', 24000, '-ac', 1, ref)
+                    steps.append({**pieces[0], "seconds": window['seconds'], "source": ref})
             else:
                 if source:
                     # A voice reference is a sample; edits above retain it all.
                     ref = work / "voice.wav"
-                    ffmpeg("-i", source, "-t", 8, ref)
+                    ffmpeg("-i", source, "-t", 8, '-ar', 24000, '-ac', 1, ref)
                     source = ref
                 steps = pieces
             paths = []
@@ -114,15 +126,24 @@ def handler(job):
                     gen_seconds=piece["seconds"], nfe=32, cfg_strength=2.0, seed=piece["seed"])
                 output = work / f"part{n}.wav"
                 save_audio(audio, sr, str(output))
+                if editing:
+                    normalized = work / f'edited{n}.wav'
+                    ffmpeg('-i', output, '-ar', source_info.samplerate, '-ac', source_info.channels,
+                           '-c:a', 'pcm_s24le', normalized)
+                    output = normalized
                 if not piece.get("sample"):
                     paths.append(output)
                 if not editing and source is None:
                     source = work / "voice.wav"
                     ffmpeg("-i", output, "-t", 8, source)
+            if before:
+                paths.insert(0, before)
+            if after:
+                paths.append(after)
             listing = work / "concat.txt"
             listing.write_text("".join(f"file '{p.name}'\n" for p in paths))
             wav = work / "master.wav"; mp3 = work / "master.mp3"
-            ffmpeg("-f", "concat", "-safe", 1, "-i", listing, "-c:a", "pcm_s16le", wav)
+            ffmpeg("-f", "concat", "-safe", 1, "-i", listing, "-c:a", "pcm_s24le" if editing else "pcm_s16le", wav)
             ffmpeg("-i", wav, "-c:a", "libmp3lame", "-b:a", "192k", mp3)
             duration = sf.info(wav).duration
             s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"],

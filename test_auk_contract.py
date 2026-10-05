@@ -1,9 +1,30 @@
 import unittest
 
-from auk_contract import plan, model_instruction
+from auk_contract import plan, model_instruction, edit_windows
 
 
 class ContractTests(unittest.TestCase):
+    def test_edit_windows_preserve_range_and_duration(self):
+        for total in (0.2, 14, 42, 251.73):
+            windows = edit_windows(total, {})
+            self.assertEqual(windows[0]['start'], 0)
+            self.assertEqual(windows[-1]['end'], total)
+            self.assertAlmostEqual(sum(w['seconds'] for w in windows), total)
+            for i, w in enumerate(windows):
+                self.assertLessEqual(w['end'] - w['start'] + w['seconds'], 28.00001)
+                if i:
+                    self.assertEqual(windows[i - 1]['end'], w['start'])
+        windows = edit_windows(90, {'edit_start': 10, 'edit_end': 30, 'gen_seconds': 40})
+        self.assertEqual(windows[0]['start'], 10)
+        self.assertEqual(windows[-1]['end'], 30)
+        self.assertAlmostEqual(sum(w['seconds'] for w in windows), 40)
+
+    def test_bad_edit_range_rejected(self):
+        for values in ({'edit_start': -1}, {'edit_end': 91}, {'edit_start': 10, 'edit_end': 5},
+                       {'gen_seconds': float('nan')}, {'gen_seconds': 0}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                edit_windows(90, values)
+
     def test_long_speech_keeps_every_word_in_order(self):
         words = " ".join(f"word{n}" for n in range(1201))
         for pace in (0.5, 1, 3):

@@ -5,6 +5,24 @@ import re
 import xml.etree.ElementTree as ET
 
 
+def edit_windows(total, inp):
+    """Frame-aligned, bounded windows, including a selected range's untouched edges."""
+    start = float(inp.get('edit_start') or 0)
+    end = float(inp['edit_end']) if inp.get('edit_end') is not None else total
+    target = float(inp['gen_seconds']) if inp.get('gen_seconds') is not None else end - start
+    if not all(math.isfinite(x) for x in (total, start, end, target)) or total <= 0 or start < 0 or end <= start or end > total + 0.05 or target <= 0:
+        raise ValueError('Choose an edit range inside the recording and a positive target length.')
+    end = min(total, end)
+    count = max(1, math.ceil((end - start + target) / 28))
+    if count > 360:
+        raise ValueError('Select a shorter recording section for this edit.')
+    return [{
+        'start': start + (end - start) * i / count,
+        'end': end if i == count - 1 else start + (end - start) * (i + 1) / count,
+        'seconds': target / count,
+    } for i in range(count)]
+
+
 def model_instruction(piece, has_reference=False):
     """Use AuK's distinct speech contracts; edit requests keep their own words."""
     if "text" not in piece:
