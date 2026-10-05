@@ -688,12 +688,12 @@ def style_request(inp):
     key = inp.get('lora_key')
     if key is None:
         return None
-    if not isinstance(key, str) or not STYLE_KEY.match(key):
+    if not isinstance(key, str) or not STYLE_KEY.fullmatch(key) or re.search(r'decoder|soundstage', key, re.I):
         raise ValueError('That trained style is not available.')
     scale = inp.get('lora_scale', 1.0)
-    if type(scale) not in (int, float) or not math.isfinite(scale) or not 0.1 <= scale <= 1.5:
-        raise ValueError('Style strength must be between 0.1 and 1.5.')
-    return key, float(scale)
+    if type(scale) not in (int, float) or not math.isfinite(scale) or not 0 <= scale <= 1.5:
+        raise ValueError('Style strength must be between 0 and 1.5.')
+    return (key, float(scale)) if scale else None
 
 
 def style_linears(model):
@@ -703,6 +703,33 @@ def style_linears(model):
                            (layer.mlp, ('gate_proj', 'up_proj', 'down_proj'))):
             for name in names:
                 yield getattr(mod, name)
+
+
+def style_tensors(checkpoint, linears):
+    """Reject decoder adapters and validate every tensor before changing any weight."""
+    import torch
+    if not isinstance(checkpoint, dict):
+        raise ValueError('That trained style does not fit this model.')
+    stage = f"{checkpoint.get('kind', '')} {checkpoint.get('targets', '')}"
+    # Older sound-stage checkpoints have only io/head, with no kind field.
+    if re.search(r'decoder|sound.?stage|\bnar\b|nar_', stage, re.I) or 'io' in checkpoint or 'head' in checkpoint:
+        raise ValueError('That file is a sound-stage adapter, not a singing style.')
+    tensors, rank = checkpoint.get('lora'), checkpoint.get('rank')
+    if not isinstance(tensors, (list, tuple)) or len(tensors) != 2 * len(linears):
+        raise ValueError('That trained style does not fit this model.')
+    if rank is not None and (type(rank) is not int or rank < 1):
+        raise ValueError('That trained style has an invalid rank.')
+    for index, lin in enumerate(linears):
+        a, b = tensors[2 * index:2 * index + 2]
+        if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor) or a.ndim != 2 or b.ndim != 2:
+            raise ValueError('That trained style has invalid weights.')
+        if (not a.is_floating_point() or not b.is_floating_point() or a.shape[0] < 1 or
+                a.shape[1] != lin.weight.shape[1] or b.shape != (lin.weight.shape[0], a.shape[0]) or
+                (rank is not None and a.shape[0] != rank)):
+            raise ValueError('That trained style does not fit this model.')
+        if not torch.isfinite(a).all().item() or not torch.isfinite(b).all().item():
+            raise ValueError('That trained style contains damaged weights.')
+    return tensors
 
 
 def apply_style(pipe, wanted, fetch):
@@ -717,20 +744,26 @@ def apply_style(pipe, wanted, fetch):
     model = pipe._load_model()
     linears = list(style_linears(model))
     with torch.no_grad():
-        if STYLE['plain'] is None:
-            STYLE['plain'] = [lin.weight.detach().to('cpu', copy=True) for lin in linears]
         tensors = None
         if wanted:
-            tensors = torch.load(fetch(wanted[0]), map_location='cpu', weights_only=True)['lora']
-            if len(tensors) != 2 * len(linears):
-                raise ValueError('That trained style does not fit this model.')
+            tensors = style_tensors(torch.load(fetch(wanted[0]), map_location='cpu', weights_only=True), linears)
+        if STYLE['plain'] is None:
+            STYLE['plain'] = [lin.weight.detach().to('cpu', copy=True) for lin in linears]
         STYLE['applied'] = 'changing'
-        for index, (lin, plain) in enumerate(zip(linears, STYLE['plain'])):
-            lin.weight.copy_(plain)
-            if tensors:
-                a = tensors[2 * index].to(lin.weight.device, torch.float32)
-                b = tensors[2 * index + 1].to(lin.weight.device, torch.float32)
-                lin.weight.add_((wanted[1] * (b @ a)).to(lin.weight.dtype))
+        try:
+            for index, (lin, plain) in enumerate(zip(linears, STYLE['plain'])):
+                lin.weight.copy_(plain)
+                if tensors:
+                    a = tensors[2 * index].to(lin.weight.device, torch.float32)
+                    b = tensors[2 * index + 1].to(lin.weight.device, torch.float32)
+                    lin.weight.add_((wanted[1] * (b @ a)).to(lin.weight.dtype))
+                    if not torch.isfinite(lin.weight).all().item():
+                        raise ValueError('That trained style contains damaged weights.')
+        except Exception:
+            for lin, plain in zip(linears, STYLE['plain']):
+                lin.weight.copy_(plain)
+            STYLE['applied'] = None
+            raise
     STYLE['applied'] = wanted
 
 
@@ -742,7 +775,7 @@ def engine():
         PIPE = YuE2Pipeline.from_pretrained(
             os.environ['YUE_MODEL_DIR'], vae=os.environ['YUE_VAE_DIR'],
             local_files_only=True, device='cuda')
-        STYLE['applied'] = None  # a fresh pipeline reads plain weights from disk
+        STYLE.update(applied=None, plain=None)  # a fresh pipeline reads plain weights from disk
     return PIPE
 
 

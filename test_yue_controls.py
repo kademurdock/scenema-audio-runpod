@@ -189,8 +189,11 @@ class StyleTest(unittest.TestCase):
 
     def test_style_key_and_strength_are_checked(self):
         self.assertIsNone(style_request({}))
+        self.assertIsNone(style_request({'lora_key': 'yue2-loras/kids-step1200.pt', 'lora_scale': 0}))
         self.assertEqual(style_request({'lora_key': 'yue2-loras/kids-step1200.pt'}), ('yue2-loras/kids-step1200.pt', 1.0))
-        for bad in ({'lora_key': '../secrets.pt'}, {'lora_key': 'yue2-loras/a.pt', 'lora_scale': 9}):
+        for bad in ({'lora_key': '../secrets.pt'}, {'lora_key': 'yue2-loras/a.pt', 'lora_scale': 9},
+                    {'lora_key': 'yue2-loras/a.pt', 'lora_scale': -.1},
+                    {'lora_key': 'yue2-loras/a.pt\n'}, {'lora_key': 'yue2-loras/soul-DECODER-step1000.pt'}):
             with self.assertRaises(ValueError):
                 style_request(bad)
 

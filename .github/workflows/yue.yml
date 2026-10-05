@@ -2,7 +2,7 @@ name: build-yue2
 on:
   push:
     branches: [main, session202-yue2, lora-styles, p295-covers, p295-covers-sync]
-    paths: [Dockerfile.yue, yue_handler.py, test_yue_controls.py, cover.py, lyric_sync.py, align.py, test_lyric_sync.py, 'instrumental/**', .github/workflows/yue.yml]
+    paths: [Dockerfile.yue, yue_handler.py, test_yue_controls.py, test_yue_styles.py, cover.py, lyric_sync.py, align.py, test_lyric_sync.py, 'instrumental/**', .github/workflows/yue.yml]
   workflow_dispatch:
 permissions:
   contents: read
