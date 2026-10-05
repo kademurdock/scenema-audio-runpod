@@ -21,9 +21,14 @@ class ContractTests(unittest.TestCase):
 
     def test_bad_edit_range_rejected(self):
         for values in ({'edit_start': -1}, {'edit_end': 91}, {'edit_start': 10, 'edit_end': 5},
+                       {'edit_start': 90}, {'edit_start': 90.01, 'edit_end': 90.02},
                        {'gen_seconds': float('nan')}, {'gen_seconds': 0}):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 edit_windows(90, values)
+
+    def test_rounded_end_uses_actual_source_duration(self):
+        windows = edit_windows(90, {'edit_start': 89, 'edit_end': 90.02})
+        self.assertEqual(windows, [{'start': 89, 'end': 90, 'seconds': 1}])
 
     def test_long_speech_keeps_every_word_in_order(self):
         words = " ".join(f"word{n}" for n in range(1201))

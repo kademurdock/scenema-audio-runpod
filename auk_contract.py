@@ -9,10 +9,12 @@ def edit_windows(total, inp):
     """Frame-aligned, bounded windows, including a selected range's untouched edges."""
     start = float(inp.get('edit_start') or 0)
     end = float(inp['edit_end']) if inp.get('edit_end') is not None else total
-    target = float(inp['gen_seconds']) if inp.get('gen_seconds') is not None else end - start
-    if not all(math.isfinite(x) for x in (total, start, end, target)) or total <= 0 or start < 0 or end <= start or end > total + 0.05 or target <= 0:
+    if not all(math.isfinite(x) for x in (total, start, end)) or total <= 0 or start < 0 or start >= total or end <= start or end > total + 0.05:
         raise ValueError('Choose an edit range inside the recording and a positive target length.')
     end = min(total, end)
+    target = float(inp['gen_seconds']) if inp.get('gen_seconds') is not None else end - start
+    if not math.isfinite(target) or target <= 0:
+        raise ValueError('Choose an edit range inside the recording and a positive target length.')
     count = max(1, math.ceil((end - start + target) / 28))
     if count > 360:
         raise ValueError('Select a shorter recording section for this edit.')
