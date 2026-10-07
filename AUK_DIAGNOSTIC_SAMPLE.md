@@ -15,10 +15,11 @@ The optional sample is a private sibling of that take's WAV and MP3 in the same
 B2 bucket. It never enters the audible concatenation or gallery asset event, and
 no prompt, sample, URL or user detail is printed to worker logs. The worker's
 completed response supplies its owner ID, key, SHA-256, duration and seven-day
-signed URL. The bridge continues projecting ordinary playback fields, so these
-diagnostics do not appear in the gallery or ordinary Sound Booth API. An operator
-must match the completed worker response to that authenticated owner's job before
-reading it through the private provider API.
+signed URL. Bridge `63383a9` retains validated sample metadata with the exact
+authenticated owner's job, checking its sibling key, private host, duration and
+hash. The clip does not become a gallery asset. The worker's completed result
+can also be inspected through the private provider API while available; match it
+to the authenticated owner's job before reading it.
 Link expiry does not delete the object: it follows the ordinary stored-master
 retention policy. Operators must remove it with the take's private stored files
 when it is no longer needed; do not enable this under a claimed deletion policy
