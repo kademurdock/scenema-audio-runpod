@@ -13,6 +13,7 @@ jobs:
       - name: Speech instruction and inference isolation tests
         run: |
           python3 -m pip install "numpy>=1.26,<3" "soundfile>=0.12,<1"
+          python3 -c "import shutil; assert shutil.which('ffmpeg'), 'Real PCM checks require FFmpeg'"
           python3 -m unittest test_auk_contract.py test_auk_inference.py test_auk_handler.py
       - name: Free image build space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
