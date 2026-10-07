@@ -1,5 +1,6 @@
 """Full-quality AuK, private B2 outputs, zero automatic inference retries."""
 import ipaddress
+import hashlib
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ import time
 import urllib.parse
 import uuid
 
-from auk_contract import plan, model_instruction, edit_windows
+from auk_contract import plan, model_instruction, edit_windows, retain_bootstrap_sample
 
 log = logging.getLogger("auk-worker")
 logging.basicConfig(level=logging.INFO)
@@ -125,6 +126,7 @@ def handler(job):
                     source = ref
                 steps = pieces
             paths = []
+            diagnostic_sample = None
             heard = sum(1 for s in steps if not s.get("sample"))
             for n, piece in enumerate(steps):
                 runpod.serverless.progress_update(job, "AuK HQ: setting the voice" if piece.get("sample")
@@ -148,6 +150,10 @@ def handler(job):
                 if not editing and source is None:
                     source = work / "voice.wav"
                     ffmpeg("-i", output, "-t", 8, source)
+                    if piece.get("sample") and retain_bootstrap_sample(inp, os.environ):
+                        # Retain the exact cropped reference the audible parts
+                        # received, separately from the performance and gallery.
+                        diagnostic_sample = source
             if before:
                 paths.insert(0, before)
             if after:
@@ -166,12 +172,31 @@ def handler(job):
             for path, suffix, mime in [(wav, ".wav", "audio/wav"), (mp3, ".mp3", "audio/mpeg")]:
                 s3.upload_file(str(path), bucket, key + suffix, ExtraArgs={"ContentType": mime})
             url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key + ".mp3"}, ExpiresIn=604800)
-            return {"engine": "auk", "quality": "base-bf16-32", "key": key + ".mp3",
+            result = {"engine": "auk", "quality": "base-bf16-32", "key": key + ".mp3",
                     "wav_key": key + ".wav", "wav_url": s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key + ".wav"}, ExpiresIn=604800), "url": url, "duration_s": round(duration, 2),
                     "processing_ms": int((time.monotonic() - start) * 1000),
                     "bytes": mp3.stat().st_size, "seed": pieces[0]["seed"],
                     "has_reference_voice": bool(inp.get("reference_voice_url")), "parts": heard,
                     "voice_sample": any(s.get("sample") for s in steps)}
+            if diagnostic_sample is not None:
+                try:
+                    diagnostic_key = key + '.conditioning.wav'
+                    s3.upload_file(str(diagnostic_sample), bucket, diagnostic_key,
+                                   ExtraArgs={"ContentType": "audio/wav"})
+                    result['diagnostic_sample'] = {
+                        'owner_id': inp['out_prefix'], 'key': diagnostic_key,
+                        'url': s3.generate_presigned_url('get_object',
+                            Params={'Bucket': bucket, 'Key': diagnostic_key}, ExpiresIn=604800),
+                        'duration_s': sf.info(diagnostic_sample).duration,
+                        'sha256': hashlib.sha256(diagnostic_sample.read_bytes()).hexdigest(),
+                        'kind': 'bootstrap_reference',
+                    }
+                except Exception as error:
+                    # An optional capture cannot turn finished audio into a
+                    # render failure and invite an unnecessary paid retry.
+                    log.warning('AuK diagnostic retention failed (%s)', type(error).__name__)
+                    result['diagnostic_sample_error'] = 'retention_failed'
+            return result
     except Exception as error:
         # Do not return URLs, signed queries, or storage credentials in errors.
         missing = getattr(error, "name", None) if isinstance(error, ModuleNotFoundError) else None

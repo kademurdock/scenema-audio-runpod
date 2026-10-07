@@ -5,6 +5,17 @@ import re
 import xml.etree.ElementTree as ET
 
 
+def retain_bootstrap_sample(inp, env):
+    """An ops-only opt-in for one authenticated bridge owner's next normal job."""
+    owner = env.get('AUK_DIAGNOSTIC_USER_ID', '')
+    # The bridge supplies out_prefix from its trusted userId, not speech text.
+    # A request-side boolean cannot enable retention for another account.
+    return (bool(re.fullmatch(r'[a-f0-9]{24}', owner)) and
+            inp.get('out_prefix') == owner and inp.get('voice_sample') is True and
+            inp.get('auk_task', 'speech') == 'speech' and
+            not inp.get('reference_voice_url'))
+
+
 def edit_windows(total, inp):
     """Frame-aligned, bounded windows, including a selected range's untouched edges."""
     start = float(inp.get('edit_start') or 0)

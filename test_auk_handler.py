@@ -14,6 +14,97 @@ import auk_handler as worker
 
 @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg is required')
 class AudioTests(unittest.TestCase):
+    def test_private_sample_capture_keeps_exact_reference_out_of_heard_audio_and_other_accounts(self):
+        import hashlib
+        owner = '1234567890abcdef12345678'
+        for configured_owner in (None, owner, 'abcdef1234567890abcdef12'):
+            with self.subTest(configured_owner=configured_owner), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                uploaded, calls = {}, []
+                rate = 24000
+
+                class Engine:
+                    model = types.SimpleNamespace(transformer=types.SimpleNamespace(clear_cache=lambda: None))
+
+                    def generate(self, messages, **kwargs):
+                        content = messages[0]['content']
+                        reference = sf.read(content[1]['audio'])[0] if len(content) == 2 else None
+                        calls.append(reference)
+                        return np.full(round(kwargs['gen_seconds'] * rate), 0.25 if reference is None else 0.125), rate
+
+                class Storage:
+                    def upload_file(self, path, bucket, key, **kwargs):
+                        dest = root / Path(key).name
+                        shutil.copy(path, dest)
+                        uploaded[key] = dest
+
+                    def generate_presigned_url(self, _action, Params, **kwargs):
+                        return 'https://example.invalid/' + Params['Key']
+
+                modules = {
+                    'auk.infer.infer_auk': types.SimpleNamespace(save_audio=lambda data, sr, path: sf.write(path, data, sr)),
+                    'boto3': types.SimpleNamespace(client=lambda *a, **k: Storage()),
+                    'runpod': types.SimpleNamespace(serverless=types.SimpleNamespace(progress_update=lambda *a: None)),
+                }
+                env = {'AWS_ENDPOINT_URL': 'https://example.invalid', 'AWS_BUCKET_NAME': 'test', 'AUK_DIAGNOSTIC_USER_ID': ''}
+                if configured_owner:
+                    env['AUK_DIAGNOSTIC_USER_ID'] = configured_owner
+                with patch.dict(sys.modules, modules), patch.dict('os.environ', env), \
+                        patch.object(worker, 'engine', return_value=Engine()):
+                    result = worker.handler({'input': {'prompt': 'These fifteen invented words mark the full audible performance separately from its private voice sample.',
+                        'out_prefix': owner, 'voice_sample': True, 'retain_voice_sample': True}})
+                self.assertNotIn('error', result)
+                self.assertEqual(len(calls), 2)  # No diagnostic generation.
+                self.assertIsNone(calls[0])
+                self.assertTrue(np.all(calls[1] == 0.25))
+                heard, _ = sf.read(uploaded[result['wav_key']])
+                self.assertTrue(np.all(heard == 0.125))
+                if configured_owner == owner:
+                    capture = result['diagnostic_sample']
+                    retained, _ = sf.read(uploaded[capture['key']])
+                    np.testing.assert_array_equal(retained, calls[1])
+                    self.assertEqual(capture['owner_id'], owner)
+                    self.assertEqual(capture['sha256'], hashlib.sha256(uploaded[capture['key']].read_bytes()).hexdigest())
+                    self.assertEqual(len(uploaded), 3)
+                else:
+                    self.assertNotIn('diagnostic_sample', result)
+                    self.assertEqual(len(uploaded), 2)
+
+    def test_optional_capture_failure_does_not_fail_completed_audio_or_retry_inference(self):
+        owner = '1234567890abcdef12345678'
+        calls = []
+
+        class Engine:
+            model = types.SimpleNamespace(transformer=types.SimpleNamespace(clear_cache=lambda: None))
+
+            def generate(self, messages, **kwargs):
+                calls.append(messages)
+                return np.full(round(kwargs['gen_seconds'] * 24000), 0.125), 24000
+
+        class Storage:
+            def upload_file(self, path, bucket, key, **kwargs):
+                if key.endswith('.conditioning.wav'):
+                    raise RuntimeError('signed URLs and credentials must not appear in logs')
+
+            def generate_presigned_url(self, _action, Params, **kwargs):
+                return 'https://example.invalid/' + Params['Key']
+
+        modules = {
+            'auk.infer.infer_auk': types.SimpleNamespace(save_audio=lambda data, sr, path: sf.write(path, data, sr)),
+            'boto3': types.SimpleNamespace(client=lambda *a, **k: Storage()),
+            'runpod': types.SimpleNamespace(serverless=types.SimpleNamespace(progress_update=lambda *a: None)),
+        }
+        with patch.dict(sys.modules, modules), patch.dict('os.environ', {'AWS_ENDPOINT_URL': 'https://example.invalid',
+                'AWS_BUCKET_NAME': 'test', 'AUK_DIAGNOSTIC_USER_ID': owner}), \
+                patch.object(worker, 'engine', return_value=Engine()), self.assertLogs('auk-worker', level='WARNING') as logs:
+            result = worker.handler({'input': {'prompt': 'A synthetic line for the voice.', 'voice_sample': True, 'out_prefix': owner}})
+        self.assertEqual(result['diagnostic_sample_error'], 'retention_failed')
+        self.assertNotIn('error', result)
+        self.assertNotIn('diagnostic_sample', result)
+        self.assertTrue(result['url'])
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn('credentials', '\n'.join(logs.output))
+
     def test_full_edit_sends_instruction_and_audio_and_returns_generated_pcm(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

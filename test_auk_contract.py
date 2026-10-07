@@ -1,9 +1,22 @@
 import unittest
 
-from auk_contract import plan, model_instruction, edit_windows
+from auk_contract import plan, model_instruction, edit_windows, retain_bootstrap_sample
 
 
 class ContractTests(unittest.TestCase):
+    def test_sample_diagnostics_require_exact_server_selected_owner(self):
+        owner = '1234567890abcdef12345678'
+        request = {'out_prefix': owner, 'voice_sample': True}
+        self.assertTrue(retain_bootstrap_sample(request, {'AUK_DIAGNOSTIC_USER_ID': owner}))
+        for env in ({}, {'AUK_DIAGNOSTIC_USER_ID': '*'}, {'AUK_DIAGNOSTIC_USER_ID': 'bad'},
+                    {'AUK_DIAGNOSTIC_USER_ID': 'abcdef1234567890abcdef12'}):
+            self.assertFalse(retain_bootstrap_sample(request, env))
+        for changed in ({'out_prefix': None}, {'out_prefix': 'abcdef1234567890abcdef12'},
+                        {'voice_sample': 'true'}, {'voice_sample': False}, {'auk_task': 'edit'},
+                        {'reference_voice_url': 'https://example.test/a'}):
+            self.assertFalse(retain_bootstrap_sample({**request, **changed}, {'AUK_DIAGNOSTIC_USER_ID': owner}))
+        self.assertFalse(retain_bootstrap_sample({'retain_voice_sample': True, **request}, {}))
+
     def test_edit_windows_preserve_range_and_duration(self):
         for total in (0.2, 14, 42, 251.73):
             windows = edit_windows(total, {})
