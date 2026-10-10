@@ -8,6 +8,7 @@ WAV writer. TestPinnedUpstream additionally reads the pinned upstream source (if
 checks that every name this worker sends to it exists there; it is skipped when no clone is found."""
 import ast
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -18,7 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -274,7 +275,16 @@ class TestSmallHelpers(unittest.TestCase):
         self.assertNotIn('KANGAROO', shown)
         self.assertNotIn('Traceback', shown)
         self.assertLessEqual(len(ace.scrub('x' * 900)), 200)
+        self.assertLessEqual(len(ace.scrub('x' * 900, limit=300)), 300)
+        self.assertGreater(len(ace.scrub('x' * 900, limit=300)), 200)
         self.assertEqual(ace.scrub(None), '')
+        self.assertEqual(ace.scrub('   '), '')
+
+    def test_scrub_removes_web_links_and_hub_tokens_but_keeps_the_reason(self):
+        text = 'Cannot load: https://huggingface.co/a/b?x=1 and http://10.0.0.1:8080/p, token hf_QwErTyUiOp12 end'
+        self.assertEqual(ace.scrub(text), 'Cannot load: [link] and [link], token [token] end')
+        self.assertEqual(ace.scrub('Out of memory while loading'), 'Out of memory while loading')
+        self.assertEqual(ace.scrub('shelf_life_value and chf_x'), 'shelf_life_value and chf_x')   # not a token
 
     def test_plain_failure(self):
         self.assertEqual(ace.plain_failure('Insufficient free VRAM: need ~9.1 GB'), ace.TOO_BIG)
@@ -346,6 +356,24 @@ class TestRequestInput(unittest.TestCase):
         self.check('Model must be xl-turbo or xl-sft.', model='xl-base')
         self.check('Model must be xl-turbo or xl-sft.', model='')
         self.check('Model must be xl-turbo or xl-sft.', model=3)
+        for value in (['xl-turbo'], {'name': 'xl-turbo'}, [], {}, True):      # unhashable values must not reach a dict lookup
+            self.check('Model must be xl-turbo or xl-sft.', model=value)
+
+    def test_odd_json_values_in_any_field_are_refused_in_plain_words_never_crash(self):
+        fields = ('mode', 'model', 'caption', 'lyrics', 'duration', 'seed', 'batch_size', 'bpm', 'keyscale',
+                  'timesignature', 'vocal_language', 'thinking', 'steps', 'guidance_scale', 'shift', 'lora_key')
+        values = ([], {}, ['xl-turbo'], {'a': 1}, [[1]], [None], True, False, 0, -1, 1.5, '', 'x', float('nan'),
+                  float('inf'), 10 ** 30, -10 ** 30, ' ', '\x00', 2 ** 31)
+        for field in fields:
+            for value in values:
+                raw = valid(**{field: value})
+                try:
+                    ace.refuse_adapter(raw)
+                    ace.request_input(raw)
+                except ace.RequestError:
+                    pass
+                except Exception as error:      # any other type would reach the generic handler as a vague failure
+                    self.fail(f'{field}={value!r} raised {type(error).__name__}')
 
     def test_caption(self):
         self.check('Describe the music in a few words.', caption='')
@@ -469,9 +497,11 @@ class TestRenderOutput(Harness):
         self.assertRegex(out['key'], KEY_MP3)
         self.assertRegex(out['wav_key'], KEY_WAV)
         self.assertEqual(out['key'].rsplit('/', 1)[0], out['wav_key'].rsplit('/', 1)[0])
-        self.assertTrue(out['url'].startswith('https://storage.example/ace/'))
-        self.assertIn('ttl=604800', out['url'])
-        self.assertIn('ttl=604800', out['wav_url'])
+        # which link goes with which file: the fake client builds each link from the Key it was asked to sign
+        self.assertEqual(out['url'], f'https://storage.example/{out["key"]}?ttl=604800')
+        self.assertEqual(out['wav_url'], f'https://storage.example/{out["wav_key"]}?ttl=604800')
+        self.assertTrue(out['url'].split('?')[0].endswith('/master.mp3'))
+        self.assertTrue(out['wav_url'].split('?')[0].endswith('/master.wav'))
         self.assertEqual(out['duration_s'], 90.0)
         self.assertEqual(out['bytes'], 10)
         self.assertEqual(out['seed'], 7)
@@ -499,6 +529,9 @@ class TestRenderOutput(Harness):
         for take in out['takes']:
             self.assertRegex(take['key'], KEY_MP3)
             self.assertRegex(take['wav_key'], KEY_WAV)
+            self.assertEqual(take['url'], f'https://storage.example/{take["key"]}?ttl=604800')        # mp3 link, mp3 file
+            self.assertEqual(take['wav_url'], f'https://storage.example/{take["wav_key"]}?ttl=604800')  # wav link, wav file
+            self.assertEqual(take['key'].rsplit('/', 1)[0], take['wav_key'].rsplit('/', 1)[0])
 
     def test_timing_keys(self):
         out = self.run_job()
@@ -521,6 +554,9 @@ class TestRenderOutput(Harness):
         for link in self.s3.presigned:
             self.assertEqual((link['operation'], link['expires']), ('get_object', 604800))
             self.assertEqual(link['params']['Bucket'], 'sound-bucket')
+        # every uploaded file gets exactly one link, signed for that file's key
+        self.assertEqual(sorted(link['params']['Key'] for link in self.s3.presigned),
+                         sorted(upload['key'] for upload in self.s3.uploads))
 
     def test_temp_files_are_gone_afterwards(self):
         self.run_job()
@@ -540,6 +576,63 @@ class TestRenderOutput(Harness):
     def test_nothing_is_sent_to_save_dir(self):
         self.run_job()
         self.assertIsNone(self.api.calls[0].save_dir)
+
+
+class TestTimingAndMemory(Harness):
+    """The booth prices a song and sizes cheaper cards from these fields, so each one is pinned to a clock the test runs."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = {'now': 1000.0}
+        self.patch(ace.time, 'monotonic', lambda: self.clock['now'])
+
+    def tick(self, seconds):
+        self.clock['now'] += seconds
+
+    def test_model_load_time_covers_the_model_and_the_planner(self):
+        def slow_engine(model):
+            self.tick(20.0)
+            return self.dits.setdefault(model, SimpleNamespace(model=object(), name=model))
+
+        def slow_planner():
+            self.tick(7.0)
+            return self.llm
+        self.engine.side_effect = slow_engine
+        self.planner.side_effect = slow_planner
+        self.assertEqual(self.run_job()['timing']['model_load_s'], 27.0)
+        self.assertEqual(self.run_job(thinking=False)['timing']['model_load_s'], 20.0)    # no planner, no planner time
+
+    def test_encode_and_upload_times_add_up_over_the_takes(self):
+        encode = fake_ffmpeg_factory(self.ffmpeg_log)
+
+        def slow_ffmpeg(*args):
+            self.tick(2.0)
+            encode(*args)
+        self.patch(ace, 'ffmpeg', slow_ffmpeg)
+        upload = self.s3.upload_file
+
+        def slow_upload(*args, **kwargs):
+            self.tick(3.0)
+            return upload(*args, **kwargs)
+        self.s3.upload_file = slow_upload
+        timing = self.run_job(batch_size=3)['timing']
+        self.assertEqual(timing['encode_s'], 12.0)      # 3 takes x 2 ffmpeg runs x 2 s
+        self.assertEqual(timing['upload_s'], 18.0)      # 3 takes x 2 files x 3 s
+
+    def test_the_memory_peak_is_reset_after_loading_and_read_right_after_the_render(self):
+        events = []
+
+        def peak(reset=False):
+            events.append('reset' if reset else 'read')
+            return None if reset else 7.25
+        self.patch(ace, 'gpu_peak', peak)
+        self.engine.side_effect = lambda model: events.append('load') or self.dits.setdefault(
+            model, SimpleNamespace(model=object(), name=model))
+        self.planner.side_effect = lambda: events.append('planner') or self.llm
+        self.api = FakeApi(spend=lambda: events.append('render'))
+        out = self.run_job()
+        self.assertEqual(events, ['load', 'planner', 'reset', 'render', 'read'])
+        self.assertEqual(out['memory'], {'render_peak_gib': 7.25})
 
 
 class TestGenerationRequest(Harness):
@@ -603,6 +696,26 @@ class TestGenerationRequest(Harness):
         self.assertIs(params.dcw_enabled, True)
         self.assertIs(self.last().dit, self.dits['xl-turbo'])
         self.engine.assert_called_with('xl-turbo')
+
+    def test_dcw_strengths_follow_the_planner_as_in_upstreams_think_defaults(self):
+        self.run_job()                                  # turbo with the planner: the Think pair
+        params = self.last().params
+        self.assertEqual((params.dcw_scaler, params.dcw_high_scaler), (0.02, 0.06))
+        self.run_job(thinking=False)                    # no planner: the plain pair
+        params = self.last().params
+        self.assertEqual((params.dcw_scaler, params.dcw_high_scaler), (0.05, 0.02))
+        self.planner_ok = False                         # planner wanted but not available: made without it
+        self.run_job()
+        params = self.last().params
+        self.assertIs(params.thinking, False)
+        self.assertEqual((params.dcw_scaler, params.dcw_high_scaler), (0.05, 0.02))
+
+    def test_dcw_strengths_are_not_sent_when_dcw_is_off(self):
+        self.run_job(model='xl-sft')
+        params = self.last().params
+        self.assertIs(params.dcw_enabled, False)
+        self.assertFalse(hasattr(params, 'dcw_scaler'))
+        self.assertFalse(hasattr(params, 'dcw_high_scaler'))
 
     def test_sft_settings_turn_dcw_off(self):
         out = self.run_job(model='xl-sft')
@@ -802,6 +915,15 @@ class TestFailures(Harness):
         self.assertEqual(silently(ace.handler, {'input': ['x']}), {'error': 'Send the request as named fields.'})
         self.assertEqual(silently(ace.handler, {}), {'error': 'Describe the music in a few words.'})
         self.assertEqual(silently(ace.handler, None), {'error': 'Describe the music in a few words.'})
+
+    def test_a_list_or_dict_model_gets_the_plain_sentence_not_a_vague_failure(self):
+        for value in (['xl-turbo'], {'name': 'xl-turbo'}):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                out = ace.handler({'id': 'j', 'input': valid(model=value)})
+            self.assertEqual(out, {'error': 'Model must be xl-turbo or xl-sft.'}, value)
+            self.assertEqual(buffer.getvalue(), '')       # the caller's mistake, not a worker failure: nothing logged
+        self.engine.assert_not_called()
 
 
 class TestAdapterSeam(Harness):
@@ -1155,7 +1277,63 @@ class TestResolveModels(CacheCase):
         fetch.assert_called_once_with('ACE-Step/Ace-Step1.5', None, ace.DOWNLOAD_SKIP['main'])
 
 
+def hub_modules(snapshot_download, constants, bound=False):
+    """A stand-in huggingface_hub for sys.modules, shaped like the real package on a cold boot: it builds itself
+    lazily, so `huggingface_hub.constants` is NOT an attribute until some code has imported that submodule
+    (bound=False). The submodule is registered under its own name, which is all an explicit import needs."""
+    fake = ModuleType('huggingface_hub')        # a real module object: `import a.b as c` reads its __name__
+    fake.snapshot_download = snapshot_download
+    if bound:
+        fake.constants = constants
+    return {'huggingface_hub': fake, 'huggingface_hub.constants': constants}
+
+
+HUB = importlib.util.find_spec('huggingface_hub')
+
+REAL_HUB_SCRIPT = r"""
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+os.environ['HF_HUB_OFFLINE'] = '1'
+import ace_handler as ace
+import huggingface_hub
+seen = {}
+
+def fake_download(repo, revision=None, cache_dir=None, ignore_patterns=None):
+    # the real library is loaded, only the network call is replaced
+    seen.update(env=os.environ['HF_HUB_OFFLINE'], flag=huggingface_hub.constants.HF_HUB_OFFLINE, repo=repo)
+    return '/tmp/hub/snapshots/abc'
+
+huggingface_hub.snapshot_download = fake_download
+folder = ace.fetch_model('x/y', 'abc')
+print(json.dumps({'folder': str(folder), 'seen': seen, 'env_after': os.environ['HF_HUB_OFFLINE'],
+                  'flag_after': huggingface_hub.constants.HF_HUB_OFFLINE}))
+"""
+
+
 class TestFetchModel(unittest.TestCase):
+    @unittest.skipIf(HUB is None, 'huggingface_hub is not installed on this machine (the image build has it)')
+    def test_against_the_real_library_in_a_fresh_process(self):
+        # The cold-boot order: nothing has imported huggingface_hub.constants before fetch_model runs. A stand-in
+        # module cannot show that the real package binds the submodule only after somebody imports it.
+        out = subprocess.run([sys.executable, '-I', '-B', '-c', REAL_HUB_SCRIPT, str(Path(__file__).resolve().parent)],
+                             capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        lines = out.stdout.strip().splitlines()
+        self.assertTrue(lines and lines[-1].startswith('{'), out.stdout)     # a swallowed failure prints a line instead
+        result = json.loads(lines[-1])
+        self.assertEqual(Path(result['folder']), Path('/tmp/hub/snapshots/abc'), out.stdout)
+        self.assertEqual(result['seen'], {'env': '0', 'flag': False, 'repo': 'x/y'})
+        self.assertEqual(result['env_after'], '1')
+        self.assertIs(result['flag_after'], True)
+
+    def test_works_whether_or_not_the_package_has_bound_its_constants_yet(self):
+        for bound in (False, True):
+            constants = SimpleNamespace(HF_HUB_OFFLINE=True)
+            with mock.patch.dict(sys.modules, hub_modules(lambda *a, **k: '/tmp/x', constants, bound=bound)), \
+                    mock.patch.dict(os.environ, {'HF_HUB_OFFLINE': '1'}):
+                self.assertEqual(ace.fetch_model('x/y', None), Path('/tmp/x'), bound)
+            self.assertIs(constants.HF_HUB_OFFLINE, True, bound)
+
     def test_offline_mode_is_restored_after_a_download(self):
         seen = {}
         constants = SimpleNamespace(HF_HUB_OFFLINE=True)
@@ -1164,8 +1342,8 @@ class TestFetchModel(unittest.TestCase):
             seen.update(repo=repo, revision=revision, cache_dir=cache_dir, ignore=ignore_patterns,
                         env=os.environ['HF_HUB_OFFLINE'], flag=constants.HF_HUB_OFFLINE)
             return '/tmp/hf-hub/models--x--y/snapshots/abc'
-        fake = SimpleNamespace(constants=constants, snapshot_download=snapshot_download)
-        with mock.patch.dict(sys.modules, {'huggingface_hub': fake}), mock.patch.dict(os.environ, {'HF_HUB_OFFLINE': '1'}):
+        with mock.patch.dict(sys.modules, hub_modules(snapshot_download, constants)), \
+                mock.patch.dict(os.environ, {'HF_HUB_OFFLINE': '1'}):
             folder = ace.fetch_model('x/y', 'abc', ('*.py',))
             self.assertEqual(os.environ['HF_HUB_OFFLINE'], '1')
         self.assertEqual(folder, Path('/tmp/hf-hub/models--x--y/snapshots/abc'))
@@ -1178,9 +1356,9 @@ class TestFetchModel(unittest.TestCase):
         # temporary '0', so the constant it holds afterwards must be rebuilt from the restored value.
         for restored, expected in (('1', True), ('0', False), (None, True)):
             constants = SimpleNamespace(HF_HUB_OFFLINE=False)
-            fake = SimpleNamespace(constants=constants, snapshot_download=lambda *a, **k: '/tmp/x')
             env = {} if restored is None else {'HF_HUB_OFFLINE': restored}
-            with mock.patch.dict(sys.modules, {'huggingface_hub': fake}), mock.patch.dict(os.environ, env):
+            with mock.patch.dict(sys.modules, hub_modules(lambda *a, **k: '/tmp/x', constants)), \
+                    mock.patch.dict(os.environ, env):
                 if restored is None:
                     os.environ.pop('HF_HUB_OFFLINE', None)
                 ace.fetch_model('x/y', None)
@@ -1192,10 +1370,9 @@ class TestFetchModel(unittest.TestCase):
 
         def snapshot_download(*args, **kwargs):
             raise ConnectionError('no route')
-        fake = SimpleNamespace(constants=constants, snapshot_download=snapshot_download)
         buffer = io.StringIO()
-        with mock.patch.dict(sys.modules, {'huggingface_hub': fake}), mock.patch.dict(os.environ, {'HF_HUB_OFFLINE': '1'}), \
-                contextlib.redirect_stdout(buffer):
+        with mock.patch.dict(sys.modules, hub_modules(snapshot_download, constants)), \
+                mock.patch.dict(os.environ, {'HF_HUB_OFFLINE': '1'}), contextlib.redirect_stdout(buffer):
             self.assertIsNone(ace.fetch_model('x/y', None))
             self.assertEqual(os.environ['HF_HUB_OFFLINE'], '1')
         self.assertIs(constants.HF_HUB_OFFLINE, True)
@@ -1410,6 +1587,7 @@ class TestEnsureCheckpoints(CacheCase):
 class FakeDitHandler:
     created = []
     works = True       # set False to make the next handlers fail to initialise
+    failure = 'Error initializing model: boom\n\nTraceback:\n...'
 
     def __init__(self):
         self.model = object()
@@ -1423,11 +1601,12 @@ class FakeDitHandler:
         self.init_calls.append(kwargs)
         if self.ok:
             return '[OK] Model initialized successfully on cuda\nDtype: torch.bfloat16\nAttention: sdpa\n', True
-        return 'Error initializing model: boom\n\nTraceback:\n...', False
+        return self.failure, False
 
 
 class FakeLlm:
     created = []
+    failure = 'Error initializing 5Hz LM: boom'
 
     def __init__(self, ok=True):
         self.llm_initialized = False
@@ -1441,7 +1620,7 @@ class FakeLlm:
         if self.ok:
             self.llm_initialized, self.llm_backend = True, 'pt'
             return 'ok\nBackend: PyTorch', True
-        return 'Error initializing 5Hz LM: boom', False
+        return self.failure, False
 
 
 class TestEngine(unittest.TestCase):
@@ -1554,6 +1733,31 @@ class TestEngine(unittest.TestCase):
         self.assertNotIn('Traceback', buffer.getvalue())
         self.assertIsNone(FakeDitHandler.created[-1].model)       # the half-built handler was released
 
+    def test_a_load_failure_line_keeps_the_reason_but_not_links_or_tokens(self):
+        self.addCleanup(setattr, FakeDitHandler, 'failure', FakeDitHandler.failure)
+        FakeDitHandler.works = False
+        FakeDitHandler.failure = ('Error initializing model: 401 Client Error for url: '
+                                  'https://huggingface.co/ACE-Step/x/resolve/main/config.json '
+                                  'with token hf_AbCdEfGh1234567890 (HTTP://CDN.EXAMPLE/a?b=c)\nTraceback: more')
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), self.assertRaises(ace.WorkerError):
+            ace.engine('xl-turbo')
+        line = buffer.getvalue()
+        self.assertIn('xl-turbo load failed: Error initializing model: 401 Client Error for url: [link]', line)
+        self.assertNotIn('huggingface.co', line)
+        self.assertNotIn('hf_AbCd', line)
+        self.assertNotIn('CDN.EXAMPLE', line)
+        self.assertNotIn('Traceback', line)
+
+    def test_a_card_is_checked_before_any_model_work(self):
+        def no_card():
+            raise ace.WorkerError('No graphics card is available on this worker. Try again in a moment.')
+        with mock.patch.object(ace, 'require_gpu', no_card), self.assertRaises(ace.WorkerError) as caught:
+            silently(ace.engine, 'xl-turbo')
+        self.assertIn('No graphics card', str(caught.exception))
+        self.assertEqual(self.events, [])           # nothing was resolved, built or loaded
+        self.assertEqual(ace.STATE['dit'], {})
+
     def test_slow_attention_is_logged(self):
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
@@ -1609,8 +1813,17 @@ class TestPlannerLoad(unittest.TestCase):
             self.assertIsNone(ace.planner())
             self.assertIsNone(ace.planner())
         self.assertEqual(len(FakeLlm.created), 2)
-        self.assertIn('planner load failed', buffer.getvalue())
+        self.assertIn('planner load failed: Error initializing 5Hz LM: boom', buffer.getvalue())
         self.assertNotIn('Traceback', buffer.getvalue())
+
+    def test_the_planner_load_failure_line_drops_links_and_tokens(self):
+        self.addCleanup(setattr, FakeLlm, 'failure', FakeLlm.failure)
+        FakeLlm.failure = 'Error initializing 5Hz LM: cannot reach https://huggingface.co/x with hf_ZyXwVuTs9876543210'
+        self.ok = False
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertIsNone(ace.planner())
+        self.assertIn('planner load failed: Error initializing 5Hz LM: cannot reach [link] with [token]', buffer.getvalue())
 
     def test_an_exception_while_loading_gives_none(self):
         def broken():
@@ -1743,7 +1956,9 @@ class TestUpstreamImports(unittest.TestCase):
             self.assertEqual(os.environ['ACESTEP_GENERATION_TIMEOUT'], '3600')
             self.assertEqual(os.environ['ACESTEP_CHECKPOINTS_DIR'], str(ace.checkpoints_dir()))
         self.assertEqual(removed, [()])
-        self.assertEqual(added[0][1], {'level': 'WARNING'})
+        # backtrace/diagnose off: loguru's defaults print variable values (the caption and lyrics) in tracebacks
+        self.assertEqual(added[0][1], {'level': 'WARNING', 'backtrace': False, 'diagnose': False})
+        self.assertEqual(len(added), 1)
 
     def test_existing_settings_are_not_overridden(self):
         reset_state()
@@ -1762,6 +1977,59 @@ class TestUpstreamImports(unittest.TestCase):
         out = subprocess.run([sys.executable, '-I', '-B', '-c', code], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(out.stdout.strip(), '[]')
+
+
+LOGURU = importlib.util.find_spec('loguru')
+
+# Mirrors upstream's failure path: inference.py catches the error of a render and calls logger.exception(...), and the
+# frame that failed holds the caption and lyrics. argv[2] picks the sink: the worker's own, or loguru's plain defaults.
+LOG_SCRIPT = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+import ace_handler as ace
+from loguru import logger
+if sys.argv[2] == 'worker':
+    ace.quiet_logs()
+else:
+    logger.remove()
+    logger.add(sys.stderr, level='WARNING')
+
+def generate(captions, lyrics):
+    try:
+        return len(captions) / len(lyrics[:0])
+    except Exception:
+        logger.exception('Music generation failed')
+
+logger.info('INFO-LINE-SENTINEL')
+generate(sys.argv[3], sys.argv[4])
+"""
+
+
+@unittest.skipIf(LOGURU is None, 'loguru is not installed on this machine (the image build has it)')
+class TestQuietLogsWithRealLoguru(unittest.TestCase):
+    def logged(self, sink):
+        # a real script file, not -c: loguru reads the source line of each frame to print the variables on it
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / 'fail_a_render.py'
+            script.write_text(LOG_SCRIPT, encoding='utf-8')
+            out = subprocess.run([sys.executable, '-I', '-B', str(script), str(Path(__file__).resolve().parent),
+                                  sink, SECRET_CAPTION, SECRET_LYRICS], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout + out.stderr
+
+    def test_a_failed_render_does_not_put_the_callers_words_in_the_log(self):
+        text = self.logged('worker')
+        self.assertIn('Music generation failed', text)       # the failure is still reported
+        self.assertIn('ZeroDivisionError', text)
+        self.assertNotIn('INFO-LINE-SENTINEL', text)          # and INFO lines stay out
+        self.assertNotIn('ZEBRA', text)
+        self.assertNotIn('KANGAROO', text)
+
+    def test_the_check_can_see_a_leak_with_loguru_defaults(self):
+        # control: with a plain WARNING sink the same traceback prints the variables, so the test above is meaningful
+        text = self.logged('default')
+        self.assertIn('ZEBRA', text)
+        self.assertIn('KANGAROO', text)
 
 
 class TestMisc(unittest.TestCase):
@@ -1997,6 +2265,30 @@ class TestPinnedUpstream(unittest.TestCase):
         self.assertEqual((literal(tree, 'DURATION_MIN'), literal(tree, 'DURATION_MAX')),
                          (ace.DURATION_MIN, ace.DURATION_MAX))
         self.assertEqual(sorted(int(v) for v in set(ace.TIME_SIGNATURES.values())), literal(tree, 'VALID_TIME_SIGNATURES'))
+
+    def test_dcw_strengths_are_upstreams_think_aware_defaults(self):
+        tree = parse('acestep/ui/gradio/events/dcw_defaults.py')
+        think, plain = literal(tree, 'THINK_DCW_DEFAULTS'), literal(tree, 'NON_THINK_DCW_DEFAULTS')
+        self.assertEqual(ace.DCW_STRENGTHS[True], (think['scaler'], think['high_scaler']))
+        self.assertEqual(ace.DCW_STRENGTHS[False], (plain['scaler'], plain['high_scaler']))
+        self.assertEqual((think['mode'], plain['mode']), ('double', 'double'))     # the dataclass default mode, not sent
+        fields = {}
+        for node in class_node(parse('acestep/inference.py'), 'GenerationParams').body:
+            if isinstance(node, ast.AnnAssign) and node.value is not None:
+                fields[node.target.id] = node.value
+        self.assertEqual(ast.literal_eval(fields['dcw_mode']), 'double')
+        # GenerationParams carries only the non-Think pair; that is why the planner case is passed explicitly
+        self.assertEqual((ast.literal_eval(fields['dcw_scaler']), ast.literal_eval(fields['dcw_high_scaler'])),
+                         ace.DCW_STRENGTHS[False])
+
+    def test_no_upstream_module_replaces_the_log_sink_the_worker_installs(self):
+        # quiet_logs() runs before upstream is imported. A module that called logger.add/remove/configure while it
+        # loads would undo it (only the command-line tool cli.py does that, and the worker never imports it).
+        offenders = []
+        for path in (UPSTREAM / 'acestep').rglob('*.py'):
+            if re.search(r'\blogger\.(add|remove|configure)\(', path.read_text(encoding='utf-8', errors='replace')):
+                offenders.append(str(path.relative_to(UPSTREAM)))
+        self.assertEqual(offenders, [])
 
     def test_the_upstream_code_dirs_have_the_files_the_build_expects(self):
         turbo = {p.name for p in (UPSTREAM / 'acestep' / 'models' / 'xl_turbo').glob('*.py')}

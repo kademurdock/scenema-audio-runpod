@@ -69,6 +69,11 @@ MAIN_FILES = ('vae/config.json', 'vae/diffusion_pytorch_model.safetensors',
 LINK_SUFFIXES = ('.json', '.safetensors', '.pt', '.txt')
 BOTH_MODELS_GIB = 40   # a card with less memory holds one DiT at a time
 
+# DCW strengths (low band, high band) by whether the planner is used. Upstream's own Think-aware defaults:
+# acestep/ui/gradio/events/dcw_defaults.py THINK_DCW_DEFAULTS and NON_THINK_DCW_DEFAULTS (docs/en/DCW.md "Think").
+# GenerationParams itself only carries the non-Think pair, so the planner case has to be passed explicitly.
+DCW_STRENGTHS = {True: (0.02, 0.06), False: (0.05, 0.02)}
+
 FEATURES = ('ace-xl-turbo', 'ace-xl-sft', 'batch', 'instrumental', 'probe')
 VALID_LANGUAGES = frozenset((
     'ar az bg bn ca cs da de el en es fa fi fr he hi hr ht hu id is it ja ko la lt ms ne nl no pa pl pt ro ru sa sk '
@@ -167,7 +172,10 @@ def fetch_model(repo, revision, ignore=()):
     try:
         os.environ['HF_HUB_OFFLINE'] = '0'
         import huggingface_hub
-        constants = huggingface_hub.constants
+        # An explicit submodule import. huggingface_hub builds its package lazily, so `huggingface_hub.constants` is
+        # not an attribute until some code has imported that submodule, and on a cold boot (this call comes before
+        # upstream is imported) nothing has. Reading the attribute would raise AttributeError.
+        import huggingface_hub.constants as constants
         constants.HF_HUB_OFFLINE = False
         return Path(huggingface_hub.snapshot_download(repo, revision=revision, cache_dir=DOWNLOAD_CACHE,
                                                       ignore_patterns=list(ignore) or None))
@@ -377,11 +385,15 @@ def configure_environment():
 
 
 def quiet_logs():
-    """loguru prints captions and lyrics to its default sink at INFO; RunPod keeps worker logs. Keep warnings only."""
+    """loguru prints captions and lyrics to its default sink at INFO; RunPod keeps worker logs. Keep warnings only.
+
+    backtrace and diagnose are off on purpose. With loguru's defaults (both on), every logger.exception() that
+    upstream calls around a render (inference.py "Music generation failed" and others) prints the VALUES of the
+    variables on each traceback line, and those frames hold the whole caption and lyrics."""
     try:
         from loguru import logger
         logger.remove()
-        logger.add(sys.stderr, level='WARNING')
+        logger.add(sys.stderr, level='WARNING', backtrace=False, diagnose=False)
     except Exception:
         pass
 
@@ -439,7 +451,7 @@ def load_dit(model):
         use_flash_attention=False, compile_model=False, offload_to_cpu=False, offload_dit_to_cpu=False,
         quantization=None, prefer_source=None, use_mlx_dit=False)
     if not ok:
-        print(f'ACE-Step {model} load failed:', str(status).splitlines()[0][:300] if status else '', flush=True)
+        print(f'ACE-Step {model} load failed:', scrub(status, limit=300), flush=True)
         release_dit(handler)
         raise WorkerError(f'The {spec["label"]} music model could not be loaded.')
     log_status(model, status)
@@ -496,7 +508,7 @@ def planner():
         status, ok = llm.initialize(checkpoint_dir=str(STATE['ckpt']), lm_model_path=LM_FOLDER, backend=lm_backend(),
                                     device='cuda', offload_to_cpu=False)
         if not ok:
-            print('ACE-Step planner load failed:', str(status).splitlines()[0][:300] if status else '', flush=True)
+            print('ACE-Step planner load failed:', scrub(status, limit=300), flush=True)
             return None
         STATE['llm'] = llm
         print(f'ACE-Step planner loaded in {time.monotonic() - began:.1f}s, backend {getattr(llm, "llm_backend", None)}',
@@ -584,7 +596,7 @@ def request_input(raw):
         raise RequestError('Mode must be render or probe.')
     model = raw.get('model')
     model = 'xl-turbo' if model is None else model
-    if model not in DIT_MODELS:
+    if not isinstance(model, str) or model not in DIT_MODELS:   # a list or dict is unhashable: no dict lookup first
         raise RequestError('Model must be xl-turbo or xl-sft.')
     spec = DIT_MODELS[model]
     notes = []
@@ -727,12 +739,16 @@ def settings_for(request):
 def build_generation(api, request, settings, seeds, thinking):
     """GenerationParams and GenerationConfig for one request (field names checked against the pinned source)."""
     rewrite = thinking and os.environ.get('ACE_PLANNER_REWRITES_CAPTION') == '1'
+    strengths = {}
+    if settings['dcw_enabled']:
+        scaler, high_scaler = DCW_STRENGTHS[bool(thinking)]
+        strengths = dict(dcw_scaler=scaler, dcw_high_scaler=high_scaler)
     params = api.GenerationParams(
         task_type='text2music', caption=request['caption'], lyrics=request['lyrics'],
         instrumental=request['instrumental'], vocal_language=request['vocal_language'], bpm=request['bpm'],
         keyscale=request['keyscale'], timesignature=request['timesignature'], duration=request['duration'],
         inference_steps=settings['steps'], guidance_scale=settings['guidance_scale'], shift=settings['shift'],
-        dcw_enabled=settings['dcw_enabled'], seed=seeds[0],
+        dcw_enabled=settings['dcw_enabled'], seed=seeds[0], **strengths,
         # thinking False must skip the planner altogether: upstream still runs it for any use_cot_* flag left on.
         # The caller's wording and language are kept (use_cot_caption / use_cot_language off); the planner fills
         # tempo, key and time signature, and writes the 5 Hz audio codes the DiT follows.
@@ -786,14 +802,20 @@ def make_progress(job, send=None):
     return progress
 
 
-def scrub(text, *private):
-    """First line of an upstream message, with the caption and lyrics removed, for the worker log."""
+LINK = re.compile(r"""https?://[^\s'"<>()\[\]]*[^\s'"<>()\[\].,;:!?]""", re.IGNORECASE)
+HUB_TOKEN = re.compile(r'\bhf_[A-Za-z0-9]{8,}')
+
+
+def scrub(text, *private, limit=200):
+    """First line of an upstream message for the worker log, with the caption and lyrics, web links and Hugging Face
+    tokens removed (the contract allows the exception type; this keeps upstream's one-line reason as well)."""
     lines = str(text or '').strip().splitlines()
     line = lines[0] if lines else ''
     for secret in private:
         if secret and len(secret) >= 6:
             line = line.replace(secret, '[hidden]')
-    return line[:200]
+    line = HUB_TOKEN.sub('[token]', LINK.sub('[link]', line))
+    return line[:limit]
 
 
 def plain_failure(error):
