@@ -1,0 +1,522 @@
+# ACE-Step 1.5 XL worker: stage 1 recon notes (Oct 10 2026)
+
+Branch `ace-xl`. Written for stage 2 (the `ace_handler.py` author) and for reviewers.
+Every upstream claim cites `path:line` in the pinned checkout `F:/KadeAI-work/ace/upstream`
+(commit `ca1e85fe9430179831e6bc6be790c332190a3866`, a shallow clone with one commit; line numbers are for that commit).
+Nothing here was run on a GPU. Where a statement is an estimate or inference it says so.
+
+How facts were obtained:
+- READ = read in the pinned upstream source or the worker repo (primary source).
+- HF-LISTING = public Hugging Face file listing and `config.json` files fetched read-only on Oct 10 2026
+  (`huggingface.co/api/models/<repo>/tree/main...`). The fetch tool summarised the pages with a small model, so
+  names and sizes are reliable but a copied 40-character sha could hold a typo: re-check before pinning (see 3.5).
+- INFERENCE = reasoned from code or docs, not observed.
+
+Contents: 1 Python API (a) | 2 dependencies and install recipe (b) | 3 cache layout vs upstream layout and the three
+HF repos (c) | 4 things that will bite (d) | 5 yue_handler.py conventions to reuse (e) | 6 suggested shape of stage 2.
+
+---------------------------------------------------------------------------------------------------------------------
+
+## 1. The Python inference API (a)
+
+### 1.1 Entry points and call chain
+
+Official in-process usage (docs/en/INFERENCE.md:26-73, run_generate_test.py:31-110, profile_inference.py:874-898):
+
+```
+dit  = acestep.handler.AceStepHandler()                       # handler.py:62
+llm  = acestep.llm_inference.LLMHandler()                     # llm_inference.py:48
+status, ok = dit.initialize_service(project_root=..., config_path="acestep-v15-xl-turbo", device="cuda", ...)
+status, ok = llm.initialize(checkpoint_dir=..., lm_model_path="acestep-5Hz-lm-1.7B", backend="pt", device="cuda", ...)
+result = acestep.inference.generate_music(dit, llm, params, config, save_dir=None)   # inference.py:514
+```
+
+- Both `initialize_service` (init_service_orchestrator.py:48-220) and `LLMHandler.initialize` (llm_inference.py:499-777)
+  return `(status_string, ok_bool)` and never raise (they catch everything). Stage 2 must check `ok`.
+- `generate_music` (inference.py:514-1115) also never raises: it returns `GenerationResult(success=False, error=str(e))`
+  (inference.py:1107-1115). `error` can be a long string; map it to one plain sentence, log only the exception type.
+- Everything is synchronous and not thread-safe (single handler instances); RunPod runs one job at a time per worker, fine.
+
+### 1.2 DiT config selection, checkpoint names and layout
+
+How a DiT "config" is selected: there is no config object. The DiT is chosen by the NAME of a folder under the checkpoints dir,
+passed as `config_path` ("acestep-v15-xl-turbo" or "acestep-v15-xl-sft"). Three things hang off that name:
+
+1. `model_path = os.path.join(checkpoint_dir, config_path)` and the weights are loaded from there with
+   `AutoModel.from_pretrained(path, trust_remote_code=True, attn_implementation=..., dtype=self.dtype)`
+   (init_service_orchestrator.py:155-162; init_service_loader.py:175-180). The model class comes from the repo's own
+   `config.json` `auto_map` (HF-LISTING: turbo -> `modeling_acestep_v15_xl_turbo.AceStepConditionGenerationModel`,
+   sft -> `modeling_acestep_v15_xl_base.AceStepConditionGenerationModel`; AutoConfig -> `configuration_acestep_v15.AceStepConfig`).
+2. Behaviour switches come from the repo's `config.json`, not from the name: `is_turbo` (HF-LISTING: xl-turbo `true`; xl-sft `false`,
+   `model_version` "turbo" vs "base"). `is_turbo_model()` = `getattr(config, "is_turbo", False)` (init_service_catalog.py:75-79).
+   It decides: guidance forced to 1.0 (handler generate_music.py:312-318), steps clamped to max 8 (service_generate_request.py:52-57),
+   and the DCW default (generate_music.py:181-193 and service_generate_execute.py:64-70).
+3. The NAME is used for (a) the code-sync map `_CHECKPOINT_TO_VARIANT` (model_downloader.py:25-43: `acestep-v15-xl-turbo`->`xl_turbo`,
+   `acestep-v15-xl-sft`->`xl_sft`) and (b) VRAM heuristics `get_dit_type_from_path` (gpu_config.py:193-217; token match, so an
+   absolute path still works for this one).
+
+CODE SYNC (important): before loading, `_sync_model_code_if_needed` (init_service_downloads.py:64-76) hashes every `*.py` in
+`acestep/models/<variant>/` (xl_turbo: `configuration_acestep_v15.py`, `modeling_acestep_v15_xl_turbo.py`; xl_sft: those plus
+`apg_guidance.py`, file `modeling_acestep_v15_xl_base.py`) against the same names inside the checkpoint folder and, on any
+difference, OVERWRITES the checkpoint folder's copies with `shutil.copy2` (model_downloader.py:60-133). The pinned commit's
+`modeling_acestep_v15_xl_turbo.py` is 109,260 bytes, the HF repo's is 103,821 bytes (HF-LISTING), so they differ and the sync
+WILL fire on an unprepared snapshot. On a RunPod cache snapshot those files are symlinks into `blobs/`; `copy2` onto a symlink
+writes through to the shared blob (or fails if read-only). So never point `config_path` at a snapshot folder directly. The
+pinned upstream code expects its own modeling files: the pinned `service_generate_execute.py:103-141` passes `dcw_*`, `repaint_*`,
+`retake_*` kwargs that the older HF copy may not accept (INFERENCE). See 3.3 for the layout recipe that avoids all of this.
+
+`config_path` could be an absolute path (os.path.join and Path / both discard the left part for an absolute right operand:
+init_service_orchestrator.py:155, model_downloader.py:424), but then `_CHECKPOINT_TO_VARIANT.get()` finds nothing, no code sync
+happens, and the HF modeling copy is used. Not recommended.
+
+DiT dtype/device handling (init_service_orchestrator.py:85-101): CUDA with compute capability major >= 8 -> `torch.bfloat16`,
+older CUDA -> float16 (ROCm -> float32 unless `ACESTEP_ROCM_DTYPE`); `gpu_config.cuda_supports_bfloat16` is gpu_config.py:111-121.
+A40/A6000 (sm_86), L40/6000 Ada (sm_89) and 5090 (sm_120) all get bf16. Attention: `initialize_service(use_flash_attention=False)`
+is the default -> `sdpa` (init_service_loader.py:144-162), falling back to `eager` if sdpa fails to load
+(init_service_loader.py:164-185; check the status string "Attention: sdpa", an `eager` fallback would be slow and memory hungry).
+`flash_attn` is not installed in the recommended image (2.3), so `use_flash_attention=True` would just warn and use SDPA.
+The model is moved with `.to(device).to(dtype)` (init_service_loader.py:197-204); `offload_to_cpu=False` keeps everything on the GPU.
+`compile_model=False` is the default (orchestrator line 54); leave it off (Triton compile adds minutes and sm_120 risk, INFERENCE).
+`quantization=None` is the default; leave it (contract: no INT8). Weights stay fp32 on disk and are cast to bf16 on load (see 4).
+
+Signature (init_service_orchestrator.py:48-61):
+`initialize_service(project_root: str, config_path: str, device: str="auto", use_flash_attention: bool=False, compile_model: bool=False,
+offload_to_cpu: bool=False, offload_dit_to_cpu: bool=False, quantization: Optional[str]=None, prefer_source: Optional[str]=None,
+use_mlx_dit: bool=True, vae_checkpoint: Optional[str]=None) -> Tuple[str, bool]`.
+
+Checkpoints directory resolution (orchestrator lines 118-129; model_downloader.py:344-359): env `ACESTEP_CHECKPOINTS_DIR` if set
+(then `.expanduser().resolve()`), else `<project_root>/checkpoints`. `project_root` defaults to `ACESTEP_PROJECT_ROOT` or cwd
+(progress.py:20-33); the handler also writes `.cache/acestep/progress_estimates.json` under it (handler.py:143-149, errors
+swallowed in progress.py:47-54). Point both at a writable folder under /tmp.
+
+What `initialize_service` demands to exist (all by NAME, all under the checkpoints dir):
+- `check_main_model_exists` (model_downloader.py:386-402) requires ALL FOUR main components to hold weights:
+  `acestep-v15-turbo` (the 2B DiT, never used by us), `vae`, `Qwen3-Embedding-0.6B`, `acestep-5Hz-lm-1.7B`
+  (MAIN_MODEL_COMPONENTS, model_downloader.py:307-312). "Holds weights" = one of `model.safetensors`,
+  `model.safetensors.index.json`, `pytorch_model.bin`, ..., `diffusion_pytorch_model.safetensors` exists (model_downloader.py:362-383).
+  If any is missing it calls the downloader (init_service_downloads.py:31-36), which first opens a socket to www.google.com
+  to choose HF vs ModelScope (model_downloader.py:140-159, 247) and then tries to download ~10 GB. Under `HF_HUB_OFFLINE=1`
+  that fails and `initialize_service` returns `(error, False)`. So the dir must be complete BEFORE the call.
+- `check_model_exists(config_path)` (init_service_downloads.py:43) for the XL folder; if missing it downloads from
+  `SUBMODEL_REGISTRY` (model_downloader.py:290-304: `acestep-v15-xl-turbo` -> `ACE-Step/acestep-v15-xl-turbo`,
+  `acestep-v15-xl-sft` -> `ACE-Step/acestep-v15-xl-sft`) into `<ckpt>/<name>/`.
+- VAE at `<ckpt>/vae` (`resolve_vae_path`, model_downloader.py:710-738; default variant "official"; `vae_checkpoint` may also be an
+  ABSOLUTE path, init_service_loader_components.py:19-66). Loaded with diffusers `AutoencoderOobleck.from_pretrained`
+  (loader_components:53), dtype bf16 on Ampere+ (memory_utils.py:199-216).
+- Text encoder at `<ckpt>/Qwen3-Embedding-0.6B` (loader_components:90), `AutoTokenizer` + `AutoModel.from_pretrained`, cast to the DiT dtype.
+- `<ckpt>/<config_path>/silence_latent.pt` (init_service_loader.py:211-216).
+Every `from_pretrained` on the generation path takes a LOCAL directory (audit: init_service_loader.py:175,
+loader_components:53/94/95, llm_inference.py:404/612). The only hub calls are in `model_downloader.py:178/204`.
+=> With a prepared checkpoints dir the whole path runs under `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`; nothing resolves a hub id.
+(`trust_remote_code=True` on a local folder copies the .py files into `HF_MODULES_CACHE`, default `~/.cache/huggingface/modules`;
+that dir must be writable and `acestep` must be importable because the modeling file does
+`from acestep.models.common.dcw_correction import DCWCorrector`, modeling_acestep_v15_xl_turbo.py:53.)
+
+Each `AceStepHandler` also loads its own VAE and text encoder (init_service_orchestrator.py:163-172), so two DiT handlers
+duplicate ~1.5 GB. Upstream's own way to switch DiTs is to call `initialize_service(config_path=<other>)` again on the SAME handler
+(api/job_model_selection.py:73-107 `_swap_primary_model`): `_load_main_model_from_checkpoint` first `del self.model` and
+`torch.cuda.empty_cache()` (init_service_loader.py:130-135). There is no separate unload method for the DiT handler (grep:
+only `LLMHandler.unload` exists, llm_inference.py:125). A manual release that mirrors upstream's failure path is
+`h.model = h.vae = h.text_encoder = h.text_tokenizer = h.config = h.silence_latent = None; gc.collect(); torch.cuda.empty_cache()`
+(orchestrator lines 211-218).
+
+### 1.3 The 1.7B planner LM: loading and backends
+
+`LLMHandler.initialize(checkpoint_dir: str, lm_model_path: str, backend: str="vllm", device: str="auto", offload_to_cpu: bool=False,
+dtype: Optional[torch.dtype]=None) -> Tuple[str, bool]` (llm_inference.py:499-507).
+- `full_lm_model_path = os.path.join(checkpoint_dir, lm_model_path)` (line 590): `lm_model_path` may be a relative folder name
+  ("acestep-5Hz-lm-1.7B") or an absolute path (os.path.join). It must exist or you get `(msg, False)` (line 591-592).
+  The LM size is read from the NAME ("1.7B" substring) for memory heuristics (gpu_config.py:894-912), so keep "1.7B" in the folder name.
+- dtype default: bf16 on cuda/xpu, float32 otherwise (lines 566-577). Device "cuda" or "auto".
+- Backends: `"vllm"` (nano-vllm), `"pt"` (HF transformers, custom decode loop), `"mlx"` (Apple only). Resolution:
+  `backend == "pt"` goes straight to `_load_pytorch_model` (lines 767-772; 401-416: `AutoModelForCausalLM.from_pretrained(path,
+  trust_remote_code=True)` then `.to(device).to(dtype)`). `backend == "vllm"` silently falls back to pt if CUDA is absent, if
+  free VRAM < 2 GB (VRAM_SAFE_FREE_GB, line 33/735) or if nano-vllm fails to import/init (lines 721-766). The status string says which
+  backend actually ran: log it (`llm.llm_backend` is "pt" or "vllm" after init).
+- The global GPU config picks the recommended backend per VRAM tier (gpu_config.py:316-470; >= 24 GB = tier "unlimited", recommended LM
+  4B, backend vllm, max duration with LM 600 s, max batch 8, no offload, no quantization). `resolve_lm_backend` (gpu_config.py:285-309).
+  Cards of the target class: A40/A6000 48 GB, L40/L40S/6000 Ada, 5090 32 GB are all "unlimited". The global config is built lazily
+  from the detected VRAM (gpu_config.py:1569-1582), initialising CUDA the first time anything asks (so also at `AceStepHandler()`
+  construction: handler.py:175).
+- vLLM path details (INFERENCE where unverified): nano-vllm is pure Python (setuptools), allocates a KV cache pool up front sized
+  from FREE VRAM (`get_lm_gpu_memory_ratio`, gpu_config.py:976-1075) and uses `enforce_eager=True` when `flash_attn` or `triton` is missing
+  (llm_inference.py:652-675), with a Python-loop SDPA decode fallback (nano-vllm attention.py:233-285, 327-330).
+  See 2.3 for why the recommendation is `pt`.
+- pt path details: single item = custom decode loop with HF KV cache; with `lm_cfg_scale > 1` (default 2.0) it runs cond+uncond as a
+  batch of 2 (llm_inference.py:1042-1087, 2618-2790). Constrained decoding (FSM for the metadata block, audio-code-only vocabulary) runs in
+  Python each step. Codes are generated at 5 per second of audio (llm_inference.py:278-282): 180 s = 900 codes, 360 s = 1800 codes.
+  ESTIMATE (not measured): ~25-40 decoded tokens/s on an A40, so planner time is roughly 40-70 s for a 3-minute song and 70-110 s for 6 minutes,
+  on top of ~7 s for the metadata (CoT) phase. That is longer than the xl-turbo render itself (~25 s for 2:30 on a 5090 per the research file).
+  Report it separately as `timing.plan_s`. `thinking=False` removes it entirely.
+- `max_model_len` is 4096 on the handler (line 62) and caps `max_new_tokens` at 4032 (lines 299-301): plenty for 600 s (3000 codes).
+
+### 1.4 Generation entry point: names, types, defaults
+
+`acestep.inference.generate_music(dit_handler, llm_handler, params: GenerationParams, config: GenerationConfig, save_dir: Optional[str]=None,
+progress=None) -> GenerationResult` (inference.py:514-521). Decorator `_get_spaces_gpu_decorator` is a no-op outside HF Spaces.
+
+`GenerationParams` (inference.py:55-233, dataclass). Fields the worker sets (worker field -> param, type, default, notes):
+
+| worker input | GenerationParams field | type / upstream default | notes |
+|---|---|---|---|
+| caption | `caption` | str, "" | docs say < 512 chars. Text encoder hard-truncates the whole prompt (instruction + caption + metas) at 256 tokens (conditioning_text.py:127-133). |
+| lyrics | `lyrics` | str, "" | Instrumental = the literal string `"[Instrumental]"`. `GenerationParams.instrumental` is NOT consumed by text2music (grep: only echoed in params and used by create_sample), so set the lyrics string. Lyric tokens truncate silently at 2048 (conditioning_text.py:138-144); 4096 chars of normal English is ~1,100 tokens. Lyrics are wrapped as `# Languages\n<lang>\n\n# Lyric\n<lyrics><|endoftext|>` (prompt_utils.py:27-29). |
+| duration | `duration` | float, -1.0 (auto) | seconds, 10-600 (constants.py:58-59). The LM clamps its target to `[10, min(gpu tier max, 600)]` (llm_inference.py:266-278). |
+| bpm | `bpm` | Optional[int], None | 30-300 (constants.py:52-53). |
+| keyscale | `keyscale` | str, "" | LM and constrained decoder use exactly `"<A-G><''|#|b|♯|♭> <major|minor>"`, lowercase mode, e.g. "G major", "F# minor" (constants.py:27-42). Normalise "A Minor"->"A minor"; drop an unparsable value with a worker note. |
+| timesignature | `timesignature` | str, "" | "2","3","4","6" (constants.py:66; docs INFERENCE.md:348), passed as a string. |
+| vocal_language | `vocal_language` | str, "unknown" | ISO-ish code from `VALID_LANGUAGES` (constants.py:13-20: 'en','es','fr',...,'yue','zh','unknown'). Pass "en" explicitly. |
+| seed | `GenerationConfig.seeds` (see 1.5) | int | see seed handling below |
+| thinking | `thinking` | bool, True | True = LM writes the plan AND the 5 Hz audio codes the DiT then follows. |
+| steps | `inference_steps` | int, 8 | turbo clamps to <= 8 in the handler (service_generate_request.py:52-57), the turbo sampler itself allows 1-20 (modeling_acestep_v15_xl_turbo.py:1982-1991). |
+| guidance_scale | `guidance_scale` | float, 7.0 | turbo forces 1.0 (generate_music.py:312-318). |
+| shift | `shift` | float, 1.0 | `__post_init__` turns shift <= 0 into 1.0 (inference.py:223-229). Upstream HTTP API and Gradio use 3.0 (api/http/release_task_request_builder.py:83; model_config.py:121,138). |
+| (DCW) | `dcw_enabled` Optional[bool] None, `dcw_mode` "double", `dcw_scaler` 0.05, `dcw_high_scaler` 0.02, `dcw_wavelet` "haar" | | None = on for turbo, off otherwise (docs/en/DCW.md:81; generate_music.py:181-193). |
+| batch_size | `GenerationConfig.batch_size` | int, 2 | default is 2, not 1: always set. |
+
+Other fields worth knowing: `use_cot_metas/use_cot_caption/use_cot_language` (default True), `lm_temperature` 0.85, `lm_cfg_scale` 2.0, `lm_top_k` 0,
+`lm_top_p` 0.9, `use_constrained_decoding` True, `enable_normalization` True with `normalization_db=-1.0` (peak-normalises each take to -1 dBFS,
+inference.py:134-138, 998-1013), `fade_in_duration`/`fade_out_duration` 0, `infer_method` "ode", `sampler_mode` "euler", `use_adg` False,
+`cfg_interval_start/end` 0.0/1.0, `task_type` "text2music". (`timesteps`, repaint/cover/flow_edit fields are unused for text2music.)
+
+`GenerationConfig` (inference.py:236-267): `batch_size=2`, `allow_lm_batch=False` (not read by generate_music), `use_random_seed=True`,
+`seeds: Optional[List[int]]=None`, `lm_batch_chunk_size=8`, `constrained_decoding_debug=False`, `audio_format="flac"`,
+`mp3_bitrate="128k"`, `mp3_sample_rate=48000`.
+
+Behaviours that are easy to get wrong (all READ):
+1. SEEDS. `use_random_seed=True` (the default) makes `prepare_seeds` ignore every seed you pass and draw random ones
+   (task_utils.py:26-28). So set `use_random_seed=False` AND `seeds=[s, s+1, ...]` (list; inference.py:597-600). A single int seed with
+   batch > 1 gives only take 0 that seed; the others are random (task_utils.py:48-52). Seeds are parsed as `int(float(str))`
+   (task_utils.py:37), which loses precision above 2^53, and upstream itself draws seeds in [0, 2^32-1]; keep worker seeds <= 2,147,483,647
+   (the booth/YuE limit) and compute `seed + i` modulo that. The seed that was used for take i is `audios[i]["params"]["seed"]`
+   (inference.py:969) and `extra_outputs["seed_value"]` is the joined string. The DiT noise uses `torch.Generator(device).manual_seed(int(s))`
+   per take (modeling_acestep_v15_xl_turbo.py:1811-1827), so the DiT part is deterministic per seed.
+   The LM is NOT seeded for batch 1: the `seeds` argument to the LM is ignored in single mode ("TODO: not used yet", llm_inference.py:1318-1319)
+   and `_run_pt` only calls `torch.manual_seed` in batch mode (llm_inference.py:1186-1191). To make `seed` reproduce the plan, call
+   `torch.manual_seed(seed); torch.cuda.manual_seed_all(seed); random.seed(seed)` once before `generate_music` (INFERENCE: cheap, bitwise
+   reproducibility across GPU models is not promised anyway).
+2. THINKING OFF does not skip the LM by itself. `use_lm = (thinking or need_lm_for_cot) and llm_handler is not None and llm_handler.llm_initialized`
+   with `need_lm_for_cot = use_cot_caption or use_cot_language or use_cot_metas` (inference.py:653-655). With thinking False and the cot flags
+   at their default True the LM still runs a metadata-only pass. To honour "thinking false -> LM skipped", pass `use_cot_metas=False,
+   use_cot_caption=False, use_cot_language=False` (or pass `llm_handler=None`). Do NOT set `use_cot_metas=False` while thinking is True
+   and no user metadata exists (generate_with_stop_condition would call `.items()` on None, llm_inference.py:1429); duration is always set so
+   user_metadata is never empty in the worker, still guard it.
+3. THE LM OVERWRITES THE CAPTION AND THE LANGUAGE by default. With `use_cot_caption=True` the DiT's caption becomes the LM's rewritten caption
+   (inference.py:825-826); with `use_cot_language=True` the DiT language becomes the LM's detection (827-828; user language is not part of
+   the metadata sent to the LM, 672-700). Recommended: `use_cot_language = False` whenever the caller gave `vocal_language` (stage 2 defaults it to "en",
+   so effectively always False); `use_cot_caption` is a product decision (upstream default True expands a short direction into a rich one;
+   False keeps her exact words). Record the choice in `worker_notes`.
+4. If bpm + keyscale + timesignature + duration are ALL supplied, phase 1 (metadata CoT) is skipped (llm_inference.py:1245-1251, 1367, 1423-1429)
+   and the caption is not rewritten, but phase 2 (audio codes) still runs when thinking is True. With only some supplied, the constrained decoder
+   injects the given values and the LM fills the rest (user_metadata, inference.py:672-700).
+5. LM-decided values are copied back into the (mutated) `params` object: `params.cot_bpm`, `cot_keyscale`, `cot_timesignature`, `cot_duration`,
+   `cot_vocal_language`, `cot_caption` (inference.py:809-822). Raw dict: `result.extra_outputs["lm_metadata"]` (keys bpm, caption, duration,
+   keyscale, language, timesignature; line 1071). Use these for the contract's `plan`; do not copy `audios[i]["params"]` wholesale: it carries the
+   full lyrics, the caption and the entire `audio_codes` string (lines 977-983).
+6. BATCH + LM: with batch > 1, phase 1 is shared and phase 2 is generated per item; under pt that is SEQUENTIAL per take with `torch.manual_seed(seeds[i])`
+   (llm_inference.py:1180-1218), so planner time scales with batch size.
+7. `_vram_guard_reduce_batch` can silently lower the batch size when free VRAM is tight (memory_utils.py:138-197; XL x1.7, sft/base x2) and a
+   pre-flight can refuse the request (generate_music.py:106-179; skip with `ACESTEP_SKIP_VRAM_PREFLIGHT=1`). The number of returned `audios`
+   can be smaller than `batch_size`; build `takes` from what came back and add a worker note.
+8. Latents with NaN/Inf or all zeros raise inside the handler and come back as `success=False` (generate_music_decode.py:67-86).
+
+### 1.5 What it returns
+
+`GenerationResult(audios: List[dict], status_message: str, extra_outputs: dict, success: bool, error: Optional[str])` (inference.py:278-302).
+Each `audios[i]` (inference.py:1059-1065): `{"path": str, "tensor": torch.Tensor [channels, samples] float32 on CPU, "key": uuid-from-params, "sample_rate": 48000, "params": dict}`.
+- Sample rate 48,000 Hz (handler.py:121), stereo (VAE config: 2 channels, 48000 Hz, downsample product 1920 = 25 Hz latents; HF-LISTING vae/config.json).
+- Tensors are returned in memory. Files are written only if `save_dir` is not None (inference.py:1042). The worker should pass `save_dir=None` and write
+  its own files, because upstream's saver goes through `torchaudio.save(..., backend='soundfile')` (audio_utils.py:303-309), and torchaudio 2.9+ moved I/O onto
+  torchcodec (INFERENCE, unverified); on failure it falls back to plain soundfile (lines 322-343) but why depend on it.
+- Output audio is clamped (divide by peak if > 1.0, generate_music_decode.py:199-203) and then, by default, peak-normalised to -1 dBFS in `generate_music`.
+- WAV 24-bit 48 kHz: `soundfile.write(path, tensor.T.numpy(), 48000, subtype="PCM_24")` (tensor.T because upstream is channels-first; audio_utils.py:292
+  does the same transpose), or float WAV -> `ffmpeg -c:a pcm_s24le` exactly like yue_handler.py:1373. MP3: `ffmpeg -i master.wav -c:a libmp3lame -b:a 320k`
+  (yue_handler.py:1374). 24-bit stereo 48 kHz is 288,000 bytes per second: 3 min = 52 MB, 6 min = 104 MB, 10 min = 173 MB.
+- Timing: `extra_outputs["time_costs"]` (inference.py:1073-1094) holds `lm_phase1_time`, `lm_phase2_time`, `lm_total_time` (only when the LM ran),
+  `dit_encoder_time_cost`, `dit_diffusion_time_cost`, `dit_diffusion_per_step_time_cost`, `dit_vae_decode_time_cost`, `dit_total_time_cost`,
+  `dit_offload_time_cost`, `pipeline_total_time`. Map: `plan_s = lm_total_time`, `render_s = dit_total_time_cost`.
+- Memory: `ACESTEP_SAVE_MEMORY=1` makes the payload skip the big intermediate tensors (generate_music_payload.py:52-64, gpu_config.py:1575-1581; said to save
+  4-8 GB of host RAM per generation). Set it.
+- Progress: pass `progress=` any callable accepting `(ratio, desc=...)` AND `(ratio, "text")` (llm_inference.py:1366 passes the text positionally; the DiT handler,
+  core/generation/handler/generate_music.py:331, passes `desc=`). Define `def progress(*a, **k)` and forward a plain phrase to `runpod.serverless.progress_update`.
+
+### 1.6 Recommended settings per checkpoint (from upstream docs and UI defaults)
+
+| | xl-turbo | xl-sft |
+|---|---|---|
+| steps | 8 (Tutorial.md:261; model_config.py:116; allowed 1-20, clamped to 8 by the handler) | 50 (Tutorial.md:262; model_config.py:131) |
+| guidance | ignored (forced 1.0) | 7.0 default, typical 5-9 (INFERENCE.md:367) |
+| shift | 3.0 ("the only turbo parameter to set manually", INFERENCE.md:354-362; Gradio model_config.py:121) | 3.0 (Gradio model_config.py:138; HTTP default 3.0) |
+| DCW | model default = on, "double" 0.05/0.02 (DCW.md:81, 148-157). Gradio uses 0.02/0.06 when Think is on (DCW.md:144-146); the HTTP route uses the 0.05/0.02 defaults. Start with the defaults. | pass `dcw_enabled=False` explicitly (contract; upstream default is already off because `is_turbo` is false in its config.json, but do not rely on that) |
+| sampler | ode / euler, `use_adg=False`, cfg interval 0..1 | same |
+| think | thinking True gives the LM's 5 Hz codes (the "plan") | same |
+
+With 8 steps and shift 3.0 the turbo sampler builds exactly its distilled schedule `[1.0, .9545, .9, .8333, .75, .6429, .5, .3]`
+(modeling_acestep_v15_xl_turbo.py:1938-1942, 1982-1991; checked by hand). If the caller passes a different `steps`, the turbo class computes a linspace +
+shift schedule instead; allowed 1-20.
+
+### 1.7 LoRA seam (reserved)
+
+`AceStepHandler` already has `add_lora(path, adapter_name)`, `load_lora(path)`, `set_lora_scale(name, scale)`, `set_use_lora(bool)`, `remove_lora(name)`,
+`unload_lora()` (core/generation/handler/lora_manager.py:17-36; lifecycle.py:191-325). They need `peft` (not installed in the recommended image), return
+status STRINGS starting with a check mark / cross instead of raising, refuse quantized models (lifecycle.py:200-205, which is why INT8 stays off), and back up the
+whole decoder state_dict to CPU on first use (lifecycle.py:246-260). Per-request loading would go in `apply_adapter(pipe, key)`: fetch the adapter from B2 to /tmp,
+`h.add_lora(dir, name)`, `h.set_lora_scale(name, scale)`, generate, then `h.unload_lora()` in a `finally`. Today the function raises NotImplementedError and `lora_key` is refused
+before any work.
+
+---------------------------------------------------------------------------------------------------------------------
+
+## 2. Dependencies and install recipe (b)
+
+### 2.1 What upstream pins
+
+- Python: `requires-python >=3.11,<3.13` (pyproject.toml:6; uv.lock:3). 3.12 is allowed.
+- Linux x86_64 torch stack: `torch==2.10.0+cu128`, `torchvision==0.25.0+cu128`, `torchaudio==2.10.0+cu128` (pyproject.toml:14-16; requirements.txt:13-15).
+  Index `https://download.pytorch.org/whl/cu128` (pyproject.toml:64-67).
+- uv.lock resolved versions (the set upstream tests): transformers 4.57.6 (pyproject says `>=4.51,<4.58`), diffusers 0.37.1, huggingface-hub 0.36.0,
+  tokenizers 0.22.2, safetensors 0.7.0, accelerate 1.12.0, numpy 2.3.5, scipy 1.17.0, soundfile 0.13.1, loguru 0.7.3, einops 0.8.2,
+  vector-quantize-pytorch 1.27.20, pytorch-wavelets 1.3.0, pywavelets 1.9.0, torchcodec 0.10.0, torchao 0.16.0 (pyproject pins `>=0.16,<0.17`), triton 3.6.0,
+  peft 0.18.1, lycoris-lora 3.4.0, numba 0.63.1, xxhash 3.6.0, nano-vllm 0.2.0, flash-attn 2.8.3+cu128torch2.10 (cp311 only).
+- `transformers>=4.56` is required for the `dtype=` keyword used in init_service_loader.py:179 (older versions took `torch_dtype`; INFERENCE from the
+  transformers 4.56 rename). 4.57.6 satisfies it. Keep the pin.
+- Things that need compilation: nothing on the recommended path. `flash-attn` is a prebuilt cp311 wheel from a third-party GitHub release
+  (uv.lock:609-621, acestep/third_parts/nano-vllm/pyproject.toml:20); on Python 3.12 the markers (`python_version == '3.11'`, lines 16-20) do not match, so it is
+  simply not installed (there is no cp312 wheel in the lock; building flash-attn from source on a slim image needs nvcc plus 30+ minutes). `nano-vllm` itself is pure Python.
+  `triton` arrives with torch on Linux (torch 2.10 cu128 depends on triton 3.6.0, INFERENCE) but nano-vllm's own triton requirement is also restricted to Python 3.11 (pyproject.toml:17).
+  `numba`, `vector-quantize-pytorch`, `pytorch-wavelets`, `pywavelets`, `soundfile` are wheels.
+
+### 2.2 What the inference path actually imports (measured with F:/KadeAI-work/ace/scratch/import_graph.py, a static AST walk)
+
+Module level, from `acestep.inference`, `acestep.handler`, `acestep.llm_inference`, `acestep.gpu_config`, `acestep.model_downloader`:
+`torch, torchaudio, transformers, numpy, soundfile, loguru, tqdm, yaml`. Inside functions: `diffusers` (VAE), `safetensors`, `huggingface_hub`
+(downloader only), `modelscope` (downloader only), `torchao` (quantization only), `flash_attn`, `triton`, `nanovllm`, `mlx*` (Apple), `torchcodec` (audio loading in the
+training/dataset modules only), `spaces`. The remote modeling code adds `einops`, `vector_quantize_pytorch` (module level, modeling file lines 23 and 42) and
+`pytorch_wavelets` (lazy, only when DCW is active; missing = warning and DCW silently skipped, models/common/dcw_loader.py:32-47).
+NOT needed for text2music: gradio, fastapi, uvicorn, scipy, numba, matplotlib, lightning, tensorboard, peft, lycoris, modelscope, torchvision, torchao, torchcodec.
+
+### 2.3 Recommended install recipe for `python:3.12-slim-bookworm`
+
+```
+FROM python:3.12-slim-bookworm
+ENV PYTHONUNBUFFERED=1 HF_HUB_DISABLE_TELEMETRY=1
+RUN apt-get update && apt-get install -y --no-install-recommends git ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+RUN pip install --no-cache-dir torch==2.10.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+RUN python -c "import torch; f = torch._C._cuda_getArchFlags(); print('ACE env CUDA archs:', f); assert 'sm_86' in f and 'sm_120' in f, f"
+RUN git clone https://github.com/ace-step/ACE-Step-1.5.git /opt/ace-step && cd /opt/ace-step && git checkout ca1e85fe9430179831e6bc6be790c332190a3866
+RUN pip install --no-cache-dir transformers==4.57.6 huggingface_hub==0.36.0 tokenizers==0.22.2 safetensors==0.7.0 accelerate==1.12.0 diffusers==0.37.1 \
+    numpy==2.3.5 soundfile==0.13.1 loguru==0.7.3 einops==0.8.2 vector-quantize-pytorch==1.27.20 pytorch-wavelets==1.3.0 pywavelets==1.9.0 \
+    pyyaml tqdm 'runpod>=1.7,<2' 'boto3>=1.35,<2' 'requests>=2.32,<3'
+ENV PYTHONPATH=/opt/ace-step ACE_STEP_COMMIT=ca1e85fe9430179831e6bc6be790c332190a3866
+```
+Notes on the recipe:
+- Mirrors `Dockerfile.yue` lines 10-15 (same base, same cu128 index, same git clone + checkout style). pip resolves `torch==2.10.0` to the `+cu128` build from that
+  index exactly as Dockerfile.yue:13 does; later `pip install` calls will not replace it because `==2.10.0` is satisfied by `2.10.0+cu128`.
+- Do NOT `pip install` upstream itself (`pip install .` would drag in gradio, fastapi, uvicorn, numba, lightning, tensorboard, torchao...). Put the clone on
+  `PYTHONPATH`; `acestep` is a plain package (acestep/__init__.py is a docstring only) and its code-sync source dir is `Path(__file__).parent/"models"`
+  (model_downloader.py:46-48). The repo is ~21 MB; no pruning needed.
+- The arch assertion must NOT look for `sm_89`: PyTorch wheels list `sm_80/sm_86/sm_90/sm_100/sm_120`-style cubins and run on sm_89 (L40, 6000 Ada, 4090)
+  through CUDA binary compatibility within the 8.x family (INFERENCE: standard CUDA rule, and `Dockerfile.yue:6,31` assert only sm_86 and sm_120).
+  The contract text says sm_89; assert `sm_86` and `sm_120`, print the full flag list so CI shows it, and say so in the Dockerfile comment.
+- LM backend CHOICE: `pt`. Reasons (READ/INFERENCE): (1) nano-vllm installs fine on 3.12 (pure Python, no compiler) but without `flash_attn` it runs `enforce_eager=True`
+  with a Python-loop SDPA decode (attention.py:233-285, llm_inference.py:675), losing most of vLLM's speed advantage, and no cp312 flash-attn wheel exists in the lock;
+  (2) it pre-allocates a KV pool from free VRAM (gpu_config.py:976-1075) which competes with the lazily loaded xl-sft and with the 32 GB 5090 budget;
+  (3) its Triton KV kernel and shared-memory multiprocess runner are extra moving parts on sm_120 (nano-vllm utils/compat.py:3-6 itself warns about Blackwell Triton);
+  (4) upstream falls back to pt automatically on any vLLM failure, so `pt` is the behaviour we would end up with anyway. Cost: planner time (1.3). Make the backend an env knob
+  (`ACE_LM_BACKEND`, default `pt`) so the smoke test can try `vllm` after `pip install --no-deps /opt/ace-step/acestep/third_parts/nano-vllm xxhash`.
+- torchao is deliberately NOT installed (contract: no INT8). Upstream warns that an unpinned torchao 0.18.x breaks model load (requirements.txt:37-41); if a build-time import
+  check ever demands it, pin `torchao==0.16.0` (pyproject.toml:42), never unpinned. `peft==0.18.1` and `lycoris-lora==3.4.0` come with the LoRA phase later.
+- Size estimate (INFERENCE, not measured): torch 2.10 cu128 + nvidia libs about 7-8 GB on disk, the rest about 1.5 GB, base 0.15 GB, ffmpeg 0.1 GB: roughly 9-10 GB, no weights.
+  Dockerfile.yue is the existing example of an image of this kind that fits the 15 GB limit.
+- Build-time checks to put in the Dockerfile: the arch assertion above; `python -c "import acestep.inference, acestep.handler, acestep.llm_inference, acestep.model_downloader;
+  from acestep.inference import GenerationParams, GenerationConfig, generate_music"` (imports only; `AceStepHandler()` would also work with no GPU but is not needed);
+  `python -c "import ace_handler"`; `python -m unittest test_ace_handler.py`; and a check that the code-sync source files exist:
+  `ls /opt/ace-step/acestep/models/xl_turbo/modeling_acestep_v15_xl_turbo.py /opt/ace-step/acestep/models/xl_sft/modeling_acestep_v15_xl_base.py`.
+- Env for the runtime (all read by upstream): `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_CACHE=/runpod-volume/huggingface-cache/hub TOKENIZERS_PARALLELISM=false
+  ACESTEP_PROJECT_ROOT=/tmp/ace-root ACESTEP_CHECKPOINTS_DIR=/tmp/ace-checkpoints ACESTEP_DISABLE_TQDM=1 ACESTEP_SAVE_MEMORY=1`.
+
+---------------------------------------------------------------------------------------------------------------------
+
+## 3. RunPod cache layout vs upstream layout (c)
+
+### 3.1 What upstream expects (a flat `checkpoints/` folder)
+
+```
+checkpoints/
+  acestep-v15-turbo/            2B DiT from the main repo: only needs to hold weights (check_main_model_exists); never loaded by us
+  acestep-v15-xl-turbo/         config.json + modeling/config .py + shard files + silence_latent.pt   (the DiT we load)
+  acestep-v15-xl-sft/           same shape, loaded lazily
+  vae/                          config.json + diffusion_pytorch_model.safetensors
+  Qwen3-Embedding-0.6B/         tokenizer + model.safetensors
+  acestep-5Hz-lm-1.7B/          tokenizer + model.safetensors
+```
+Names are exact and case sensitive (model_downloader.py:287-312, init_service_loader_components.py:90, llm_inference.py:590).
+
+### 3.2 What RunPod's cache gives us
+
+`/runpod-volume/huggingface-cache/hub/models--<org>--<name>/snapshots/<sha>/...` (standard HF cache; files are symlinks to `../../blobs/<hash>`; this is what
+`Dockerfile.yue:17-18,28-30` already relies on). For this engine: `models--ACE-Step--acestep-v15-xl-turbo`, `models--ACE-Step--acestep-v15-xl-sft`,
+`models--ACE-Step--Ace-Step1.5`. A snapshot folder of the DiT repos is flat (the DiT files sit directly in `snapshots/<sha>/`); the main repo's snapshot holds the four sub-folders.
+
+### 3.3 Build the checkpoints dir at boot (recipe)
+
+Do this once per process, in a writable scratch dir (default `/tmp/ace-checkpoints`), after the three snapshot folders are resolved:
+
+1. `vae`, `Qwen3-Embedding-0.6B`, `acestep-5Hz-lm-1.7B` and `acestep-v15-turbo`: symlink each to `<main snapshot>/<same name>` (upstream only reads them).
+   If `acestep-v15-turbo` is absent from the snapshot, create a real folder with an empty `model.safetensors`; `_contains_model_weights` only tests `.exists()`
+   (model_downloader.py:381-383) and the 2B model is never loaded.
+2. For each DiT (`acestep-v15-xl-turbo`, `acestep-v15-xl-sft`): create a REAL directory, symlink every non-`.py` entry of the snapshot into it (`config.json`,
+   `model-0000N-of-00004.safetensors`, `model.safetensors.index.json`, `silence_latent.pt`), and COPY (not link) the code files from
+   `/opt/ace-step/acestep/models/<xl_turbo|xl_sft>/*.py` except `__init__.py`. Then `_check_code_mismatch` finds no difference, the sync never writes, and the shared cache
+   is never touched. (Files in a snapshot are symlinks to blobs; `shutil.copy2` onto them would write through, see 1.2.)
+3. Export `ACESTEP_CHECKPOINTS_DIR` to that dir (so `initialize_service` and `get_checkpoints_dir()` agree) and pass the same path as `checkpoint_dir` to `LLMHandler.initialize`.
+4. Validate before calling upstream: check the specific files (`vae/diffusion_pytorch_model.safetensors`, `Qwen3-Embedding-0.6B/model.safetensors`,
+   `acestep-5Hz-lm-1.7B/model.safetensors`, `acestep-v15-xl-*/model.safetensors.index.json` and its 4 shards, `silence_latent.pt`). `yue_handler._filled()` (any file in the folder, lines 49-53)
+   is too weak here: a half-filled main snapshot would pass it and fail later inside upstream with a long message.
+5. If a repo is missing from the cache, download its pinned revision once with `huggingface_hub.snapshot_download(repo, revision=sha, cache_dir="/tmp/hf-hub")` as `yue_handler.fetch_model`
+   does (lines 76-87), then build from that snapshot. Never call upstream's `model_downloader` (it opens a socket to google.com and falls back to ModelScope).
+
+The HF repos' own `*.py` files are NOT used (the pinned upstream copies replace them), only `config.json` (auto_map, `is_turbo`), weights, the index and `silence_latent.pt`.
+
+### 3.4 Contents of the three HF repos (HF-LISTING, Oct 10 2026; sizes in bytes, summed by hand)
+
+`ACE-Step/acestep-v15-xl-turbo` (not gated, not private): `.gitattributes`, `README.md`, `config.json` (2,407), `configuration_acestep_v15.py` (13,225),
+`model-00001-of-00004.safetensors` 4,986,971,456; `-00002-` 4,986,942,776; `-00003-` 4,986,942,808; `-00004-` 4,988,483,464 (total 19,949,340,504 = 19.95 GB),
+`model.safetensors.index.json` (71,471), `modeling_acestep_v15_xl_turbo.py` (103,821), `silence_latent.pt` (3,841,215).
+config.json: `auto_map` as in 1.2, `"dtype": "bfloat16"`, `"is_turbo": true`, `"model_version": "turbo"`, hidden_size 2560, 32 layers, `transformers_version` 4.57.0.
+The shards are fp32-sized (about 5.0 B parameters at 4 bytes); the `dtype` field says bf16 but the files are not. Loading with `dtype=bf16` halves it to about 10 GB in VRAM
+(upstream's own estimate is 9.0 GB, gpu_config.py:151).
+
+`ACE-Step/acestep-v15-xl-sft`: same four shards (identical sizes), `model.safetensors.index.json`, `silence_latent.pt`, `config.json` (2,525; `"is_turbo": false`, `"model_version": "base"`,
+auto_map -> `modeling_acestep_v15_xl_base.AceStepConditionGenerationModel`), `configuration_acestep_v15.py` (13,225), `apg_guidance.py` (8,340), `modeling_acestep_v15_xl_base.py` (105,981), README.
+
+`ACE-Step/Ace-Step1.5` (28 files): `acestep-v15-turbo/{config.json, configuration_acestep_v15.py, model.safetensors (4,787,825,604), modeling_acestep_v15_turbo.py, silence_latent.pt}`,
+`acestep-5Hz-lm-1.7B/{added_tokens.json, chat_template.jinja, config.json, merges.txt, model.safetensors (3,708,521,528), special_tokens_map.json, tokenizer.json, tokenizer_config.json, vocab.json}`,
+`Qwen3-Embedding-0.6B/{added_tokens.json, chat_template.jinja, config.json, merges.txt, model.safetensors (1,191,586,416), special_tokens_map.json, tokenizer.json, tokenizer_config.json, vocab.json}`,
+`vae/{config.json, diffusion_pytorch_model.safetensors (337,431,388)}`, plus root `config.json`, `README.md`, `.gitattributes`. Total about 10.1 GB.
+LM config: model_type qwen3, 28 layers, hidden 2048, vocab 217,204 (summarised; matches the 1.7B naming). VAE config: `AutoencoderOobleck`, 2 channels, 48 kHz.
+Cache footprint of the whole engine: 19.95 + 19.95 + 10.1 = about 50 GB; VRAM resident after boot (turbo + LM + VAE + text encoder, bf16): about 10 + 3.7 + 0.3 + 1.2 = 15 GB;
+with xl-sft loaded as a second handler add about 11.5 GB (INFERENCE from file sizes).
+
+### 3.5 Revision pins as of today (HF-LISTING; re-verify before pinning, the summariser may have mistyped a character)
+
+| repo | sha | lastModified |
+|---|---|---|
+| ACE-Step/acestep-v15-xl-turbo | d4a0b288b83ebb7e25a8c0b32c573c22e134e8ee | 2026-04-07 |
+| ACE-Step/acestep-v15-xl-sft | d06de46b4622f781cf07f4a013a67d591ca52819 | 2026-04-07 |
+| ACE-Step/Ace-Step1.5 | 19671f406d603126926c1b7e2adc169acbcade22 | 2026-02-03 |
+
+All three have been stable for months, so pinning the Dockerfile `ENV ACE_TURBO_DIR=/runpod-volume/huggingface-cache/hub/models--ACE-Step--acestep-v15-xl-turbo/snapshots/<sha>` style variables (like `YUE_MODEL_DIR`)
+is low risk. The orchestrator can confirm each sha with `git ls-remote` on the Hub URL (a metadata call, not made here). Whether RunPod's cache can hold three repos on one endpoint (`MODEL_NAME` vs
+a list) is not answerable from upstream; the research file says caching handles one repo per endpoint, in which case two repos arrive through the download fallback on first boot (about 30-40 GB).
+
+---------------------------------------------------------------------------------------------------------------------
+
+## 4. Things that will bite on a real worker (d)
+
+1. COLD START IS BIG. 50 GB cached, about 25 GB read from the network volume at boot (turbo shards 19.95 GB + LM 3.7 + TE 1.2 + VAE 0.3), fp32 shards cast to bf16 on load, plus the LM tokenizer
+   (upstream's own comment says the tokenizer load "may take 80~90s", llm_inference.py:609-611). Do all of it in `warm()` so FlashBoot snapshots a ready worker, and log per-stage seconds.
+2. THE CODE-SYNC WRITE. Described in 1.2: an unprepared snapshot makes upstream overwrite files inside the shared cache (or fail with a permission error and report only "Error initializing model").
+   Use the real-directory-plus-copied-code recipe in 3.3. After building, assert `_check_code_mismatch("acestep-v15-xl-turbo", ckpt) == []` as a boot self-check.
+3. `check_main_model_exists` WANTS THE 2B TURBO. A checkpoints dir without a weighted `acestep-v15-turbo` makes upstream start a download (socket to google.com, then Hub, then ModelScope) even
+   though we never use that model. In an offline container this shows up as a confusing failure (1.2, 3.3 step 1).
+4. LOG PRIVACY AND VOLUME. loguru's default sink prints at INFO the full DiT text input including the caption and lyrics (handler `conditioning_text.py:118-125`) and the LM prompt with caption and lyrics
+   (`llm_inference.py:1377,1490`). RunPod keeps worker logs. Remove the default sink at import (`from loguru import logger; logger.remove(); logger.add(sys.stderr, level="WARNING")`) and never return upstream's
+   `error`/`status_message` text (it embeds tracebacks). `yue_handler` logs only exception types (lines 1428-1429); do the same.
+5. LM REWRITES CAPTION AND LANGUAGE BY DEFAULT (1.4 item 3). Left at defaults, her "Music direction" is replaced by the LM's own caption and her language is replaced by the LM's guess.
+6. THINKING=FALSE STILL RUNS THE LM unless the three `use_cot_*` flags are also False (1.4 item 2).
+7. SEEDS (1.4 item 1): without `use_random_seed=False` the reported seed would not reproduce anything; the LM is unseeded for batch 1; `seed + i` must stay in range.
+8. PT PLANNER TIME may exceed the render time (1.3). Surface `timing.plan_s`; cost accounting by execution seconds will see it. A 6-minute song with thinking on is the worst case (about 1,800 codes).
+9. TURBO CLAMPS AND IGNORES. Steps above 8 are clamped by the handler (service_generate_request.py:52-57) and guidance is overridden (generate_music.py:312-318): report the values USED in `worker_notes`,
+   not the ones requested. The booth's xl-turbo path must not promise guidance control.
+10. SFT HAS TWO FORWARD PASSES PER STEP (CFG) and 50 steps: with the VRAM pre-flight (`xl_base` 1.0 GB per batch item per minute of audio, generate_music.py:139-154) a 4-take 6-minute sft request needs
+    about 24 GB of activation headroom by upstream's own estimate; the VRAM guard may cut the batch silently (1.4 item 7). Contract caps the booth at batch 1 for v1, keep the capability but test 1 only.
+11. TWO DiTs ON ONE CARD. Each handler duplicates VAE + text encoder; a second 10 GB DiT plus first on a 32 GB card is tight. Contract: release turbo before loading sft below 40 GB. The release is manual (1.2);
+    the swap re-reads 20 GB, so expect about a minute of `model_load_s` on the first sft request after turbo and again when returning to turbo. Do not thrash: keep whichever model was used last.
+12. `HF_MODULES_CACHE` / `trust_remote_code`: transformers copies the modeling files to `~/.cache/huggingface/modules/transformers_modules/<folder name>`; the folder names `acestep-v15-xl-turbo` and `acestep-v15-xl-sft`
+    must stay distinct (they are). The cache dir must be writable; `acestep` must be importable (PYTHONPATH) at that moment or the load fails on `from acestep.models.common...`.
+13. SDPA vs EAGER. If the sdpa load fails, upstream retries with eager silently (init_service_loader.py:164-185). Grep the init status string for "Attention: sdpa" at boot and fail loudly if not (INFERENCE: eager would also use more memory for the sliding-window layers).
+14. DEVICE SELECTION. Everything defaults to `cuda:0`; the GPU config is global and computed from device 0's total memory. RunPod gives one GPU, fine. `MAX_CUDA_VRAM` must not be set in the endpoint env (it caps the allocator, gpu_config.py:24).
+15. AUDIO SAVING PATH. Do not use `save_dir` (1.5). The tensor is already peak-normalised to -1 dBFS; keep that (it is upstream's default and keeps takes comparable); do not normalise twice.
+16. SILENT TRUNCATIONS: tokens, not characters: the whole text prompt is cut at 256 tokens, lyrics at 2048 (conditioning_text.py:127-144). The booth trims the caption at 512 characters; a caption of 512 characters of dense terms can still exceed 256 tokens
+    after the instruction and metas are added. Add a worker note if `len(tokenizer(...)) >= 256` is cheap to check (it is: the DiT handler's tokenizer is `h.text_tokenizer`).
+17. `batch_size` default is 2 in `GenerationConfig` (inference.py:254) and `prepare_seeds`, the VRAM guard and the pre-flight all read it. Always pass it.
+18. `fetch_model` in yue_handler leaves `huggingface_hub.constants.HF_HUB_OFFLINE = False` after a download (it resets only the environment variable, yue_handler.py:86-87). If you copy it, restore both.
+19. TORCHAUDIO/TORCHCODEC. `import torchaudio` happens at module level (audio_utils.py:21), so torchaudio must be installed; torchcodec is only needed for loading audio files (reference audio, cover) and is not installed in the
+    recommended image. Do not add reference-audio features without adding torchcodec and checking that it finds the system FFmpeg libraries (INFERENCE).
+20. sm_89 STRING in the arch assertion (2.3): asserting it would fail the build for a harmless reason.
+21. Possible vLLM-only footgun if someone flips `ACE_LM_BACKEND=vllm`: `LLMHandler.initialize` returns success on the pt fallback too, so log `llm.llm_backend`; the vLLM engine takes its memory before the lazily loaded sft arrives.
+22. Output WAV sizes (288 kB/s, 1.5 above) matter downstream: the fork contract's cover-source 20 MB check will reject an ACE WAV longer than about 70 s if it reads `wav_url`; `url` (the 320 kbps MP3, 40 kB/s, 20 MB = 8 minutes)
+    is the safer cover source. This is the fork stage's problem; it is noted here because the worker decides the file sizes.
+
+---------------------------------------------------------------------------------------------------------------------
+
+## 5. yue_handler.py conventions to reuse (e)
+
+All line numbers are `F:/KadeAI-work/ace/worker/yue_handler.py` unless stated. Files in the working tree are CRLF on this PC (`core.autocrlf=true`); the git index stores LF (`git ls-files --eol`: `i/lf w/crlf`),
+so commit whatever endings your editor wrote, they are normalised to LF in the repo. New files may be LF.
+
+Copy (small, standard library or lazy imports, no yue dependencies):
+- `_filled(folder)` (49-53), `model_folder(pinned, repo, roots=None)` (56-73): pinned snapshot, else newest non-empty cached snapshot of `models--<org>--<name>` under `[pinned.parents[2], $HF_HUB_CACHE, /runpod-volume/huggingface-cache/hub]`,
+  returns `(Path|None, how)`. Add a `required=` list of relative paths so a half-filled snapshot is not accepted (3.3 step 4).
+- `fetch_model(repo, revision)` (76-87): `huggingface_hub.snapshot_download(repo, revision=..., cache_dir="/tmp/hf-hub")` with offline mode switched off for the call. Fix the constants reset (item 18).
+- `resolve_models(download=True)` (90-106) and the `MODELS` tuple (44-45), `RESOLVED` flag (46): per model, pinned env var -> folder, writes the resolved path back into `os.environ[env]`, prints `"<name> <how>"` per model
+  (boot log line `YuE2 models: ...`). ACE equivalent: three entries (`ACE_TURBO_DIR`/`ACE-Step/acestep-v15-xl-turbo`, `ACE_SFT_DIR`/`ACE-Step/acestep-v15-xl-sft`, `ACE_MAIN_DIR`/`ACE-Step/Ace-Step1.5`); sft is optional at boot (resolve it
+  without downloading at boot, download lazily on first use). Probe mode calls `resolve_models()` and reports the three `how` values.
+- `storage()` (830-834): `boto3.client('s3', endpoint_url=os.environ['AWS_ENDPOINT_URL'], region_name=os.environ.get('AWS_REGION', 'us-east-005'))` and `os.environ['AWS_BUCKET_NAME']`. The access key and secret come from
+  `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` through boto3's own environment lookup (not read in code). Imports boto3 lazily inside the function: keep it so the unit tests run without boto3 (the CI step in `yue.yml:16` runs the
+  tests on a bare `ubuntu-latest` Python with no torch).
+- `gpu_name()` (801-806) and `gpu_peak(reset=False)` (809-820): lazy `import torch`, return `None` when unavailable; the booth prices by the `gpu` string, so it is `torch.cuda.get_device_name()`.
+- `warm()` (1264-1273): `try: engine(); print(f'... ready at boot in {t:.1f}s') except Exception as error: print('... boot load skipped:', type(error).__name__)`; a failure falls back to loading on first use.
+- `engine()` (770-779): module global `PIPE`, built once; ACE equivalent holds the turbo handler, the optional sft handler and the one `LLMHandler`.
+- `__main__` (1432-1435): `import runpod; warm(); runpod.serverless.start({'handler': handler})`.
+- Handler skeleton (1276-1302, 1424-1429): `start = time.monotonic()`, one `try`, validation helpers that raise `ValueError('<plain sentence>')`, `except ValueError as error: return {'error': str(error)}`,
+  `except Exception as error: print('X failed:', type(error).__name__, ...); return {'error': 'X could not finish (<Type>). Your writing is saved.'}` (the YuE wording; the contract wants one plain sentence and no URLs or secrets).
+  Validation style to imitate: `request_input` (185-208) and `sound_controls` (156-164; the nested `number()` helper rejects bools, NaN, inf and out-of-range values: `type(value) not in (int, float)` already excludes `bool`).
+- `runpod.serverless.progress_update(job, 'text')` calls (1306, 1323) imported lazily inside the handler: `import runpod` is at 1298, not at module level (so tests do not need it).
+- Output assembly (1383-1414): `prefix = f'<engine>/{uuid.uuid4()}'`; `client.upload_file(str(path), bucket, prefix + '/' + name, ExtraArgs={'ContentType': mime})`; presigned GET with
+  `client.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': key}, ExpiresIn=604800)`; result keys `engine, key, wav_key, url, wav_url, duration_s (round(...,2) from sf.info(wav).duration), bytes (mp3.stat().st_size),
+  processing_ms (int((time.monotonic()-start)*1000)), seed, truncated, timing {...}, gpu, memory {'render_peak_gib': ...}, features, worker_notes`. Take keys for ACE are `ace/<uuid4>/master.mp3` and `master.wav`.
+  The whole body runs inside `with tempfile.TemporaryDirectory() as td:` (1301) so nothing is left on disk.
+- `TAKE_KEY` regex (108) is the pattern the other YuE modes use to accept only well-formed keys: if ACE ever accepts a key from the caller (it does not in v1), copy that style.
+- `FEATURES` tuple (113-115) reported in outputs; ACE: `("ace-xl-turbo", "ace-xl-sft", "batch", "instrumental", "probe")` per contract.
+- ffmpeg: `from auk_handler import ffmpeg` (1300) is the shared helper: `subprocess.run(["ffmpeg","-nostdin","-y","-v","error",*map(str,args)], check=True, timeout=180, capture_output=True)` (auk_handler.py:61-63).
+  Importing it drags in `auk_contract` (auk_handler.py:15). `Dockerfile.ace` is meant to be self-contained, so COPY the four-line `ffmpeg()` into `ace_handler.py` instead of importing `auk_handler`.
+  Exact calls to repeat: `ffmpeg('-i', work/'audio.flac', '-c:a', 'pcm_s24le', wav)` then `ffmpeg('-i', wav, '-c:a', 'libmp3lame', '-b:a', '320k', mp3)` (1373-1374).
+  ACE variant: write the 24-bit WAV directly with `soundfile` from the tensor, or write a float WAV and run the first command; then the second command unchanged.
+- Test conventions (`test_yue_controls.py:1-30`, CI `yue.yml:14-16`): plain `unittest`, `import yue_handler` at the top (so the module must import with nothing but the standard library),
+  `types.SimpleNamespace`/small fake classes for the pipeline, `unittest.mock.patch.object` for module globals, no GPU, no network. `test_yue_styles.py` is the one test that imports torch (CPU tensors), which is why the
+  Docker build runs it inside the image and the workflow does not. Keep ACE tests to the first style (fake pipeline, fake S3) so the CI step works without torch.
+
+Do NOT copy: the YuE-specific cover, score, ABC, sync and style code (lines 107-770 and 837-1262), `STYLE_KEY`, `apply_style` (the YuE adapter folding; ACE's `apply_adapter` is a separate seam, 1.7).
+
+---------------------------------------------------------------------------------------------------------------------
+
+## 6. Suggested shape for stage 2 (not binding)
+
+```
+ace_handler.py
+  constants: MODELS (3 entries), FEATURES, VERSIONS, DEFAULTS per checkpoint (steps, guidance, shift, dcw)  [1.6]
+  pure helpers: trim_caption(text, 512) -> (text, note); normalise_keyscale; request_input(raw) -> dict (ValueError sentences);
+                take_seeds(seed, n); settings_for(model, overrides)
+  resolve_models / model_folder / fetch_model / storage / gpu_name / gpu_peak            [copied, 5]
+  build_checkpoints(root, snaps, upstream_dir) -> Path                                    [3.3]
+  engine(model) -> handler; load_lm(); release_turbo()                                    [1.2, 1.3]
+  render(job_input) -> takes via generate_music(save_dir=None) + soundfile/ffmpeg + upload
+  apply_adapter(pipe, key): raise NotImplementedError                                     [1.7]
+  warm(); handler(job); __main__
+test_ace_handler.py   fake pipeline (callable returning a fake GenerationResult), fake S3 client, no torch
+Dockerfile.ace        recipe 2.3 + COPY ace_handler.py test_ace_handler.py + build-time checks
+.github/workflows/ace.yml
+```
+Open decisions for stage 2 / the orchestrator (each is a product call, not a technical one): whether the LM may rewrite the caption (1.4 item 3); whether to expose `ACE_LM_BACKEND`; whether sft is resolved at boot
+(read-only check) or only on first use; whether to cap `batch_size` at 1 for sft until the VRAM guard behaviour is observed. The smoke test should print, per model: init status string (attention, dtype), LM backend actually used, and the
+`time_costs` keys, because those are the unknowns above.
+
+## 7. Not verified here (honest list)
+
+- Nothing was executed on a GPU or in Linux: all timings, tokens/s, image size and VRAM numbers above are estimates from file sizes and docs.
+- HF-LISTING facts (file names, sizes, config.json content, shas) came through a summarising fetch tool; names are consistent with upstream's downloader code, but treat sizes and shas as "re-verify before pinning".
+- Upstream issue #1299 (DCW and xl-sft) and issue numbers quoted by the research file could not be read (GitHub is off limits); the DCW handling above is from the pinned source and docs.
+- Whether `torchaudio` 2.10 import needs torchcodec at import time is not established; the build-time `import acestep.inference` check will show it. If it does, add `torchcodec==0.10.0` (it needs the apt FFmpeg libraries).
+- Whether `pytorch-wavelets` pulls `scipy`/`six` transitively is left to pip; the build-time import check covers it.
