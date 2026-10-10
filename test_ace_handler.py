@@ -261,6 +261,22 @@ class TestSeedsAndSettings(unittest.TestCase):
         _, notes = ace.settings_for(self.request(guidance_scale=1))
         self.assertEqual(notes, ['Made with the fast model in 8 steps.'])
 
+    def test_guidance_13_on_sft_is_used_whole_and_on_turbo_is_ignored(self):
+        settings, notes = ace.settings_for(self.request(model='xl-sft', guidance_scale=13))
+        self.assertEqual(settings['guidance_scale'], 13.0)
+        self.assertEqual(notes, ['Made with the best-quality model in 50 steps at guidance 13.'])
+        settings, notes = ace.settings_for(self.request(model='xl-turbo', guidance_scale=13))
+        self.assertEqual(settings['guidance_scale'], 1.0)
+        self.assertEqual(notes, ['The fast model ignores the guidance setting.', 'Made with the fast model in 8 steps.'])
+
+    def test_planner_temperature_needs_a_value_and_a_planner(self):
+        asked = self.request(lm_temperature=1.3)
+        self.assertEqual(ace.planner_temperature(asked, True), 1.3)
+        self.assertIsNone(ace.planner_temperature(asked, False))
+        self.assertIsNone(ace.planner_temperature(self.request(), True))
+        self.assertEqual(ace.planner_temperature(self.request(lm_temperature=0), True), 0.0)    # zero is a value
+        self.assertIsNotNone(ace.planner_temperature(self.request(lm_temperature=0), True))
+
 
 class TestSmallHelpers(unittest.TestCase):
     def test_join_names(self):
@@ -348,8 +364,9 @@ class TestRequestInput(unittest.TestCase):
         request = ace.request_input({'caption': 'x', 'duration': 30, 'seed': None, 'batch_size': None, 'bpm': None,
                                      'keyscale': None, 'timesignature': None, 'vocal_language': None,
                                      'thinking': None, 'steps': None, 'guidance_scale': None, 'shift': None,
-                                     'lyrics': None, 'model': None, 'mode': None})
+                                     'lm_temperature': None, 'lyrics': None, 'model': None, 'mode': None})
         self.assertEqual((request['model'], request['batch_size'], request['thinking']), ('xl-turbo', 1, True))
+        self.assertIsNone(request['lm_temperature'])
 
     def test_mode_and_model(self):
         self.check('Mode must be render or probe.', mode='fast')
@@ -361,9 +378,10 @@ class TestRequestInput(unittest.TestCase):
 
     def test_odd_json_values_in_any_field_are_refused_in_plain_words_never_crash(self):
         fields = ('mode', 'model', 'caption', 'lyrics', 'duration', 'seed', 'batch_size', 'bpm', 'keyscale',
-                  'timesignature', 'vocal_language', 'thinking', 'steps', 'guidance_scale', 'shift', 'lora_key')
+                  'timesignature', 'vocal_language', 'thinking', 'steps', 'guidance_scale', 'shift', 'lm_temperature',
+                  'lora_key')
         values = ([], {}, ['xl-turbo'], {'a': 1}, [[1]], [None], True, False, 0, -1, 1.5, '', 'x', float('nan'),
-                  float('inf'), 10 ** 30, -10 ** 30, ' ', '\x00', 2 ** 31)
+                  float('inf'), 10 ** 30, -10 ** 30, 10 ** 400, -10 ** 400, ' ', '\x00', 2 ** 31)
         for field in fields:
             for value in values:
                 raw = valid(**{field: value})
@@ -476,6 +494,42 @@ class TestRequestInput(unittest.TestCase):
         self.check('Shift must be a number from 1 to 5.', shift=True)
         self.assertEqual(ace.request_input(valid(steps=8))['steps'], 8)
         self.assertEqual(ace.request_input(valid(model='xl-sft', steps=100))['steps'], 100)
+
+    def test_guidance_up_to_13_is_accepted_for_both_models(self):
+        # the booth's Prompt guidance dial sends 7 (dial 1), 10 (dial 2) and 13 (dial 3) for xl-sft
+        for model in ('xl-turbo', 'xl-sft'):
+            for value in (1, 1.0, 7, 7.0, 8.5, 10, 13, 13.0, 15):
+                got = ace.request_input(valid(model=model, guidance_scale=value))['guidance_scale']
+                self.assertEqual(got, value, (model, value))
+            self.check('Guidance must be a number from 1 to 15.', model=model, guidance_scale=15.1)
+
+    def test_lm_temperature_is_optional(self):
+        self.assertIsNone(ace.request_input(valid())['lm_temperature'])
+        self.assertIsNone(ace.request_input(valid(lm_temperature=None))['lm_temperature'])
+
+    def test_lm_temperature_accepts_the_whole_range_as_a_float(self):
+        for value in (0.0, 0, 0.4, 0.85, 1, 1.3, 2, 2.0):
+            for model in ('xl-turbo', 'xl-sft'):
+                got = ace.request_input(valid(model=model, lm_temperature=value))['lm_temperature']
+                self.assertEqual(got, value, (model, value))
+                self.assertIs(type(got), float, (model, value))      # 0 and 1 arrive as 0.0 and 1.0, never as bool
+
+    def test_lm_temperature_refusals_are_one_plain_sentence(self):
+        sentence = 'Creative variation must be a number from 0 to 2.'
+        for value in (-0.01, -1, 2.01, 2.5, 3, 100, 10 ** 30, 10 ** 400, -10 ** 400, float('nan'), float('inf'),
+                      float('-inf'), True, False, '1', '0.85', '', ' ', [0.85], {'t': 0.85}, [], {}):
+            self.check(sentence, lm_temperature=value)
+        self.check(sentence, model='xl-sft', lm_temperature=2.01)
+
+    def test_huge_whole_numbers_get_the_plain_sentence_not_an_overflow(self):
+        self.assertEqual(ace._real(10 ** 400), 10 ** 400)           # math.isfinite would raise OverflowError on it
+        self.check('Length must be between 10 and 600 seconds.', duration=10 ** 400)
+        self.check('Guidance must be a number from 1 to 15.', guidance_scale=10 ** 400)
+        self.check('Shift must be a number from 1 to 5.', shift=-10 ** 400)
+        self.assertIsNone(ace._real(True))
+        self.assertIsNone(ace._real(float('nan')))
+        self.assertIsNone(ace._real(float('inf')))
+        self.assertIsNone(ace._real('1'))
 
     def test_unknown_fields_are_ignored(self):
         request = ace.request_input(valid(unexpected='value', engine='yue2'))
@@ -825,6 +879,162 @@ class TestPlanner(Harness):
         out = self.run_job(batch_size=4)
         self.assertEqual(len(out['takes']), 2)
         self.assertIn('Only 2 of 4 takes fit in memory.', out['worker_notes'])
+
+
+class TestPlannerTemperature(Harness):
+    """The creative variation dial: lm_temperature reaches upstream only when the caller sets it and the planner runs."""
+
+    NOT_USED = 'The creative variation setting was not used because the planner did not run.'
+
+    def last(self):
+        return self.api.calls[-1]
+
+    def test_absent_means_not_passed(self):
+        for changes in ({}, {'lm_temperature': None}, {'model': 'xl-sft'}, {'thinking': False}, {'batch_size': 3}):
+            self.run_job(**changes)
+            self.assertFalse(hasattr(self.last().params, 'lm_temperature'), changes)
+
+    def test_a_request_without_it_gets_the_same_answer_as_before(self):
+        out = self.run_job()
+        self.assertEqual(out['controls'], {'steps': 8, 'guidance_scale': 1.0, 'shift': 3.0})
+        self.assertEqual(out['worker_notes'], ['Made with the fast model in 8 steps.'])
+        out = self.run_job(model='xl-sft')
+        self.assertEqual(out['controls'], {'steps': 50, 'guidance_scale': 7.0, 'shift': 3.0})
+        self.assertEqual(out['worker_notes'], ['Made with the best-quality model in 50 steps at guidance 7.'])
+
+    def test_the_only_difference_is_the_one_field(self):
+        self.run_job(seed=5, batch_size=2)
+        plain = self.last()
+        self.run_job(seed=5, batch_size=2, lm_temperature=1.3)
+        varied = self.last()
+        self.assertEqual({k: v for k, v in vars(varied.params).items() if k != 'lm_temperature'}, vars(plain.params))
+        self.assertEqual(vars(varied.config), vars(plain.config))
+        self.assertIs(varied.llm, plain.llm)
+        self.assertIs(varied.dit, plain.dit)
+
+    def test_it_passes_through_to_the_planner_for_both_models(self):
+        for model in ('xl-turbo', 'xl-sft'):
+            for value in (0.4, 0.85, 1.0, 1.3, 0.0, 2.0):
+                out = self.run_job(model=model, lm_temperature=value)
+                self.assertNotIn('error', out, (model, value))
+                self.assertEqual(self.last().params.lm_temperature, value, (model, value))
+                self.assertIs(type(self.last().params.lm_temperature), float, (model, value))
+                self.assertIs(self.last().params.thinking, True)
+                self.assertIs(self.last().llm, self.llm)
+
+    def test_zero_and_two_are_real_values_not_absent(self):
+        self.run_job(lm_temperature=0)
+        self.assertTrue(hasattr(self.last().params, 'lm_temperature'))
+        self.assertEqual(self.last().params.lm_temperature, 0.0)
+        self.run_job(lm_temperature=2)
+        self.assertEqual(self.last().params.lm_temperature, 2.0)
+
+    def test_it_is_recorded_in_controls_and_worker_notes(self):
+        out = self.run_job(lm_temperature=1.3)
+        self.assertEqual(out['controls'], {'steps': 8, 'guidance_scale': 1.0, 'shift': 3.0, 'lm_temperature': 1.3})
+        self.assertEqual(out['worker_notes'], ['Made with the fast model in 8 steps.',
+                                               'The planner ran at temperature 1.3.'])
+        for value, text in ((0, '0'), (0.4, '0.4'), (0.85, '0.85'), (2.0, '2')):
+            out = self.run_job(lm_temperature=value)
+            self.assertEqual(out['controls']['lm_temperature'], float(value))
+            self.assertIn(f'The planner ran at temperature {text}.', out['worker_notes'])
+            self.assertTrue(all(isinstance(note, str) and note.endswith('.') for note in out['worker_notes']))
+        self.assertNotIn(self.NOT_USED, out['worker_notes'])
+
+    def test_it_changes_nothing_else_in_the_answer(self):
+        plain = self.run_job(seed=9)
+        varied = self.run_job(seed=9, lm_temperature=1.3)
+        for name in ('engine', 'model', 'seed', 'duration_s', 'bytes', 'truncated', 'instrumental', 'thinking', 'gpu',
+                     'features', 'versions', 'memory'):
+            self.assertEqual(varied[name], plain[name], name)
+        self.assertEqual(set(varied), set(plain))
+        self.assertEqual(set(varied['timing']), set(plain['timing']))
+
+    def test_without_the_planner_it_is_not_sent_and_not_claimed(self):
+        out = self.run_job(thinking=False, lm_temperature=1.3)
+        self.assertFalse(hasattr(self.last().params, 'lm_temperature'))
+        self.assertNotIn('lm_temperature', out['controls'])
+        self.assertIn('The planner was skipped.', out['worker_notes'])
+        self.assertIn(self.NOT_USED, out['worker_notes'])
+        self.assertFalse([note for note in out['worker_notes'] if 'ran at temperature' in note])
+
+    def test_a_planner_that_could_not_load_is_treated_the_same_way(self):
+        self.planner_ok = False
+        out = self.run_job(lm_temperature=1.3)
+        self.assertNotIn('error', out)
+        self.assertFalse(hasattr(self.last().params, 'lm_temperature'))
+        self.assertNotIn('lm_temperature', out['controls'])
+        self.assertIn('The planner was not available, so the song was made without it.', out['worker_notes'])
+        self.assertIn(self.NOT_USED, out['worker_notes'])
+
+    def test_no_note_about_it_when_the_caller_sent_nothing(self):
+        for changes in ({}, {'thinking': False}):
+            out = self.run_job(**changes)
+            self.assertFalse([note for note in out['worker_notes'] if 'variation' in note or 'temperature' in note])
+
+    def test_the_planner_still_gets_the_callers_other_settings(self):
+        self.run_job(lm_temperature=0.4, bpm=90, keyscale='D minor', timesignature='3', seed=12)
+        params = self.last().params
+        self.assertEqual((params.bpm, params.keyscale, params.timesignature, params.seed), (90, 'D minor', '3', 12))
+        self.assertEqual((params.use_cot_metas, params.use_cot_caption, params.use_cot_language), (True, False, False))
+
+    def test_the_global_generators_are_still_seeded_for_the_planner(self):
+        with mock.patch.object(ace, 'seed_everything') as seeded:
+            self.run_job(seed=33, lm_temperature=1.3)
+        seeded.assert_called_once_with(33)
+
+    def test_both_dials_together_are_independent_of_each_other(self):
+        out = self.run_job(model='xl-sft', guidance_scale=10, lm_temperature=0.4)
+        params = self.last().params
+        self.assertEqual((params.guidance_scale, params.lm_temperature), (10.0, 0.4))
+        self.assertEqual(out['controls'], {'steps': 50, 'guidance_scale': 10.0, 'shift': 3.0, 'lm_temperature': 0.4})
+        out = self.run_job(model='xl-turbo', guidance_scale=10, lm_temperature=1.3)     # turbo: guidance ignored, planner dial kept
+        params = self.last().params
+        self.assertEqual((params.guidance_scale, params.lm_temperature), (1.0, 1.3))
+        self.assertEqual(out['controls'], {'steps': 8, 'guidance_scale': 1.0, 'shift': 3.0, 'lm_temperature': 1.3})
+        self.assertIn('The fast model ignores the guidance setting.', out['worker_notes'])
+
+
+class TestGuidanceDial(Harness):
+    """The booth's Prompt guidance dial reaches xl-sft as guidance_scale 7, 10 or 13 and never reaches xl-turbo."""
+
+    def last(self):
+        return self.api.calls[-1]
+
+    def test_best_quality_takes_the_dials_whole_range(self):
+        for value in (7, 10, 13, 7.0, 8.5, 13.0):
+            out = self.run_job(model='xl-sft', guidance_scale=value)
+            self.assertNotIn('error', out, value)
+            self.assertEqual(self.last().params.guidance_scale, float(value))
+            self.assertEqual(out['controls']['guidance_scale'], float(value))
+
+    def test_guidance_13_on_sft_end_to_end(self):
+        out = self.run_job(model='xl-sft', guidance_scale=13)
+        params = self.last().params
+        self.assertEqual((params.guidance_scale, params.inference_steps, params.shift), (13.0, 50, 3.0))
+        self.assertIs(params.dcw_enabled, False)
+        self.assertIn('Made with the best-quality model in 50 steps at guidance 13.', out['worker_notes'])
+        self.assertNotIn('lm_temperature', out['controls'])
+
+    def test_the_fast_model_ignores_guidance_and_says_so(self):
+        out = self.run_job(model='xl-turbo', guidance_scale=13)
+        self.assertEqual(self.last().params.guidance_scale, 1.0)
+        self.assertEqual(out['controls']['guidance_scale'], 1.0)
+        self.assertIn('The fast model ignores the guidance setting.', out['worker_notes'])
+        out = self.run_job(guidance_scale=13)               # the default model is the fast one
+        self.assertEqual(out['controls']['guidance_scale'], 1.0)
+
+    def test_without_guidance_each_model_keeps_its_own_default(self):
+        out = self.run_job(model='xl-sft')
+        self.assertEqual((self.last().params.guidance_scale, out['controls']['guidance_scale']), (7.0, 7.0))
+        out = self.run_job()
+        self.assertEqual((self.last().params.guidance_scale, out['controls']['guidance_scale']), (1.0, 1.0))
+        self.assertNotIn('The fast model ignores the guidance setting.', out['worker_notes'])
+        # an explicit 7 on sft is the same request as none
+        self.run_job(model='xl-sft', guidance_scale=7, seed=3)
+        explicit = dict(vars(self.last().params))
+        self.run_job(model='xl-sft', seed=3)
+        self.assertEqual(explicit, vars(self.last().params))
 
 
 class TestFailures(Harness):
@@ -2147,6 +2357,49 @@ class TestPinnedUpstream(unittest.TestCase):
         self.assertLessEqual(sent['params'], dataclass_fields(tree, 'GenerationParams'))
         self.assertLessEqual(sent['config'], dataclass_fields(tree, 'GenerationConfig'))
         self.assertTrue({'use_random_seed', 'seeds', 'batch_size'} <= sent['config'])
+
+    def test_lm_temperature_is_a_generation_field_and_its_default_is_the_booths_midpoint(self):
+        tree = parse('acestep/inference.py')
+        sent = {}
+
+        class Params(Record):
+            def __init__(self, **fields):
+                sent.update(fields)
+        api = SimpleNamespace(GenerationParams=Params, GenerationConfig=Record)
+        request = self.request(lm_temperature=1.3)
+        settings, _ = ace.settings_for(request)
+        ace.build_generation(api, request, settings, [1], True)
+        self.assertEqual(sent['lm_temperature'], 1.3)
+        self.assertLessEqual(set(sent), dataclass_fields(tree, 'GenerationParams'))
+        default = next(ast.literal_eval(n.value) for n in class_node(tree, 'GenerationParams').body
+                       if isinstance(n, ast.AnnAssign) and n.target.id == 'lm_temperature')
+        self.assertEqual(default, 0.85)      # the booth's dial sits at 0.85 in the middle, so the middle sends nothing
+        self.assertLessEqual(ace.LM_TEMPERATURE_MIN, default)
+        self.assertLessEqual(default, ace.LM_TEMPERATURE_MAX)
+
+    def test_the_planner_reads_lm_temperature_in_both_of_its_passes(self):
+        inference = (UPSTREAM / 'acestep' / 'inference.py').read_text(encoding='utf-8')
+        llm = (UPSTREAM / 'acestep' / 'llm_inference.py').read_text(encoding='utf-8')
+        self.assertRegex(inference, r'Sampling temperature for the LLM \(0\.0.{1,3}2\.0\)')   # the dash is not ASCII
+        self.assertIn('temperature=params.lm_temperature,', inference)
+        # it goes to generate_with_stop_condition, which hands it to the metadata pass and to the audio-codes pass
+        self.assertIn('"temperature": temperature,', llm)
+        # and the pt backend's two sampling loops divide the logits by it (the codes pass runs with CFG, the metadata pass without)
+        self.assertIn('self._sample_tokens(cfg_logits, temperature)', llm)
+        self.assertIn('self._sample_tokens(next_token_logits, temperature)', llm)
+        # the worker never sets upstream's separate per-phase temperatures, which would override this one
+        self.assertIn('self.constrained_processor.metadata_temperature = None', llm)
+        self.assertNotIn('metadata_temperature', (Path(__file__).resolve().parent / 'ace_handler.py').read_text(encoding='utf-8'))
+
+    def test_guidance_range_and_the_turbo_override_match_upstream(self):
+        controls = (UPSTREAM / 'acestep' / 'ui' / 'gradio' / 'interfaces' / 'generation_advanced_dit_controls.py'
+                    ).read_text(encoding='utf-8')
+        self.assertRegex(controls, r'guidance_scale = gr\.Slider\(\s*minimum=1\.0,\s*maximum=15\.0')
+        handler = (UPSTREAM / 'acestep' / 'core' / 'generation' / 'handler' / 'generate_music.py').read_text(encoding='utf-8')
+        self.assertIn('if self.is_turbo_model() and guidance_scale != 1.0:', handler)
+        sft = (UPSTREAM / 'acestep' / 'models' / 'xl_sft' / 'modeling_acestep_v15_xl_base.py').read_text(encoding='utf-8')
+        self.assertIn('do_cfg_guidance = diffusion_guidance_scale > 1.0', sft)     # no upper cap in the sampler
+        self.assertEqual(ace.request_input(valid(model='xl-sft', guidance_scale=15))['guidance_scale'], 15)
 
     def test_the_three_imports_exist_and_the_handlers_build_without_arguments(self):
         handler = parse('acestep/handler.py')

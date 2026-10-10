@@ -84,6 +84,9 @@ DURATION_MIN, DURATION_MAX = 10, 600
 BPM_MIN, BPM_MAX = 30, 300
 SEED_LIMIT = 2 ** 31   # seeds stay in 0..2147483647 like YuE2's, and seed + i wraps inside it
 BATCH_MAX = 4
+# GenerationParams.lm_temperature: "Sampling temperature for the LLM (0.0-2.0)", default 0.85 (inference.py:101, 204).
+# It is only sent when the caller sets it and the planner runs, so a request without it behaves as before.
+LM_TEMPERATURE_MIN, LM_TEMPERATURE_MAX = 0.0, 2.0
 SAMPLE_RATE = 48000
 URL_SECONDS = 604800
 INSTRUMENTAL = '[Instrumental]'
@@ -585,7 +588,9 @@ def _whole(value):
 
 
 def _real(value):
-    return value if type(value) in (int, float) and math.isfinite(value) else None
+    if type(value) is int:
+        return value      # a whole number is always finite; math.isfinite raises OverflowError on a huge one
+    return value if type(value) is float and math.isfinite(value) else None
 
 
 def request_input(raw):
@@ -688,11 +693,18 @@ def request_input(raw):
         shift = _real(shift)
         if shift is None or not 1 <= shift <= 5:
             raise RequestError('Shift must be a number from 1 to 5.')
+    temperature = raw.get('lm_temperature')
+    if temperature is not None:
+        temperature = _real(temperature)
+        if temperature is None or not LM_TEMPERATURE_MIN <= temperature <= LM_TEMPERATURE_MAX:
+            raise RequestError(f'Creative variation must be a number from {LM_TEMPERATURE_MIN:g} to '
+                               f'{LM_TEMPERATURE_MAX:g}.')
+        temperature = float(temperature)
 
     return dict(mode=mode, model=model, caption=caption, lyrics=lyrics, instrumental=instrumental,
                 duration=float(duration), seed=seed, batch_size=batch, bpm=bpm, keyscale=keyscale,
                 timesignature=signature, vocal_language=language, thinking=thinking, steps=steps,
-                guidance_scale=guidance, shift=shift, notes=notes)
+                guidance_scale=guidance, shift=shift, lm_temperature=temperature, notes=notes)
 
 
 def refuse_adapter(raw):
@@ -734,6 +746,15 @@ def settings_for(request):
     return dict(steps=steps, guidance_scale=float(guidance), shift=float(shift), dcw_enabled=spec['dcw']), notes
 
 
+def planner_temperature(request, planner_used):
+    """The planner temperature to send: the caller's value when one was set and the planner really runs, else None.
+
+    Upstream reads lm_temperature only inside the planner (ACE_NOTES 8.11). Without the planner (thinking false, or
+    the planner could not load) it would do nothing, so nothing is sent and the answer does not claim it was used."""
+    value = request['lm_temperature']
+    return value if planner_used and value is not None else None
+
+
 # ---------------------------------------------------------------- one render
 
 def build_generation(api, request, settings, seeds, thinking):
@@ -743,12 +764,16 @@ def build_generation(api, request, settings, seeds, thinking):
     if settings['dcw_enabled']:
         scaler, high_scaler = DCW_STRENGTHS[bool(thinking)]
         strengths = dict(dcw_scaler=scaler, dcw_high_scaler=high_scaler)
+    sampling = {}
+    temperature = planner_temperature(request, thinking)
+    if temperature is not None:
+        sampling = dict(lm_temperature=temperature)   # left out otherwise, so upstream keeps its own 0.85
     params = api.GenerationParams(
         task_type='text2music', caption=request['caption'], lyrics=request['lyrics'],
         instrumental=request['instrumental'], vocal_language=request['vocal_language'], bpm=request['bpm'],
         keyscale=request['keyscale'], timesignature=request['timesignature'], duration=request['duration'],
         inference_steps=settings['steps'], guidance_scale=settings['guidance_scale'], shift=settings['shift'],
-        dcw_enabled=settings['dcw_enabled'], seed=seeds[0], **strengths,
+        dcw_enabled=settings['dcw_enabled'], seed=seeds[0], **strengths, **sampling,
         # thinking False must skip the planner altogether: upstream still runs it for any use_cot_* flag left on.
         # The caller's wording and language are kept (use_cot_caption / use_cot_language off); the planner fills
         # tempo, key and time signature, and writes the 5 Hz audio codes the DiT follows.
@@ -916,6 +941,11 @@ def render(job, request, start):
             notes.append('The planner was not available, so the song was made without it.')
         elif not request['thinking']:
             notes.append('The planner was skipped.')
+        temperature = planner_temperature(request, llm is not None)
+        if temperature is not None:
+            notes.append(f'The planner ran at temperature {temperature:g}.')
+        elif request['lm_temperature'] is not None:
+            notes.append('The creative variation setting was not used because the planner did not run.')
         model_load_s = round(time.monotonic() - load_began, 1)
 
         # LoRA seam: a request's lora_key would be applied here (apply_adapter(dit, key)) and removed in a finally
@@ -960,13 +990,15 @@ def render(job, request, start):
     if plan_s is not None:
         timing['plan_s'] = plan_s
     first = takes[0]
+    controls = {'steps': settings['steps'], 'guidance_scale': settings['guidance_scale'], 'shift': settings['shift']}
+    if temperature is not None:
+        controls['lm_temperature'] = temperature   # only what the planner really used; absent otherwise
     output = {'engine': 'ace', 'mode': 'render', 'model': request['model'], 'key': first['key'],
               'wav_key': first['wav_key'], 'url': first['url'], 'wav_url': first['wav_url'],
               'duration_s': first['duration_s'], 'bytes': first['bytes'], 'seed': first['seed'],
               'processing_ms': int((time.monotonic() - start) * 1000), 'truncated': False, 'takes': takes,
               'instrumental': request['instrumental'], 'thinking': llm is not None,
-              'controls': {'steps': settings['steps'], 'guidance_scale': settings['guidance_scale'],
-                           'shift': settings['shift']},
+              'controls': controls,
               'timing': timing, 'memory': {'render_peak_gib': peak}, 'gpu': gpu_name(),
               'features': list(FEATURES), 'versions': versions(), 'worker_notes': notes}
     if plan:
