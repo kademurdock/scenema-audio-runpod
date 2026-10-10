@@ -162,13 +162,12 @@ def model_folder(pinned, repo, roots=None, check=None):
 
 def fetch_model(repo, revision, ignore=()):
     """The pinned revision from Hugging Face, once, for a machine whose cache lacks it. Restores offline mode after."""
-    constants, was_constant = None, None
+    constants = None
     previous = os.environ.get('HF_HUB_OFFLINE')
     try:
         os.environ['HF_HUB_OFFLINE'] = '0'
         import huggingface_hub
         constants = huggingface_hub.constants
-        was_constant = constants.HF_HUB_OFFLINE
         constants.HF_HUB_OFFLINE = False
         return Path(huggingface_hub.snapshot_download(repo, revision=revision, cache_dir=DOWNLOAD_CACHE,
                                                       ignore_patterns=list(ignore) or None))
@@ -178,7 +177,10 @@ def fetch_model(repo, revision, ignore=()):
     finally:
         os.environ['HF_HUB_OFFLINE'] = previous if previous is not None else '1'
         if constants is not None:
-            constants.HF_HUB_OFFLINE = was_constant
+            # huggingface_hub reads the variable once, when it is first imported. If that import happened inside
+            # this call, the constant was computed from the temporary '0'; set it from the restored value instead
+            # (yue_handler.fetch_model leaves it False after a download).
+            constants.HF_HUB_OFFLINE = os.environ['HF_HUB_OFFLINE'].upper() in ('1', 'ON', 'YES', 'TRUE')
 
 
 def resolve_models(download=True, only=None):
@@ -360,9 +362,12 @@ def configure_environment():
     os.environ.setdefault('ACESTEP_PROJECT_ROOT', '/tmp/ace-root')
     root = Path(os.environ['ACESTEP_PROJECT_ROOT'])
     os.environ['ACESTEP_CHECKPOINTS_DIR'] = str(checkpoints_dir())   # upstream must agree with the folder built here
+    # ACESTEP_GENERATION_TIMEOUT: upstream abandons a render after 600 s by default, which a long xl-sft song
+    # (50 steps with guidance) can exceed; the endpoint's own job timeout is the real limit.
     for name, value in (('HF_HUB_OFFLINE', '1'), ('TRANSFORMERS_OFFLINE', '1'), ('HF_HUB_DISABLE_TELEMETRY', '1'),
                         ('TOKENIZERS_PARALLELISM', 'false'), ('ACESTEP_DISABLE_TQDM', '1'),
-                        ('ACESTEP_SAVE_MEMORY', '1'), ('HF_MODULES_CACHE', '/tmp/hf-modules')):
+                        ('ACESTEP_SAVE_MEMORY', '1'), ('ACESTEP_GENERATION_TIMEOUT', '3600'),
+                        ('HF_MODULES_CACHE', '/tmp/hf-modules')):
         os.environ.setdefault(name, value)
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -460,7 +465,9 @@ def engine(model):
     if total is None or total < BOTH_MODELS_GIB:
         for other in [name for name in STATE['dit'] if name != model]:
             release_dit(STATE['dit'].pop(other))   # one DiT at a time: free the other before loading this one
-    STATE['dit'].pop(model, None)
+    stale = STATE['dit'].pop(model, None)
+    if stale is not None:
+        release_dit(stale)      # a handler whose model was lost may still hold the VAE or text encoder
     began = time.monotonic()
     STATE['dit'][model] = load_dit(model)
     print(f'ACE-Step {model} loaded in {time.monotonic() - began:.1f}s', flush=True)
@@ -536,7 +543,7 @@ def trim_caption(text, limit=CAPTION_MAX):
     return cut, f'The music description was shortened to fit {limit} characters.'
 
 
-KEYSCALE = re.compile(r'^([A-Ga-g])\s*([#b♯♭]?)\s*([A-Za-z]*)$')
+KEYSCALE = re.compile(r'^([A-Ga-g])\s*([#b\u266f\u266d]?)\s*([A-Za-z]*)$')
 
 
 def normalize_keyscale(text):
@@ -550,7 +557,7 @@ def normalize_keyscale(text):
         mode = 'minor' if match.group(3) == 'm' else 'major'
     if mode is None:
         return None
-    accidental = {'♯': '#', '♭': 'b'}.get(accidental, accidental)
+    accidental = {'\u266f': '#', '\u266d': 'b'}.get(accidental, accidental)
     return f'{note.upper()}{accidental} {mode}'
 
 
@@ -752,12 +759,18 @@ PHASES = (('Phase 1', 'Planning your song'), ('Phase 2', 'Writing the musical id
           ('Preparing inputs', 'Rendering your song'), ('Preparing audio', 'Finishing the audio'))
 
 
+def announce(job, text):
+    """Tell the booth, in a plain phrase, what the worker is doing now. Never raises."""
+    try:
+        import runpod
+        runpod.serverless.progress_update(job, text)
+    except Exception:
+        pass
+
+
 def make_progress(job, send=None):
     """A callback upstream can call as (ratio, 'text') or (ratio, desc='text'); forwards a few plain phrases."""
-    if send is None:
-        def send(text):
-            import runpod
-            runpod.serverless.progress_update(job, text)
+    send = send or (lambda text: announce(job, text))
     last = []
 
     def progress(*args, **kwargs):
@@ -873,6 +886,8 @@ def render(job, request, start):
     with tempfile.TemporaryDirectory() as td:
         client, bucket = storage()   # a missing setting fails here, before any GPU time is spent
         load_began = time.monotonic()
+        if request['model'] not in STATE['dit']:
+            announce(job, 'Loading the music model')   # xl-sft loads on its first use and takes a while
         dit = engine(request['model'])
         llm = planner() if request['thinking'] else None
         if request['thinking'] and llm is None:

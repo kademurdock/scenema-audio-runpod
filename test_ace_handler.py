@@ -653,7 +653,18 @@ class TestGenerationRequest(Harness):
 
     def test_progress_reaches_runpod_in_plain_phrases(self):
         self.run_job()
-        self.assertEqual(self.progress_log, [('job-1', 'Planning your song'), ('job-1', 'Rendering your song')])
+        self.assertEqual(self.progress_log, [('job-1', 'Loading the music model'), ('job-1', 'Planning your song'),
+                                             ('job-1', 'Rendering your song')])
+
+    def test_a_loaded_model_is_not_announced_again(self):
+        self.dits['xl-turbo'] = SimpleNamespace(model=object(), name='xl-turbo')
+        ace.STATE['dit']['xl-turbo'] = self.dits['xl-turbo']
+        self.run_job()
+        self.assertNotIn('Loading the music model', [text for _job, text in self.progress_log])
+
+    def test_progress_updates_never_break_a_render(self):
+        sys.modules['runpod'].serverless.progress_update = mock.Mock(side_effect=ConnectionError('offline'))
+        self.assertNotIn('error', self.run_job())
 
 
 class TestPlanner(Harness):
@@ -1159,6 +1170,20 @@ class TestFetchModel(unittest.TestCase):
                                 'env': '0', 'flag': False})
         self.assertIs(constants.HF_HUB_OFFLINE, True)     # yue_handler left this False; here it is put back
 
+    def test_the_hub_flag_follows_the_restored_environment_not_the_import_time_value(self):
+        # huggingface_hub reads HF_HUB_OFFLINE once, at import. A first import inside fetch_model sees the
+        # temporary '0', so the constant it holds afterwards must be rebuilt from the restored value.
+        for restored, expected in (('1', True), ('0', False), (None, True)):
+            constants = SimpleNamespace(HF_HUB_OFFLINE=False)
+            fake = SimpleNamespace(constants=constants, snapshot_download=lambda *a, **k: '/tmp/x')
+            env = {} if restored is None else {'HF_HUB_OFFLINE': restored}
+            with mock.patch.dict(sys.modules, {'huggingface_hub': fake}), mock.patch.dict(os.environ, env):
+                if restored is None:
+                    os.environ.pop('HF_HUB_OFFLINE', None)
+                ace.fetch_model('x/y', None)
+                self.assertEqual(os.environ['HF_HUB_OFFLINE'], restored if restored is not None else '1')
+            self.assertIs(constants.HF_HUB_OFFLINE, expected, restored)
+
     def test_a_failed_download_returns_none_and_restores_offline_mode(self):
         constants = SimpleNamespace(HF_HUB_OFFLINE=True)
 
@@ -1497,11 +1522,13 @@ class TestEngine(unittest.TestCase):
         self.assertEqual(self.events[0], ('resolve', {'download': True, 'only': ('sft', 'main')}))
         self.assertEqual(self.events[1], ('build', ('xl-sft',)))
 
-    def test_a_handler_whose_model_was_lost_is_loaded_again(self):
+    def test_a_handler_whose_model_was_lost_is_loaded_again_and_the_old_one_released(self):
         first = silently(ace.engine, 'xl-turbo')
         first.model = None
         second = silently(ace.engine, 'xl-turbo')
         self.assertIsNot(first, second)
+        self.assertIsNone(first.vae)           # the leftovers were let go, not just forgotten
+        self.assertIn(('release', 0), self.events)
 
     def test_a_failed_load_is_a_plain_error_and_leaves_nothing_registered(self):
         FakeDitHandler.works = False
@@ -1700,6 +1727,7 @@ class TestUpstreamImports(unittest.TestCase):
             self.assertEqual(os.environ['ACESTEP_SAVE_MEMORY'], '1')
             self.assertEqual(os.environ['ACESTEP_DISABLE_TQDM'], '1')
             self.assertEqual(os.environ['HF_HUB_OFFLINE'], '1')
+            self.assertEqual(os.environ['ACESTEP_GENERATION_TIMEOUT'], '3600')
             self.assertEqual(os.environ['ACESTEP_CHECKPOINTS_DIR'], str(ace.checkpoints_dir()))
         self.assertEqual(removed, [()])
         self.assertEqual(added[0][1], {'level': 'WARNING'})
@@ -1957,6 +1985,10 @@ class TestPinnedUpstream(unittest.TestCase):
         self.assertIn('progress(0.5, f"Phase 2:', llm)
         self.assertIn('desc="Preparing inputs..."', handler)
         self.assertIn('desc="Preparing audio data..."', payload)
+
+    def test_the_render_timeout_setting_is_the_one_upstream_reads(self):
+        text = (UPSTREAM / 'acestep' / 'core' / 'generation' / 'handler' / 'generate_music_execute.py').read_text(encoding='utf-8')
+        self.assertIn('os.environ.get("ACESTEP_GENERATION_TIMEOUT", "600")', text)
 
     def test_gpu_memory_environment_names(self):
         text = (UPSTREAM / 'acestep' / 'gpu_config.py').read_text(encoding='utf-8')
