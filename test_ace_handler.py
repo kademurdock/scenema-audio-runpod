@@ -2023,5 +2023,83 @@ class TestPinnedUpstream(unittest.TestCase):
         self.assertIn('os.environ.get("ACESTEP_CHECKPOINTS_DIR")', (UPSTREAM / 'acestep' / 'model_downloader.py').read_text(encoding='utf-8'))
 
 
+# ---------------------------------------------------------------- the built folder against upstream's own functions
+
+def load_upstream_downloader():
+    """The pinned model_downloader.py, loaded from its file under a private name. It imports only loguru, which is
+    replaced by a do-nothing logger on a machine that does not have it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('ace_test_upstream_downloader',
+                                                  UPSTREAM / 'acestep' / 'model_downloader.py')
+    module = importlib.util.module_from_spec(spec)
+    quiet = SimpleNamespace(**{name: (lambda *a, **k: None) for name in ('debug', 'info', 'warning', 'error')})
+    stub = {} if importlib.util.find_spec('loguru') else {'loguru': SimpleNamespace(logger=quiet)}
+    with mock.patch.dict(sys.modules, stub):
+        spec.loader.exec_module(module)
+    return module
+
+
+@unittest.skipIf(UPSTREAM is None, 'no clone of the pinned ACE-Step source on this machine')
+class TestLayoutPassesUpstreamsOwnChecks(CacheCase):
+    """build_checkpoints with the real pinned code folders, judged by upstream's real model_downloader functions
+    (on Linux, as in the image build, the links are real symbolic links)."""
+
+    DITS = ('acestep-v15-xl-turbo', 'acestep-v15-xl-sft')
+
+    def setUp(self):
+        super().setUp()
+        if not symlinks_allowed():
+            patcher = mock.patch.object(ace, '_link', copying_link)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.turbo = make_dit(self.root, 'ACE-Step/acestep-v15-xl-turbo', 'a' * 40)
+        self.sft = make_dit(self.root, 'ACE-Step/acestep-v15-xl-sft', 'b' * 40)
+        self.main = make_main(self.root, 'c' * 40)
+        self.target = Path(self.tmp.name) / 'ckpt'
+        ace.build_checkpoints(self.target, self.main, {self.DITS[0]: (self.turbo, 'xl_turbo'),
+                                                       self.DITS[1]: (self.sft, 'xl_sft')},
+                              UPSTREAM / 'acestep' / 'models')
+        self.downloader = load_upstream_downloader()
+
+    def test_upstream_finds_every_model_it_looks_for_so_it_never_starts_a_download(self):
+        self.assertTrue(self.downloader.check_main_model_exists(self.target))
+        self.assertTrue(self.downloader.check_vae_exists('official', self.target))
+        for name in self.DITS:
+            self.assertTrue(self.downloader.check_model_exists(name, self.target), name)
+
+    def test_upstream_sees_no_code_difference_so_its_sync_has_nothing_to_write(self):
+        for name in self.DITS:
+            self.assertEqual(self.downloader._check_code_mismatch(name, self.target), [], name)
+
+    def test_the_mismatch_check_is_not_vacuous(self):
+        victim = self.target / self.DITS[0] / 'modeling_acestep_v15_xl_turbo.py'
+        victim.write_text('# changed\n')
+        self.assertEqual(self.downloader._check_code_mismatch(self.DITS[0], self.target),
+                         ['modeling_acestep_v15_xl_turbo.py'])
+        victim.unlink()
+        self.assertEqual(self.downloader._check_code_mismatch(self.DITS[0], self.target),
+                         ['modeling_acestep_v15_xl_turbo.py'])
+
+    def test_upstreams_own_code_sync_cannot_change_the_shared_cache(self):
+        folders = (self.turbo, self.sft, self.main)
+        before = {p: p.read_bytes() for folder in folders for p in folder.rglob('*') if p.is_file()}
+        for name in self.DITS:
+            self.assertTrue(self.downloader._sync_model_code_files(name, self.target), name)
+        after = {p: p.read_bytes() for folder in folders for p in folder.rglob('*') if p.is_file()}
+        self.assertEqual(before, after)
+        for name in self.DITS:
+            self.assertEqual(self.downloader._check_code_mismatch(name, self.target), [], name)
+
+    def test_the_code_folder_is_found_from_the_installed_package_or_from_the_clone_setting(self):
+        import importlib.util
+        models = UPSTREAM / 'acestep' / 'models'
+        found = SimpleNamespace(submodule_search_locations=[str(UPSTREAM / 'acestep')])
+        with mock.patch.object(importlib.util, 'find_spec', lambda name: found):
+            self.assertEqual(ace.upstream_models_dir(), models)
+        with mock.patch.object(importlib.util, 'find_spec', lambda name: None), \
+                mock.patch.dict(os.environ, {'ACE_STEP_DIR': str(UPSTREAM)}):
+            self.assertEqual(ace.upstream_models_dir(), models)
+
+
 if __name__ == '__main__':
     unittest.main()

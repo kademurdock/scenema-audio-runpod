@@ -1,0 +1,59 @@
+# ACE-Step 1.5 XL worker image (engine "ace" in the Sound Booth), a RunPod serverless worker beside YuE2.
+# No model weights are baked in: RunPod's model cache (or the one-time download fallback in ace_handler.py) provides
+# them. Expected size is about 9 GB (CUDA torch is most of it). Every pin below was checked against the package
+# index pages and the pinned upstream's uv.lock; see "Stage 3" in ACE_NOTES.md for the reasons and the open risks.
+FROM python:3.12-slim-bookworm
+ENV PYTHONUNBUFFERED=1 HF_HUB_DISABLE_TELEMETRY=1
+RUN apt-get update && apt-get install -y --no-install-recommends git ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+
+# CUDA 12.8 torch, the same build upstream's lock file tests. The assertion stops the build if the wheel lacks the
+# kernels the target cards need: sm_86 (A40, RTX A6000) and sm_120 (RTX 5090, Blackwell). sm_89 (L40, L40S, RTX 6000
+# Ada) has no cubin of its own in PyTorch wheels; those cards run the sm_86 one (CUDA binary compatibility inside
+# the 8.x family), so asserting the literal string sm_89 would fail a correct build.
+RUN pip install --no-cache-dir torch==2.10.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+RUN python -c "import torch; flags = torch._C._cuda_getArchFlags(); print('ACE env:', torch.__version__, 'CUDA', torch.version.cuda, 'archs:', flags); assert torch.__version__.startswith('2.10.0') and str(torch.version.cuda).startswith('12.8'), torch.__version__; assert 'sm_86' in flags and 'sm_120' in flags, flags"
+
+# The pinned upstream source, used from this folder (not pip-installed: its own requirements would add gradio, fastapi,
+# numba, lightning and more). .git is dropped after the commit is verified.
+ENV ACE_STEP_COMMIT=ca1e85fe9430179831e6bc6be790c332190a3866
+RUN git clone https://github.com/ace-step/ACE-Step-1.5.git /opt/ace-step && cd /opt/ace-step && git checkout "$ACE_STEP_COMMIT" && test "$(git rev-parse HEAD)" = "$ACE_STEP_COMMIT" && rm -rf .git && ls acestep/inference.py acestep/models/xl_turbo/modeling_acestep_v15_xl_turbo.py acestep/models/xl_sft/modeling_acestep_v15_xl_base.py acestep/models/xl_sft/apg_guidance.py
+
+# Versions are upstream's uv.lock set (transformers, diffusers, hub, numpy, ...), plus runpod and boto3 at the current
+# 1.x releases. Two choices that are easy to get wrong:
+#   setuptools==71.1.0: pytorch-wavelets (DCW, on by default for xl-turbo) imports pkg_resources, which newer
+#     setuptools no longer ship; upstream pins setuptools<72 for the same reason. Without it DCW silently does nothing.
+#   requests==2.34.2: runpod 1.12.0 needs requests>=2.34.2 (upstream's lock has 2.32.5, which conflicts).
+RUN pip install --no-cache-dir setuptools==71.1.0 \
+    transformers==4.57.6 huggingface_hub==0.36.0 tokenizers==0.22.2 safetensors==0.7.0 accelerate==1.12.0 diffusers==0.37.1 \
+    numpy==2.3.5 soundfile==0.13.1 loguru==0.7.3 einops==0.8.2 vector-quantize-pytorch==1.27.20 \
+    pytorch-wavelets==1.3.0 pywavelets==1.9.0 six==1.17.0 pyyaml==6.0.3 tqdm==4.67.1 requests==2.34.2 \
+    runpod==1.12.0 boto3==1.43.100 botocore==1.43.100
+RUN pip check
+ENV PYTHONPATH=/opt/ace-step
+
+COPY ace_handler.py test_ace_handler.py /app/
+
+# Build-time checks. Nothing here needs a GPU or any model weights.
+# 1. upstream's inference code and both DiT modeling files import with this torch/transformers (no GPU: only imports).
+RUN python -c "import torch, torchaudio; import acestep.inference, acestep.handler, acestep.llm_inference, acestep.model_downloader; from acestep.inference import GenerationParams, GenerationConfig, generate_music; from acestep.handler import AceStepHandler; from acestep.llm_inference import LLMHandler; import acestep.models.xl_turbo.modeling_acestep_v15_xl_turbo, acestep.models.xl_sft.modeling_acestep_v15_xl_base; print('upstream imports ok, cuda available:', torch.cuda.is_available())"
+# 2. the DCW wavelet library works, so xl-turbo's default correction really runs (upstream skips it with a warning otherwise).
+RUN python -c "import torch; from acestep.models.common.dcw_loader import WAVELET_CACHE; from acestep.models.common.dcw_primitives import dcw_double; x = torch.randn(1, 64, 8); y = torch.randn(1, 64, 8); assert WAVELET_CACHE.get(x.device, x.dtype, 'haar') is not None, 'pytorch_wavelets cannot be imported, so DCW would do nothing'; z = dcw_double(x, y, 0.05, 0.02); assert z.shape == x.shape and not torch.equal(z, x), 'DCW changed nothing'; print('DCW wavelets ok')"
+# 3. the worker module imports, agrees with this file about the upstream commit, answers a probe job and refuses lora_key.
+RUN python -c "import os, ace_handler as a; assert os.environ['ACE_STEP_COMMIT'] == a.UPSTREAM_COMMIT, a.UPSTREAM_COMMIT; out = a.handler({'input': {'mode': 'probe'}}); assert out['engine'] == 'ace' and out['mode'] == 'probe' and out['versions']['torch'].startswith('2.10.0'), out; assert a.handler({'input': {'caption': 'x', 'duration': 60, 'lora_key': 'k'}}) == {'error': a.ADAPTER_SENTENCE}; print('worker probe ok', out['versions'])"
+# 4. the real WAV and MP3 path (soundfile, libsndfile, ffmpeg with libmp3lame): one second of noise becomes a 24-bit 48 kHz WAV and an MP3.
+RUN python -c "import pathlib, tempfile, torch, soundfile, ace_handler as a; folder = pathlib.Path(tempfile.mkdtemp()); wav, mp3, seconds = a.encode_take({'tensor': torch.randn(2, 48000) * 0.1, 'sample_rate': 48000}, folder); info = soundfile.info(str(wav)); assert (info.subtype, info.samplerate, info.channels) == ('PCM_24', 48000, 2), info; assert seconds == 1.0 and mp3.stat().st_size > 1000, (seconds, mp3.stat().st_size); print('encode ok', info.subtype, mp3.stat().st_size, 'bytes of mp3')"
+# 5. the unit tests, with the hub switched off so nothing can reach the network. The model-folder variables are not set yet.
+RUN HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m unittest test_ace_handler.py
+# 6. no weights in the image, and a size report for the build log.
+RUN test -z "$(find / -xdev -type f \( -name '*.safetensors' -o -name '*.ckpt' -o -name '*.gguf' -o -name 'pytorch_model*.bin' \) 2>/dev/null)" && du -sh /usr/local/lib/python3.12/site-packages /opt/ace-step /app
+
+# Runtime settings, set after the checks so they cannot influence them. The folders are the pinned snapshots of the
+# three repos in RunPod's model cache (revisions read from the Hugging Face API on Oct 10 2026); ace_handler.py falls
+# back to the newest complete cached snapshot, then to one download, when a pinned folder is missing.
+ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+ENV HF_HUB_CACHE=/runpod-volume/huggingface-cache/hub
+ENV ACE_TURBO_DIR=/runpod-volume/huggingface-cache/hub/models--ACE-Step--acestep-v15-xl-turbo/snapshots/d4a0b288b83ebb7e25a8c0b32c573c22e134e8ee
+ENV ACE_SFT_DIR=/runpod-volume/huggingface-cache/hub/models--ACE-Step--acestep-v15-xl-sft/snapshots/d06de46b4622f781cf07f4a013a67d591ca52819
+ENV ACE_MAIN_DIR=/runpod-volume/huggingface-cache/hub/models--ACE-Step--Ace-Step1.5/snapshots/19671f406d603126926c1b7e2adc169acbcade22
+CMD ["python", "-u", "/app/ace_handler.py"]

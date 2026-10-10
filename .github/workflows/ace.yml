@@ -1,0 +1,33 @@
+name: build-ace
+# Builds the ACE-Step XL worker image (engine "ace"). Runs only for branch ace-xl, and only when an ACE file changed,
+# or by hand. It does not touch the YuE2 or AuK images or tags.
+on:
+  push:
+    branches: [ace-xl]
+    paths: [Dockerfile.ace, ace_handler.py, test_ace_handler.py, .github/workflows/ace.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the worker without GPU charges
+        run: python -m unittest test_ace_handler.py
+      - name: Free disk for CUDA
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ace
+          push: true
+          tags: ghcr.io/kademurdock/scenema-audio-runpod:ace-${{ github.sha }}
+          cache-to: type=inline
