@@ -321,7 +321,7 @@ class TestRequestInput(unittest.TestCase):
     def test_defaults(self):
         request = ace.request_input({'caption': 'jazz trio', 'duration': 120})
         self.assertEqual((request['mode'], request['model']), ('render', 'xl-turbo'))
-        self.assertEqual((request['batch_size'], request['vocal_language'], request['thinking']), (1, 'en', True))
+        self.assertEqual((request['batch_size'], request['vocal_language'], request['thinking']), (1, 'unknown', True))
         self.assertIsNone(request['seed'])
         self.assertIsNone(request['bpm'])
         self.assertEqual((request['keyscale'], request['timesignature']), ('', ''))
@@ -671,7 +671,7 @@ class TestGenerationRequest(Harness):
         self.run_job()
         params = self.last().params
         self.assertEqual((params.bpm, params.keyscale, params.timesignature), (None, '', ''))
-        self.assertEqual(params.vocal_language, 'en')
+        self.assertEqual(params.vocal_language, 'unknown')
 
     def test_long_caption_is_trimmed_and_noted(self):
         out = self.run_job(caption='ambient texture ' * 80)

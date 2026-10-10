@@ -663,7 +663,7 @@ def request_input(raw):
             raise RequestError('Time signature must be 2, 3, 4 or 6.')
 
     language = raw.get('vocal_language')
-    language = 'en' if language in (None, '') else language
+    language = 'unknown' if language in (None, '') else language
     if not isinstance(language, str) or language.strip().lower() not in VALID_LANGUAGES:
         raise RequestError('Vocal language must be a short code such as en.')
     language = language.strip().lower()

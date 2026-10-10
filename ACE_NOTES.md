@@ -221,8 +221,8 @@ Behaviours that are easy to get wrong (all READ):
    user_metadata is never empty in the worker, still guard it.
 3. THE LM OVERWRITES THE CAPTION AND THE LANGUAGE by default. With `use_cot_caption=True` the DiT's caption becomes the LM's rewritten caption
    (inference.py:825-826); with `use_cot_language=True` the DiT language becomes the LM's detection (827-828; user language is not part of
-   the metadata sent to the LM, 672-700). Recommended: `use_cot_language = False` whenever the caller gave `vocal_language` (stage 2 defaults it to "en",
-   so effectively always False); `use_cot_caption` is a product decision (upstream default True expands a short direction into a rich one;
+   the metadata sent to the LM, 672-700). Recommended: `use_cot_language = False` whenever the caller gave `vocal_language` (the worker never turns it on, and an absent
+   vocal_language is sent as "unknown", upstream's own default, because the booth has no Language setting and the family writes in other languages); `use_cot_caption` is a product decision (upstream default True expands a short direction into a rich one;
    False keeps the caller's exact words). Record the choice in `worker_notes`.
 4. If bpm + keyscale + timesignature + duration are ALL supplied, phase 1 (metadata CoT) is skipped (llm_inference.py:1245-1251, 1367, 1423-1429)
    and the caption is not rewritten, but phase 2 (audio codes) still runs when thinking is True. With only some supplied, the constrained decoder
