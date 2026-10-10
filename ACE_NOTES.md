@@ -594,17 +594,17 @@ Image size (estimate, not measured): torch + CUDA libraries about 7 to 8 GB, ffm
 
 ### 8.3 Build-time checks in `Dockerfile.ace` (all CPU, no weights, no network except the build's own installs)
 
-1. Arch assertion (right after torch is installed), then `pip check` after the pinned set.
-2. Upstream imports: `torch, torchaudio, acestep.inference, acestep.handler, acestep.llm_inference, acestep.model_downloader`, the names `GenerationParams, GenerationConfig, generate_music, AceStepHandler, LLMHandler`, AND both DiT modeling files
+The numbers match the numbered comments in the Dockerfile. Before them: the arch assertion (right after torch is installed) and `pip check` (after the pinned set).
+1. Upstream imports: `torch, torchaudio, acestep.inference, acestep.handler, acestep.llm_inference, acestep.model_downloader`, the names `GenerationParams, GenerationConfig, generate_music, AceStepHandler, LLMHandler`, AND both DiT modeling files
    (`acestep.models.xl_turbo.modeling_acestep_v15_xl_turbo`, `acestep.models.xl_sft.modeling_acestep_v15_xl_base`), which import transformers internals, einops and vector_quantize_pytorch the way the real load will. `torch.cuda.is_available()` is printed (False in the build).
-3. DCW: `WAVELET_CACHE.get(cpu, float32, 'haar')` is not None and `dcw_double(...)` on random CPU latents changes the tensor (the correction really runs).
-4. Worker module: `import ace_handler`; `ACE_STEP_COMMIT` equals `UPSTREAM_COMMIT`; a `mode: probe` job returns `engine: ace` and torch `2.10.0...`; a `lora_key` job returns the refusal sentence.
-5. Real encoding: `encode_take` on one second of noise (real soundfile, libsndfile, ffmpeg with libmp3lame) gives a 24-bit, 48 kHz, 2-channel WAV and a non-trivial MP3.
-6. `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m unittest test_ace_handler.py` (the model-folder variables are not set yet, so no test can find or fetch a model). In the image the upstream clone exists, so `TestPinnedUpstream` and the five layout tests run too
+2. DCW: `WAVELET_CACHE.get(cpu, float32, 'haar')` is not None and `dcw_double(...)` on random CPU latents changes the tensor (the correction really runs).
+3. Worker module: `import ace_handler`; `ACE_STEP_COMMIT` equals `UPSTREAM_COMMIT`; a `mode: probe` job returns `engine: ace` and torch `2.10.0...`; a `lora_key` job returns the refusal sentence.
+4. Real encoding: the ffmpeg encoder list must name `libmp3lame` and `pcm_s24le`; then `encode_take` on one second of noise (real soundfile, libsndfile, ffmpeg) gives a 24-bit, 48 kHz, 2-channel WAV and a non-trivial MP3.
+5. `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m unittest test_ace_handler.py` (the model-folder variables are not set yet, so no test can find or fetch a model). In the image the upstream clone exists, so `TestPinnedUpstream` and the five layout tests run too
    (and `test_weights_are_links_into_the_snapshot_and_code_is_copied`, the real-symlink test that is skipped on this PC).
-7. No `*.safetensors`, `*.ckpt`, `*.gguf` or `pytorch_model*.bin` anywhere on the root filesystem, then the size report.
+6. No `*.safetensors`, `*.ckpt`, `*.gguf` or `pytorch_model*.bin` anywhere on the root filesystem, then the size report.
 Local emulation done: check 3's exact code ran against `ace_handler` with a stub torch (passed); the WAV half of check 4 ran with real numpy and soundfile (FLOAT, 48000, 2 channels, 1.0 s); the unit tests passed with a stub torch and loguru on the path,
-with `HF_HUB_OFFLINE=1`, and on Python 3.12 where numpy, soundfile and huggingface_hub are really installed. Checks 1, 2, the ffmpeg half of 4 and 7 could not run here.
+with `HF_HUB_OFFLINE=1`, and on Python 3.12 where numpy, soundfile and huggingface_hub are really installed. The arch assertion, `pip check`, checks 1 and 2, the ffmpeg half of 4 and check 6 could not run here.
 If a check fails in CI, its line in the log says which assumption broke; none of them needs a GPU, so a fix can be iterated without RunPod spend.
 
 ### 8.4 The workflow `.github/workflows/ace.yml` (name `build-ace`)
@@ -660,7 +660,7 @@ What a stale pin means: if a repo's `main` moves, RunPod's cache holds a new sha
 - This PC (Windows, no torch, no network): from `F:/KadeAI-work/ace/worker`, `python -I -B -m unittest discover -s . -p "test_ace_handler.py"` (Python 3.14 or the 3.12 install) -> `Ran 190 tests ... OK (skipped=1)`; the one skip is the real-symlink test. `python -I -m unittest test_ace_handler.py` does NOT work (isolated mode cannot find the module); without `-I` the plain form works.
   Plain `python -m unittest` over the whole folder also runs the YuE tests, which have 6 problems on this PC that predate this work (torch missing; hash checks against CRLF files).
 - CI runner (Linux, no clone, no torch): `python -m unittest test_ace_handler.py` from the repo root -> 190 tests, 21 skipped (everything that needs the upstream source), 0 failures expected.
-- Image build (Linux, torch, clone at `/opt/ace-step`): check 6 above -> 190 tests, nothing skipped expected. On a pod: `cd /app && python -m unittest test_ace_handler.py`.
+- Image build (Linux, torch, clone at `/opt/ace-step`): check 5 above -> 190 tests, nothing skipped expected. On a pod: `cd /app && python -m unittest test_ace_handler.py`.
 - Against another clone of the pinned source: `ACE_UPSTREAM_DIR=<folder>` (the tests look there first, then `/opt/ace-step`, then the F: clone).
 - By hand on a pod, no GPU needed for the first line: `python -c "import ace_handler as a; print(a.handler({'input': {'mode': 'probe'}}))"`.
 
@@ -691,7 +691,7 @@ Capture for every job the whole answer (`timing`, `memory`, `gpu`, `worker_notes
 
 ### 8.9 Not verified in stage 3 (honest list)
 
-- No Docker build, no Linux, no GPU: every build-time check except the ones emulated in 8.3 is unexercised, and a CI failure on first run is possible. The most likely suspects, in order: the arch-flag string format or the sm_120 token (check 1), an import of a transformers internal in the XL modeling files (check 2), `pip check` complaints from floating transitive packages, the ffmpeg encoders (check 4), a unit test that behaves differently with real torch and loguru on the path (emulated with stubs only).
+- No Docker build, no Linux, no GPU: every build-time check except the ones emulated in 8.3 is unexercised, and a CI failure on first run is possible. The most likely suspects, in order: the arch-flag string format or the sm_120 token (the arch assertion), an import of a transformers internal in the XL modeling files (check 1), `pip check` complaints from floating transitive packages, the ffmpeg encoders (check 4), a unit test that behaves differently with real torch and loguru on the path (emulated with stubs only).
 - The pin set was checked from package metadata, not by a real pip resolve. Floating transitive packages can change between today and the first build; if `pip check` or an import fails after such a change, freeze the closure listed by `closure.py`.
 - The RunPod model-cache semantics (several repos on one endpoint, revision choice) come from one summarised documentation page plus the YuE2 evidence, not from the endpoint.
 - GitHub behaviour (path filters on the first push of a new branch, `workflow_dispatch` needing the file on the default branch, `GITHUB_TOKEN` write access to the existing package) is from general knowledge, not tested.
