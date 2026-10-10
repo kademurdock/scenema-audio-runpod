@@ -30,6 +30,9 @@ SECRET_CAPTION = 'ZEBRA-CAPTION-SENTINEL for the log check'
 SECRET_LYRICS = 'KANGAROO-LYRICS-SENTINEL for the log check'
 
 
+ACE_REAL_LINK = ace._link
+
+
 def reset_state():
     ace.STATE.update(ckpt=None, built=set(), dit={}, llm=None, planner_tries=0, api=None, env=False)
     ace.RESOLVED.clear()
@@ -1302,6 +1305,16 @@ class TestBuildCheckpoints(CacheCase):
         after = {p: p.read_bytes() for p in self.turbo.iterdir() if p.is_file()}
         self.assertEqual(before, after)
 
+    def test_link_is_an_os_symlink_that_knows_folders_from_files(self):
+        calls = []
+        folder, file = self.main / 'vae', self.turbo / 'config.json'
+        with mock.patch.object(ace, '_link', ACE_REAL_LINK), \
+                mock.patch.object(ace.os, 'symlink', lambda *a, **k: calls.append((a, k))):
+            ACE_REAL_LINK(folder, self.target / 'vae')
+            ACE_REAL_LINK(file, self.target / 'config.json')
+        self.assertEqual(calls, [((str(folder), str(self.target / 'vae')), {'target_is_directory': True}),
+                                 ((str(file), str(self.target / 'config.json')), {'target_is_directory': False})])
+
     def test_python_files_are_never_linked_but_weights_and_json_are(self):
         linked = []
 
@@ -1866,6 +1879,20 @@ class TestPinnedUpstream(unittest.TestCase):
         self.assertLessEqual(sent['params'], dataclass_fields(tree, 'GenerationParams'))
         self.assertLessEqual(sent['config'], dataclass_fields(tree, 'GenerationConfig'))
         self.assertTrue({'use_random_seed', 'seeds', 'batch_size'} <= sent['config'])
+
+    def test_the_three_imports_exist_and_the_handlers_build_without_arguments(self):
+        handler = parse('acestep/handler.py')
+        llm = parse('acestep/llm_inference.py')
+        inference = parse('acestep/inference.py')
+        class_node(handler, 'AceStepHandler')
+        class_node(llm, 'LLMHandler')
+        function_node(inference, 'generate_music')
+        class_node(inference, 'GenerationParams')
+        class_node(inference, 'GenerationConfig')
+        for tree, name in ((handler, 'AceStepHandler'), (llm, 'LLMHandler')):
+            init = function_node(tree, '__init__', inside=name)
+            required = len(init.args.args) - 1 - len(init.args.defaults)       # minus self, minus defaulted
+            self.assertEqual(required, 0, name)
 
     def test_generate_music_signature_and_result(self):
         tree = parse('acestep/inference.py')
