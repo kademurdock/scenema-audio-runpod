@@ -13,7 +13,21 @@ How facts were obtained:
 - INFERENCE = reasoned from code or docs, not observed.
 
 Contents: 1 Python API (a) | 2 dependencies and install recipe (b) | 3 cache layout vs upstream layout and the three
-HF repos (c) | 4 things that will bite (d) | 5 yue_handler.py conventions to reuse (e) | 6 suggested shape of stage 2.
+HF repos (c) | 4 things that will bite (d) | 5 yue_handler.py conventions to reuse (e) | 6 suggested shape of stage 2 | 7 not verified.
+
+TL;DR for stage 2 (details and citations below):
+1. Entry point: `acestep.inference.generate_music(dit, llm, GenerationParams, GenerationConfig, save_dir=None)`; two handlers are created by hand
+   (`AceStepHandler().initialize_service(...)`, `LLMHandler().initialize(...)`), both return `(status, ok)` and never raise. Returns CPU float32 tensors at 48 kHz, stereo; the worker writes its own files.
+2. Model selection is by checkpoint FOLDER NAME under one flat checkpoints dir (`acestep-v15-xl-turbo`, `acestep-v15-xl-sft`, plus `vae`, `Qwen3-Embedding-0.6B`, `acestep-5Hz-lm-1.7B`,
+   and a weighted `acestep-v15-turbo` that upstream insists on). Build that dir at boot from symlinks into the RunPod snapshots, but give each DiT a REAL directory with the pinned
+   upstream `*.py` files COPIED in, otherwise upstream's code sync writes through symlinks into the shared cache (1.2, 3.3).
+3. Fully offline works: every `from_pretrained` on the generation path takes a local folder (1.2).
+4. LM backend: `pt` (no compiler, no flash-attn; nano-vllm would run eager without flash-attn on 3.12). Planner time under `pt` is probably as large as the xl-turbo render (1.3, estimate).
+5. Gotchas that change results: `use_random_seed=False` plus an explicit `seeds` list, seed the global RNG for the LM, `thinking=False` needs the three `use_cot_*` flags off too, the LM rewrites caption
+   and language unless told not to, xl-sft gets `dcw_enabled=False`, shift 3.0 for both, steps 8 vs 50 (1.4, 1.6).
+6. Install: torch 2.10.0 + torchaudio 2.10.0 from the cu128 index, transformers 4.57.6, diffusers 0.37.1 and the short list in 2.3; clone upstream at the pinned commit onto `PYTHONPATH`, do not pip-install it.
+   Arch assertion on `sm_86` and `sm_120`, not `sm_89` (2.3).
+7. Silence loguru's INFO sink: it prints captions and lyrics into RunPod logs (4.4).
 
 ---------------------------------------------------------------------------------------------------------------------
 
@@ -56,10 +70,12 @@ passed as `config_path` ("acestep-v15-xl-turbo" or "acestep-v15-xl-sft"). Three 
    absolute path still works for this one).
 
 CODE SYNC (important): before loading, `_sync_model_code_if_needed` (init_service_downloads.py:64-76) hashes every `*.py` in
-`acestep/models/<variant>/` (xl_turbo: `configuration_acestep_v15.py`, `modeling_acestep_v15_xl_turbo.py`; xl_sft: those plus
-`apg_guidance.py`, file `modeling_acestep_v15_xl_base.py`) against the same names inside the checkpoint folder and, on any
-difference, OVERWRITES the checkpoint folder's copies with `shutil.copy2` (model_downloader.py:60-133). The pinned commit's
-`modeling_acestep_v15_xl_turbo.py` is 109,260 bytes, the HF repo's is 103,821 bytes (HF-LISTING), so they differ and the sync
+`acestep/models/<variant>/` (xl_turbo: `configuration_acestep_v15.py`, `modeling_acestep_v15_xl_turbo.py`; xl_sft:
+`configuration_acestep_v15.py`, `apg_guidance.py`, `modeling_acestep_v15_xl_base.py`) against the same names inside the checkpoint
+folder and, on any difference, OVERWRITES the checkpoint folder's copies with `shutil.copy2` (model_downloader.py:60-133).
+Blob sizes in the pinned commit vs the HF repos (HF-LISTING): `modeling_acestep_v15_xl_turbo.py` 109,260 vs 103,821;
+`modeling_acestep_v15_xl_base.py` 108,816 vs 105,981; `configuration_acestep_v15.py` is a 212-byte re-export of
+`acestep.models.common` upstream vs 13,225 bytes on the Hub; `apg_guidance.py` 602 vs 8,340. They all differ, so the sync
 WILL fire on an unprepared snapshot. On a RunPod cache snapshot those files are symlinks into `blobs/`; `copy2` onto a symlink
 writes through to the shared blob (or fails if read-only). So never point `config_path` at a snapshot folder directly. The
 pinned upstream code expects its own modeling files: the pinned `service_generate_execute.py:103-141` passes `dcw_*`, `repaint_*`,
@@ -163,7 +179,7 @@ progress=None) -> GenerationResult` (inference.py:514-521). Decorator `_get_spac
 | lyrics | `lyrics` | str, "" | Instrumental = the literal string `"[Instrumental]"`. `GenerationParams.instrumental` is NOT consumed by text2music (grep: only echoed in params and used by create_sample), so set the lyrics string. Lyric tokens truncate silently at 2048 (conditioning_text.py:138-144); 4096 chars of normal English is ~1,100 tokens. Lyrics are wrapped as `# Languages\n<lang>\n\n# Lyric\n<lyrics><|endoftext|>` (prompt_utils.py:27-29). |
 | duration | `duration` | float, -1.0 (auto) | seconds, 10-600 (constants.py:58-59). The LM clamps its target to `[10, min(gpu tier max, 600)]` (llm_inference.py:266-278). |
 | bpm | `bpm` | Optional[int], None | 30-300 (constants.py:52-53). |
-| keyscale | `keyscale` | str, "" | LM and constrained decoder use exactly `"<A-G><''|#|b|♯|♭> <major|minor>"`, lowercase mode, e.g. "G major", "F# minor" (constants.py:27-42). Normalise "A Minor"->"A minor"; drop an unparsable value with a worker note. |
+| keyscale | `keyscale` | str, "" | LM and constrained decoder use exactly `"<A-G><accidental> <major|minor>"` with accidental none, `#`, `b`, or the Unicode sharp/flat signs, lowercase mode, e.g. "G major", "F# minor" (constants.py:27-42). Normalise "A Minor"->"A minor"; drop an unparsable value with a worker note. |
 | timesignature | `timesignature` | str, "" | "2","3","4","6" (constants.py:66; docs INFERENCE.md:348), passed as a string. |
 | vocal_language | `vocal_language` | str, "unknown" | ISO-ish code from `VALID_LANGUAGES` (constants.py:13-20: 'en','es','fr',...,'yue','zh','unknown'). Pass "en" explicitly. |
 | seed | `GenerationConfig.seeds` (see 1.5) | int | see seed handling below |
@@ -205,7 +221,7 @@ Behaviours that are easy to get wrong (all READ):
    (inference.py:825-826); with `use_cot_language=True` the DiT language becomes the LM's detection (827-828; user language is not part of
    the metadata sent to the LM, 672-700). Recommended: `use_cot_language = False` whenever the caller gave `vocal_language` (stage 2 defaults it to "en",
    so effectively always False); `use_cot_caption` is a product decision (upstream default True expands a short direction into a rich one;
-   False keeps her exact words). Record the choice in `worker_notes`.
+   False keeps the caller's exact words). Record the choice in `worker_notes`.
 4. If bpm + keyscale + timesignature + duration are ALL supplied, phase 1 (metadata CoT) is skipped (llm_inference.py:1245-1251, 1367, 1423-1429)
    and the caption is not rewritten, but phase 2 (audio codes) still runs when thinking is True. With only some supplied, the constrained decoder
    injects the given values and the LM fills the rest (user_metadata, inference.py:672-700).
@@ -423,7 +439,7 @@ a list) is not answerable from upstream; the research file says caching handles 
 4. LOG PRIVACY AND VOLUME. loguru's default sink prints at INFO the full DiT text input including the caption and lyrics (handler `conditioning_text.py:118-125`) and the LM prompt with caption and lyrics
    (`llm_inference.py:1377,1490`). RunPod keeps worker logs. Remove the default sink at import (`from loguru import logger; logger.remove(); logger.add(sys.stderr, level="WARNING")`) and never return upstream's
    `error`/`status_message` text (it embeds tracebacks). `yue_handler` logs only exception types (lines 1428-1429); do the same.
-5. LM REWRITES CAPTION AND LANGUAGE BY DEFAULT (1.4 item 3). Left at defaults, her "Music direction" is replaced by the LM's own caption and her language is replaced by the LM's guess.
+5. LM REWRITES CAPTION AND LANGUAGE BY DEFAULT (1.4 item 3). Left at defaults, the booth's "Music direction" text is replaced by the LM's own caption and the caller's language is replaced by the LM's guess.
 6. THINKING=FALSE STILL RUNS THE LM unless the three `use_cot_*` flags are also False (1.4 item 2).
 7. SEEDS (1.4 item 1): without `use_random_seed=False` the reported seed would not reproduce anything; the LM is unseeded for batch 1; `seed + i` must stay in range.
 8. PT PLANNER TIME may exceed the render time (1.3). Surface `timing.plan_s`; cost accounting by execution seconds will see it. A 6-minute song with thinking on is the worst case (about 1,800 codes).
@@ -509,6 +525,12 @@ test_ace_handler.py   fake pipeline (callable returning a fake GenerationResult)
 Dockerfile.ace        recipe 2.3 + COPY ace_handler.py test_ace_handler.py + build-time checks
 .github/workflows/ace.yml
 ```
+Probe mode (contract): `resolve_models()` + (optional, cheap, symlinks only) `build_checkpoints()` + `torch.cuda.is_available()` / device name; report
+`models` as the three `how` strings plus the resolved snapshot folder NAMES (sha only, no paths with job data), `versions = {ace_step_commit: os.environ['ACE_STEP_COMMIT'],
+torch: torch.__version__ (None if import fails), worker: os.environ.get('ACE_WORKER_VERSION')}`. No weights are read, so it stays cheap.
+Boot self-checks worth logging (each is one line): `torch.cuda.is_available()` (a CPU-only boot would silently pick GPU tier 1, 240 s max, gpu_config.py:317-334, 753-757),
+`_check_code_mismatch(...) == []` after building, the `initialize_service` status text (Attention / Dtype lines, init_service_setup.py:166-178) and `llm.llm_backend`.
+
 Open decisions for stage 2 / the orchestrator (each is a product call, not a technical one): whether the LM may rewrite the caption (1.4 item 3); whether to expose `ACE_LM_BACKEND`; whether sft is resolved at boot
 (read-only check) or only on first use; whether to cap `batch_size` at 1 for sft until the VRAM guard behaviour is observed. The smoke test should print, per model: init status string (attention, dtype), LM backend actually used, and the
 `time_costs` keys, because those are the unknowns above.
