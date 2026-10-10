@@ -13,7 +13,9 @@ How facts were obtained:
 - INFERENCE = reasoned from code or docs, not observed.
 
 Contents: 1 Python API (a) | 2 dependencies and install recipe (b) | 3 cache layout vs upstream layout and the three
-HF repos (c) | 4 things that will bite (d) | 5 yue_handler.py conventions to reuse (e) | 6 suggested shape of stage 2 | 7 not verified.
+HF repos (c) | 4 things that will bite (d) | 5 yue_handler.py conventions to reuse (e) | 6 suggested shape of stage 2 | 7 not verified |
+8 stage 3: the image, CI, endpoint settings, model-cache resolution, tests, smoke-test watch list (Dockerfile.ace, ace.yml).
+Stage 3 supersedes parts of section 2.3 (pins) and 3.5 (revisions): see 8.2.
 
 TL;DR for stage 2 (details and citations below):
 1. Entry point: `acestep.inference.generate_music(dit, llm, GenerationParams, GenerationConfig, save_dir=None)`; two handlers are created by hand
@@ -325,6 +327,8 @@ RUN pip install --no-cache-dir transformers==4.57.6 huggingface_hub==0.36.0 toke
     pyyaml tqdm 'runpod>=1.7,<2' 'boto3>=1.35,<2' 'requests>=2.32,<3'
 ENV PYTHONPATH=/opt/ace-step ACE_STEP_COMMIT=ca1e85fe9430179831e6bc6be790c332190a3866
 ```
+STAGE 3 CORRECTIONS to this recipe (the shipped file is `Dockerfile.ace`, details in 8.2): `setuptools==71.1.0` and `six==1.17.0` were added (pytorch-wavelets needs `pkg_resources`), `requests` is 2.34.2 not 2.32.x
+(runpod 1.12.0 needs it), runpod, boto3 and botocore are exact pins, and the lock-file version of every other package is used as listed here.
 Notes on the recipe:
 - Mirrors `Dockerfile.yue` lines 10-15 (same base, same cu128 index, same git clone + checkout style). pip resolves `torch==2.10.0` to the `+cu128` build from that
   index exactly as Dockerfile.yue:13 does; later `pip install` calls will not replace it because `==2.10.0` is satisfied by `2.10.0+cu128`.
@@ -541,4 +545,154 @@ Open decisions for stage 2 / the orchestrator (each is a product call, not a tec
 - HF-LISTING facts (file names, sizes, config.json content, shas) came through a summarising fetch tool; names are consistent with upstream's downloader code, but treat sizes and shas as "re-verify before pinning".
 - Upstream issue #1299 (DCW and xl-sft) and issue numbers quoted by the research file could not be read (GitHub is off limits); the DCW handling above is from the pinned source and docs.
 - Whether `torchaudio` 2.10 import needs torchcodec at import time is not established; the build-time `import acestep.inference` check will show it. If it does, add `torchcodec==0.10.0` (it needs the apt FFmpeg libraries).
-- Whether `pytorch-wavelets` pulls `scipy`/`six` transitively is left to pip; the build-time import check covers it.
+- Whether `pytorch-wavelets` pulls `scipy`/`six` transitively is left to pip; the build-time import check covers it. (Settled in stage 3, see 8.2: it declares numpy, six and torch, imports `pkg_resources` and `pywt`, and imports no scipy.)
+
+---------------------------------------------------------------------------------------------------------------------
+
+## 8. Stage 3: the worker image, CI, endpoint settings, tests and the smoke-test watch list (Oct 10 2026)
+
+What was and was not run: nothing in this section ran on Docker, Linux, a GPU or GitHub (none exist on this PC, and the rules forbid GitHub, RunPod and paid APIs).
+What WAS done: read-only metadata reads of PyPI (JSON pages), the PyTorch wheel index page, the Hugging Face model API (JSON, shas and file lists) and one RunPod documentation page
+(summarised by the fetch tool); a static validation of both new files (parse, quoting, COPY sources, pins, commit and sha agreement, 190 unit tests on Python 3.12 and 3.14); and local emulations
+of parts of the build-time checks (8.3). Scratch scripts live in `F:/KadeAI-work/ace/scratch/` (`check_pins.py`, `closure.py`, `validate_ace_files.py`); they are not part of the repo.
+
+### 8.1 What stage 3 added
+
+- `Dockerfile.ace` (single stage, `python:3.12-slim-bookworm`, no weights, expected about 9 GB), `.github/workflows/ace.yml`, and five tests in `test_ace_handler.py` (class `TestLayoutPassesUpstreamsOwnChecks`):
+  they build the checkpoints folder with the REAL pinned code folders and judge it with upstream's own `check_main_model_exists`, `check_vae_exists`, `check_model_exists`, `_check_code_mismatch` and
+  `_sync_model_code_files` (loaded from the pinned `model_downloader.py` by file path), and test `upstream_models_dir()`. On this Windows PC the links are copies (no symlink rights); in the image build they are real symlinks.
+  Mutation check: removing the code copy, the 2B placeholder file or the clone-folder lookup each makes these tests fail.
+- No change to `ace_handler.py` and none to any YuE2 or AuK file.
+
+### 8.2 The image recipe, the pins and how they were checked
+
+Order of the Dockerfile (cheap-to-change last): apt (git, ffmpeg, libsndfile1) -> torch and torchaudio from the cu128 index -> arch assertion -> `git clone` of the ACE-Step repo, `git checkout ca1e85f...`, verify `HEAD`,
+delete `.git` -> one `pip install` of the pinned set -> `pip check` -> `ENV PYTHONPATH=/opt/ace-step` -> `COPY ace_handler.py test_ace_handler.py /app/` -> build-time checks (8.3) -> runtime `ENV` -> `CMD python -u /app/ace_handler.py`.
+`ACE_STEP_COMMIT` is an `ENV` set before the clone so the same value is used by the build and reported by the worker (`versions.ace_step_commit`); check 3 asserts it equals `ace_handler.UPSTREAM_COMMIT`.
+
+| what | pin | how it was checked |
+|---|---|---|
+| torch, torchaudio | 2.10.0 / 2.10.0 from `https://download.pytorch.org/whl/cu128` | index page lists `torch-2.10.0+cu128-cp312-cp312-manylinux_2_28_x86_64.whl` and the torchaudio one; same torch as Dockerfile.yue's main env |
+| transformers, huggingface_hub, tokenizers, safetensors, accelerate, diffusers, numpy, soundfile, loguru, einops, vector-quantize-pytorch, pytorch-wavelets, pywavelets, six, pyyaml, tqdm | 4.57.6, 0.36.0, 0.22.2, 0.7.0, 1.12.0, 0.37.1, 2.3.5, 0.13.1, 0.7.3, 0.8.2, 1.27.20, 1.3.0, 1.9.0, 1.17.0, 6.0.3, 4.67.1 | upstream `uv.lock` values. Each version exists on PyPI, is not yanked, requires a Python that includes 3.12, and ships a wheel installable on CPython 3.12 / glibc linux x86_64 (no compiler in the slim image). Every declared requirement of each package agrees with the other pins (script `check_pins.py`, 0 conflicts) |
+| setuptools | 71.1.0 | uv.lock value and upstream's `setuptools<72`. WHY: `pytorch_wavelets/dtcwt/coeffs.py` does `from pkg_resources import resource_stream` at module level (read from the 1.3.0 wheel, in memory). The latest setuptools (84.0.0) wheel has NO `pkg_resources`; 71.1.0 and 80.9.0 do. Without it `from pytorch_wavelets import DWT1DForward` fails, and upstream's lazy loader (`dcw_loader.py:34-46`) only logs a warning and skips DCW. DCW is on by default for xl-turbo, so that would silently change the sound. Build check 2 proves the wavelets work |
+| requests | 2.34.2 | runpod 1.12.0 requires `requests>=2.34.2`, `urllib3>=2.7.0`, `boto3>=1.43.66`, `cryptography>=50`, `fastapi[all]>=0.141.1` (PyPI metadata). Upstream's lock has requests 2.32.5, which would conflict with runpod; the range `requests>=2.32,<3` in the recon recipe would have resolved fine, but an exact pin has to follow runpod |
+| runpod, boto3, botocore | 1.12.0, 1.43.100, 1.43.100 | newest runpod 1.x (2026-08-10); boto3 from 2026-09-22 (about 3 weeks old, still the 1.43 series); boto3 needs `botocore>=1.43.100,<1.44` and they release in lockstep. The YuE2 image installs `runpod>=1.7,<2` and `boto3>=1.35,<2` unpinned, so it very probably runs the same series (assumption: its build date is not recorded here) |
+| everything else (urllib3, certifi, fastapi, aiohttp, pydantic, cryptography, paramiko, pillow, einx, hf-xet, ...) | floats to the newest that pip's resolver accepts | the closure of the whole set (83 packages, torch and triton excluded) was walked on PyPI metadata (`closure.py`): every package in it has a CPython 3.12 linux x86_64 wheel. A real pip resolve was NOT run |
+
+Not installed on purpose: upstream itself (gradio, fastapi UI, numba, lightning, tensorboard...), torchvision, torchcodec, torchao (contract: no INT8), peft, lycoris, scipy (no import of it on this path), flash-attn, nano-vllm, triton as a direct pin (torch brings its own).
+`triton` arrives with torch on Linux, as 2.1 said (the lock lists it as a dependency of torch 2.10.0+cu128, and the cu128 index has a triton page).
+
+Hub revisions: `GET https://huggingface.co/api/models/<repo>` on Oct 10 2026 returned exactly the shas that stage 1 copied from the summarising fetch tool: `ACE-Step/acestep-v15-xl-turbo` d4a0b288b83ebb7e25a8c0b32c573c22e134e8ee,
+`ACE-Step/acestep-v15-xl-sft` d06de46b4622f781cf07f4a013a67d591ca52819, `ACE-Step/Ace-Step1.5` 19671f406d603126926c1b7e2adc169acbcade22 (all public, not gated, last modified 2026-04-07, 2026-04-07, 2026-02-03). The file lists match 3.4 exactly
+(11, 12 and 28 files). These are the `ACE_TURBO_DIR`, `ACE_SFT_DIR`, `ACE_MAIN_DIR` snapshot folder names in the Dockerfile; the folder name doubles as the download revision.
+
+The arch assertion: `torch._C._cuda_getArchFlags()` must contain `sm_86` and `sm_120` and torch must be `2.10.0` with CUDA `12.8`. `sm_89` is deliberately not asserted by name: PyTorch wheels carry `sm_80/sm_86`-style cubins and an Ada card
+(L40, L40S, RTX 6000 Ada, 4090) runs the `sm_86` one by CUDA binary compatibility inside the 8.x family, so a literal `sm_89` assertion would fail a correct wheel. The contract text names sm_89; this is the one place the file departs from it,
+and the reason is in the Dockerfile comment. Not verified here: the actual flag list of the 2.10.0+cu128 wheel (the build log prints it). Dockerfile.yue runs the same torch 2.10.0 cu128 in production on A40-class cards and prints, but does not assert, its flags.
+
+Image size (estimate, not measured): torch + CUDA libraries about 7 to 8 GB, ffmpeg and git about 0.4 GB, other Python packages about 0.8 GB, upstream source 21 MB, base 0.15 GB, so about 9 GB. Build check 6 prints `du -sh` of site-packages, `/opt/ace-step` and `/app` in the log.
+
+### 8.3 Build-time checks in `Dockerfile.ace` (all CPU, no weights, no network except the build's own installs)
+
+1. Arch assertion (right after torch is installed), then `pip check` after the pinned set.
+2. Upstream imports: `torch, torchaudio, acestep.inference, acestep.handler, acestep.llm_inference, acestep.model_downloader`, the names `GenerationParams, GenerationConfig, generate_music, AceStepHandler, LLMHandler`, AND both DiT modeling files
+   (`acestep.models.xl_turbo.modeling_acestep_v15_xl_turbo`, `acestep.models.xl_sft.modeling_acestep_v15_xl_base`), which import transformers internals, einops and vector_quantize_pytorch the way the real load will. `torch.cuda.is_available()` is printed (False in the build).
+3. DCW: `WAVELET_CACHE.get(cpu, float32, 'haar')` is not None and `dcw_double(...)` on random CPU latents changes the tensor (the correction really runs).
+4. Worker module: `import ace_handler`; `ACE_STEP_COMMIT` equals `UPSTREAM_COMMIT`; a `mode: probe` job returns `engine: ace` and torch `2.10.0...`; a `lora_key` job returns the refusal sentence.
+5. Real encoding: `encode_take` on one second of noise (real soundfile, libsndfile, ffmpeg with libmp3lame) gives a 24-bit, 48 kHz, 2-channel WAV and a non-trivial MP3.
+6. `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m unittest test_ace_handler.py` (the model-folder variables are not set yet, so no test can find or fetch a model). In the image the upstream clone exists, so `TestPinnedUpstream` and the five layout tests run too
+   (and `test_weights_are_links_into_the_snapshot_and_code_is_copied`, the real-symlink test that is skipped on this PC).
+7. No `*.safetensors`, `*.ckpt`, `*.gguf` or `pytorch_model*.bin` anywhere on the root filesystem, then the size report.
+Local emulation done: check 3's exact code ran against `ace_handler` with a stub torch (passed); the WAV half of check 4 ran with real numpy and soundfile (FLOAT, 48000, 2 channels, 1.0 s); the unit tests passed with a stub torch and loguru on the path,
+with `HF_HUB_OFFLINE=1`, and on Python 3.12 where numpy, soundfile and huggingface_hub are really installed. Checks 1, 2, the ffmpeg half of 4 and 7 could not run here.
+If a check fails in CI, its line in the log says which assumption broke; none of them needs a GPU, so a fix can be iterated without RunPod spend.
+
+### 8.4 The workflow `.github/workflows/ace.yml` (name `build-ace`)
+
+- Triggers: `push` to branch `ace-xl` only, and only when `Dockerfile.ace`, `ace_handler.py`, `test_ace_handler.py` or `.github/workflows/ace.yml` changed (`ACE_NOTES.md` is deliberately not listed); `workflow_dispatch`.
+  GitHub documents that `workflow_dispatch` only fires for workflow files that exist on the default branch (not tested here): on `ace-xl` alone, rely on the push trigger (a push that touches a listed file). It cannot trigger on `main`, `kade` or any YuE branch.
+- Steps, same actions and versions as `yue.yml`: checkout, `python -m unittest test_ace_handler.py` (190 tests; 21 are skipped on the runner because they need the upstream clone, which only the image build has), free disk (the identical `rm -rf` line), buildx, ghcr login, `docker/build-push-action@v6`
+  with `file: Dockerfile.ace`, `tags: ghcr.io/kademurdock/scenema-audio-runpod:ace-${{ github.sha }}`, `cache-to: type=inline`. No `cache-from` (the only existing cache candidates are YuE tags, which would feed a different image's layers into this one).
+  Consequence: every build is cold, expect roughly 15 to 30 minutes (estimate). `permissions: contents read, packages write`, as in yue.yml; the package already exists with `yue2-` tags, so the push adds `ace-` tags to the same package (not tested).
+- The RunPod template should point at the full `ace-<40-character sha>` tag, never at a moving tag.
+
+### 8.5 What the RunPod endpoint needs
+
+Names only; never put values in a file. Copy them from the YuE2 template's environment.
+
+| variable | needed | note |
+|---|---|---|
+| `AWS_ENDPOINT_URL`, `AWS_BUCKET_NAME` | yes | B2's S3 endpoint and the bucket the booth reads (read by `storage()` exactly like `yue_handler.storage()`) |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | yes | read by boto3 itself; the key must be allowed to write under `ace/` and create presigned reads (7 days = 604800 s) |
+| `AWS_REGION` | optional | default `us-east-005`, same as YuE2 |
+| `MODEL_NAME` / `MODEL_NAMES` | see below | RunPod model cache: exactly the three repos `ACE-Step/acestep-v15-xl-turbo`, `ACE-Step/acestep-v15-xl-sft`, `ACE-Step/Ace-Step1.5` |
+| `ACE_TURBO_DIR`, `ACE_SFT_DIR`, `ACE_MAIN_DIR` | no | baked into the image (8.2); set them only to point at other snapshot folders |
+| `ACE_LM_BACKEND` | no | `pt` (default) or `vllm` (an untested knob, see 4.21) |
+| `ACE_PLANNER_REWRITES_CAPTION` | no | `1` lets the planner rewrite the caption; default keeps the booth's words |
+| `ACE_CHECKPOINTS_DIR`, `ACE_STEP_DIR`, `ACE_WORKER_VERSION` | no | `/tmp/ace-checkpoints`, `/opt/ace-step`, `ace-worker-1` by default |
+| `ACESTEP_*`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`, `HF_MODULES_CACHE`, `TOKENIZERS_PARALLELISM` | no | the handler sets defaults before upstream is imported (`configure_environment`); the image sets the two offline flags |
+| `MAX_CUDA_VRAM` | MUST NOT be set | it caps the allocator inside upstream (gpu_config.py:24) |
+| `HF_TOKEN` | not needed | all three repos are public and ungated |
+
+`MODEL_NAME` / `MODEL_NAMES`: the contract uses these names. The RunPod documentation page on cached models (fetched Oct 10 2026, through a summarising tool) describes ONE cached model per endpoint, set in the endpoint's Model field, mentions `MODEL_NAME`
+only for official worker images, and documents no list form, no separator and no way to pick a revision. Yet the YuE2 endpoint evidently gets four repos from the cache (yue_handler.py:39-43 and Dockerfile.yue:17-30). So: configure the ACE endpoint
+the same way YuE2's was configured (the orchestrator can look; this stage did not call RunPod) and list exactly the three repos above. The worker does not depend on it: it works with 3, 2, 1 or 0 repos cached.
+What changes is the cold start (8.6). If only one repo can be cached, give the slot to `ACE-Step/acestep-v15-xl-turbo` (about 20 GB, needed at boot); the main repo then downloads at first boot (about 5.3 GB with the unused 2B model skipped) and xl-sft at its first use (about 20 GB).
+Other endpoint settings, all copies of the YuE2 choices unless stated (research file and NEXT_SESSION_PLAN): FlashBoot on, min workers 0, max 1 during the test spend, explicit GPU list A40, RTX A6000, RTX 6000 Ada, L40, L40S, RTX 5090, no network volume.
+Different from YuE2: (a) set the execution timeout explicitly and high (RunPod's default was not checked); the worker raises upstream's own 600 s render limit to 3600 s (`ACESTEP_GENERATION_TIMEOUT`), so the endpoint limit is the real one: use 1800 s or more for xl-sft;
+(b) container disk: with the cache complete, a few GB of `/tmp` is enough; if any repo may have to be downloaded, allow about 50 GB (20 + 5.3 + 20 + outputs) because the fallback writes to `/tmp/hf-hub` (RunPod's disk accounting not verified);
+(c) a first boot reads about 25 GB (8.8), so give the first job a long wait and do not judge latency from it.
+
+### 8.6 How the model-cache folders are resolved (`resolve_models`, `model_folder`, `fetch_model` in ace_handler.py)
+
+Per repo key (`turbo`, `sft`, `main`), in this order, using a per-repo completeness test (a DiT snapshot needs `config.json`, `silence_latent.pt` and every shard named in `model.safetensors.index.json`; the main snapshot needs `vae/{config.json, diffusion_pytorch_model.safetensors}`,
+`Qwen3-Embedding-0.6B/{config.json, model.safetensors}` and `acestep-5Hz-lm-1.7B/{config.json, model.safetensors}`; a half-filled snapshot is never accepted, unlike yue's any-file test):
+1. the pinned folder from the environment variable (`pinned`);
+2. else the newest complete snapshot of `models--<org>--<name>` by modification time, searched in this order: the pinned path's cache root (`parents[2]`), `$HF_HUB_CACHE` (the image sets `/runpod-volume/huggingface-cache/hub`), `/runpod-volume/huggingface-cache/hub`, `/tmp/hf-hub` (`cached <first 12 of the sha>`);
+3. else, only when downloads are allowed, `huggingface_hub.snapshot_download(repo, revision=<the pinned folder's name = its sha>, cache_dir=/tmp/hf-hub, ignore_patterns=...)` with offline mode switched off for that call only and restored (flag and library constant) after it (`downloaded`); the DiT repos skip `*.py`, `*.md`, `.gitattributes`, the main repo skips the 2B folder; otherwise `missing`.
+The winner is written back to its environment variable and one line `ACE-Step models: <repo> <how>; ...` is printed. At boot: turbo and main resolve with downloads allowed, sft is only looked for (no download); sft, and main if needed, resolve again with downloads allowed on the first xl-sft request.
+`mode: probe` resolves without downloading and reports, per key, `{repo, source (pinned | cached <sha12> | downloaded | missing), revision (snapshot folder name)}`, plus `loaded` flags for turbo, sft and the planner, `versions` and `gpu`. It is the cheap boot check.
+Then `ensure_checkpoints` builds `/tmp/ace-checkpoints` once per process (recipe 3.3 above): symlinks for the VAE, text encoder, planner and DiT weights/json, real folders for the DiT code copies and the 2B placeholder. Nothing is written into the cache.
+What a stale pin means: if a repo's `main` moves, RunPod's cache holds a new sha, the pinned folder is missing and step 2 picks the newest complete snapshot. The code comes from the pinned upstream either way, but weights or `config.json` (`is_turbo`) could differ, so look at `source` and `revision` in the probe.
+
+### 8.7 How to run the tests
+
+- This PC (Windows, no torch, no network): from `F:/KadeAI-work/ace/worker`, `python -I -B -m unittest discover -s . -p "test_ace_handler.py"` (Python 3.14 or the 3.12 install) -> `Ran 190 tests ... OK (skipped=1)`; the one skip is the real-symlink test. `python -I -m unittest test_ace_handler.py` does NOT work (isolated mode cannot find the module); without `-I` the plain form works.
+  Plain `python -m unittest` over the whole folder also runs the YuE tests, which have 6 problems on this PC that predate this work (torch missing; hash checks against CRLF files).
+- CI runner (Linux, no clone, no torch): `python -m unittest test_ace_handler.py` from the repo root -> 190 tests, 21 skipped (everything that needs the upstream source), 0 failures expected.
+- Image build (Linux, torch, clone at `/opt/ace-step`): check 6 above -> 190 tests, nothing skipped expected. On a pod: `cd /app && python -m unittest test_ace_handler.py`.
+- Against another clone of the pinned source: `ACE_UPSTREAM_DIR=<folder>` (the tests look there first, then `/opt/ace-step`, then the F: clone).
+- By hand on a pod, no GPU needed for the first line: `python -c "import ace_handler as a; print(a.handler({'input': {'mode': 'probe'}}))"`.
+
+### 8.8 Things to watch in the smoke test
+
+Capture for every job the whole answer (`timing`, `memory`, `gpu`, `worker_notes`, `plan`, `versions`) and the container log. Boot lines the worker prints: `ACE-Step models: ...`, `ACE-Step xl-turbo loaded in <s>`, `ACE-Step xl-turbo: Attention: sdpa; Dtype: ...`,
+`ACE-Step planner loaded in <s>, backend pt`, `ACE-Step ready at boot in <s>` (or `boot load skipped: <ExceptionType>`). Estimates below are from file sizes and upstream's own constants, not measurements.
+
+1. Memory on 32 GB cards (RTX 5090). Resident after boot is about 15 GB (DiT 9 to 10, planner 3.4 to 3.7, text encoder 1.2, VAE 0.33; upstream's table gpu_config.py:148-165). `BOTH_MODELS_GIB = 40`: a 5090 reports about 31 to 32 GiB, so turbo is released before xl-sft loads (and the planner stays);
+   an A40/L40S (about 45 GiB) keeps both (about 26 GB resident). Upstream's own activation estimate is only a pre-flight: 0.5 GB per take per minute for xl-turbo and 1.0 for xl-sft plus 0.5 GB margin (generate_music.py:106-179, gpu_config.py:173-181; it assumes flash attention and may be low for the sdpa path). Read `memory.render_peak_gib`
+   for a 30 s, 180 s and 360 s song on both models on the 5090; a "free VRAM" refusal comes back as the "too long for the memory" sentence. The cutoff to find is the longest xl-sft song the 5090 renders. `ACESTEP_SKIP_VRAM_PREFLIGHT=1` exists but hides a real shortage. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is a possible fix for fragmentation with changing song lengths; it is not set, because it is untested.
+2. Lazy xl-sft load. First xl-sft request = download if uncached, read 20 GB of fp32 shards, cast to bf16, `model_load_s` probably 1 to 3 minutes; the booth gets "Loading the music model" through progress. On a small card turbo is released first, so the next xl-turbo request reloads 20 GB: send turbo, sft, turbo in a row and read `model_load_s` each time.
+   Alternating requests on a 32 GB card would thrash; if that happens the fork side may need to route by card or batch by model.
+3. Symlinked cache layout. After boot, `ls -laL /tmp/ace-checkpoints/acestep-v15-xl-turbo` should show real `.py` files and linked weights; the log line `upstream code differs from the checkpoint copy` must NOT appear; the shared snapshot's `.py` files must be untouched.
+   Slow first reads from a network-backed `/runpod-volume` (mmap of 5 GB shards) are normal; a load that dies with "no such file" means a dangling link (the cache was evicted or the sha moved: run the probe). `HF_MODULES_CACHE` (`/tmp/hf-modules`) must contain `transformers_modules/acestep-v15-xl-turbo/...` after the load.
+4. Offline flags. With `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` nothing should resolve a hub id: watch for retries, timeouts or "couldn't connect to huggingface.co" lines, and for upstream's google.com probe (it must not run: `check_main_model_exists` has to be true, which the layout tests prove for fake files).
+   The only legitimate network use is the download fallback (`downloaded` in the probe). `fetch_model` restores both the variable and the library constant afterwards; after a fallback download, run a second job and check nothing else goes online.
+5. First-request latency. Boot reads about 25 GB (turbo 19.95, planner 3.7, text encoder 1.2, VAE 0.34) and the planner tokenizer alone "may take 80~90s" per upstream's comment (llm_inference.py:609-611). Record `ready at boot in` for a cold worker, for a cached restart, and whether FlashBoot keeps the loaded models
+   (YuE2's first job on a new image waited 360 s). Compare job 1 with job 2 on the same worker: the first render also pays CUDA/cuBLAS/SDPA initialisation. No warm-up render runs at boot; if job 1 is more than a few seconds slower than job 2 at equal length, a 10 s xl-turbo warm-up inside `warm()` is the cheap fix.
+6. Concurrency. `runpod.serverless.start({'handler': handler})` runs one job per worker at a time and the worker keeps no concurrency modifier; the handler, `STATE` and upstream's handlers are not thread-safe, so do not add one. Two queued jobs on one worker run back to back; `workersMax` is the only parallelism, and every extra worker pays the cold start.
+7. torch.compile and warm-up. `compile_model=False` and nothing is compiled or autotuned; Triton is present (torch brings it) but unused on this path, so no compile minutes and no sm_120 Triton risk are expected. Confirm the log has no "compiling" lines. Optional experiments after the first good run: `ACE_LM_BACKEND=vllm` (needs `pip install --no-deps /opt/ace-step/acestep/third_parts/nano-vllm xxhash` on the pod; no flash-attn on 3.12, so it would run eager; it reserves VRAM from free memory) and a boot warm-up render.
+8. fp32 checkpoints loaded as bf16. The shards are about 20 GB because they are fp32; the load casts to bf16 (about 10 GB on the card) and `dtype` in config.json says bf16 as well. Watch host RAM during the load (the cast happens on the CPU side: plausibly 10 to 20 GB peak; a container killed at boot with no Python error is the signature of the host-RAM limit, not VRAM),
+   the `Dtype:` line (expect `torch.bfloat16`), and listen to xl-turbo vs xl-sft at the same seed for obvious quality differences that bf16 could cause; upstream runs both in bf16, so a difference from their published samples is not expected.
+   The sm_86 cards (A40, A6000) and the 5090 all take the bf16 branch (compute capability 8 or higher, ACE_NOTES 1.2).
+9. Long songs. The booth sends 30 to 360 s. Planner time grows with length (5 codes per second: 1,800 codes at 6 minutes; under the `pt` backend an estimated 25 to 40 tokens per second, so roughly 45 to 75 s plus metadata, reported as `timing.plan_s`), xl-sft adds 50 steps with two passes each, and the 24-bit WAV is 288,000 bytes per second (104 MB at 6 minutes, over the fork's 20 MB cover-source limit past 70 s: the MP3 `url` is the safe cover source).
+   Try 360 s on xl-turbo and xl-sft with thinking on and off and note total execution seconds (the booth prices by `gpu` and `executionTime`), the endpoint timeout, `/tmp` use for a batch of takes, and the upload time. Planner output was seeded for batch 1 via the global generators; check that the same seed gives the same plan twice.
+10. Also look at: the `Attention:` line (eager fallback means a slower and larger load), `worker_notes` (steps used, planner used or skipped, trimmed caption), whether the planner rewrote the key/tempo the caller did not set (`plan`), and that no caption or lyrics text appears in the container log (loguru is cut to WARNING; the worker prints only exception types).
+
+### 8.9 Not verified in stage 3 (honest list)
+
+- No Docker build, no Linux, no GPU: every build-time check except the ones emulated in 8.3 is unexercised, and a CI failure on first run is possible. The most likely suspects, in order: the arch-flag string format or the sm_120 token (check 1), an import of a transformers internal in the XL modeling files (check 2), `pip check` complaints from floating transitive packages, the ffmpeg encoders (check 4), a unit test that behaves differently with real torch and loguru on the path (emulated with stubs only).
+- The pin set was checked from package metadata, not by a real pip resolve. Floating transitive packages can change between today and the first build; if `pip check` or an import fails after such a change, freeze the closure listed by `closure.py`.
+- The RunPod model-cache semantics (several repos on one endpoint, revision choice) come from one summarised documentation page plus the YuE2 evidence, not from the endpoint.
+- GitHub behaviour (path filters on the first push of a new branch, `workflow_dispatch` needing the file on the default branch, `GITHUB_TOKEN` write access to the existing package) is from general knowledge, not tested.
+- Image size and all timings and memory figures are estimates.
