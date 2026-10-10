@@ -357,9 +357,9 @@ def configure_environment():
     """Process settings that must be in place before upstream is imported (it reads them while it loads)."""
     if STATE['env']:
         return
-    root = Path(os.environ.get('ACESTEP_PROJECT_ROOT') or '/tmp/ace-root')
-    os.environ['ACESTEP_PROJECT_ROOT'] = str(root)
-    os.environ['ACESTEP_CHECKPOINTS_DIR'] = str(checkpoints_dir())
+    os.environ.setdefault('ACESTEP_PROJECT_ROOT', '/tmp/ace-root')
+    root = Path(os.environ['ACESTEP_PROJECT_ROOT'])
+    os.environ['ACESTEP_CHECKPOINTS_DIR'] = str(checkpoints_dir())   # upstream must agree with the folder built here
     for name, value in (('HF_HUB_OFFLINE', '1'), ('TRANSFORMERS_OFFLINE', '1'), ('HF_HUB_DISABLE_TELEMETRY', '1'),
                         ('TOKENIZERS_PARALLELISM', 'false'), ('ACESTEP_DISABLE_TQDM', '1'),
                         ('ACESTEP_SAVE_MEMORY', '1'), ('HF_MODULES_CACHE', '/tmp/hf-modules')):
