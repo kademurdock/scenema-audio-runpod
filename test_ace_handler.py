@@ -1924,24 +1924,28 @@ class TestStyleFetch(unittest.TestCase):
 
     def test_serve_json_problems(self):
         sha = hashlib.sha256(self.weights).hexdigest()
-        bad = [('not json', dict(raw_serve=b'{"adapter_model_sha256": ')), ('a list', dict(raw_serve=b'[1, 2]')),
-               ('a string', dict(raw_serve=b'"x"')), ('empty', dict(raw_serve=b'')),
-               ('no checksum', dict(serve={'adapter_model_sha256': ...})),
-               ('short checksum', dict(serve={'adapter_model_sha256': sha[:63]})),
-               ('long checksum', dict(serve={'adapter_model_sha256': sha + '0'})),
-               ('checksum with a newline', dict(serve={'adapter_model_sha256': sha + '\n'})),
-               ('checksum not hex', dict(serve={'adapter_model_sha256': 'g' * 64})),
-               ('checksum a number', dict(serve={'adapter_model_sha256': 12345})),
-               ('checksum of other bytes', dict(serve={'adapter_model_sha256': hashlib.sha256(b'other').hexdigest()})),
-               ('no tag', dict(serve={'trigger_tag': ...})), ('blank tag', dict(serve={'trigger_tag': '   '})),
-               ('tag too long', dict(serve={'trigger_tag': 't' * 41})),
-               ('tag with a newline', dict(serve={'trigger_tag': 'kd\ntest'})),
-               ('tag with a control character', dict(serve={'trigger_tag': 'kd\x00test'})),
-               ('tag a number', dict(serve={'trigger_tag': 7})), ('tag a list', dict(serve={'trigger_tag': ['kd']})),
-               ('too big', dict(raw_serve=b'{"pad": "' + b'x' * (1 << 20) + b'"}'))]
-        for label, changes in bad:
+        no_checksum, no_tag = 'serve.json has no usable checksum', 'serve.json has no usable trigger word'
+        bad = [('not json', dict(raw_serve=b'{"adapter_model_sha256": '), 'a settings file is not JSON'),
+               ('a list', dict(raw_serve=b'[1, 2]'), 'a settings file is not an object'),
+               ('a string', dict(raw_serve=b'"x"'), 'a settings file is not an object'),
+               ('empty', dict(raw_serve=b''), 'a settings file is not JSON'),
+               ('no checksum', dict(serve={'adapter_model_sha256': ...}), no_checksum),
+               ('short checksum', dict(serve={'adapter_model_sha256': sha[:63]}), no_checksum),
+               ('long checksum', dict(serve={'adapter_model_sha256': sha + '0'}), no_checksum),
+               ('checksum with a newline', dict(serve={'adapter_model_sha256': sha + '\n'}), no_checksum),
+               ('checksum not hex', dict(serve={'adapter_model_sha256': 'g' * 64}), no_checksum),
+               ('checksum a number', dict(serve={'adapter_model_sha256': 12345}), no_checksum),
+               ('checksum of other bytes', dict(serve={'adapter_model_sha256': hashlib.sha256(b'other').hexdigest()}),
+                'the adapter does not match its checksum'),
+               ('no tag', dict(serve={'trigger_tag': ...}), no_tag), ('blank tag', dict(serve={'trigger_tag': '   '}), no_tag),
+               ('tag too long', dict(serve={'trigger_tag': 't' * 41}), no_tag),
+               ('tag with a newline', dict(serve={'trigger_tag': 'kd\ntest'}), no_tag),
+               ('tag with a control character', dict(serve={'trigger_tag': 'kd\x00test'}), no_tag),
+               ('tag a number', dict(serve={'trigger_tag': 7}), no_tag), ('tag a list', dict(serve={'trigger_tag': ['kd']}), no_tag),
+               ('too big', dict(raw_serve=b'{"pad": "' + b'x' * (1 << 20) + b'"}'), 'a settings file is too big')]
+        for label, changes, reason in bad:
             self.put(**changes)
-            self.refused()
+            self.refused(f'ACE-Step style refused: {reason}')           # and for this reason, not another check's
             self.assertFalse(list(Path(self.tmp.name).rglob('adapter_model.safetensors')), label)
 
     def test_serve_json_accepts_these_forms(self):
@@ -2172,8 +2176,8 @@ class TestStyledSong(StyledHarness):
         self.assertIn('Made in the Test style at strength 0.6, with its trigger word "kdtest" ahead of the music '
                       'description.', out['worker_notes'])
         self.assertTrue(all(isinstance(note, str) and note.endswith('.') for note in out['worker_notes']))
-        self.assertEqual(set(out['timing']), {'model_load_s', 'render_s', 'encode_s', 'upload_s', 'plan_s', 'style_fetch_s',
-                                              'style_apply_s', 'style_restore_s'} - {'plan_s'})
+        self.assertEqual(set(out['timing']), {'model_load_s', 'render_s', 'encode_s', 'upload_s', 'style_fetch_s',
+                                              'style_apply_s', 'style_restore_s'})        # no plan_s: this fake reports none
         self.assertIn('lora', out['features'])
         self.assertIs(type(out['style']['scale']), float)
 
@@ -2866,13 +2870,20 @@ class TestAdapterFile(unittest.TestCase):
                      'base_model.model.layers.0.self_attn.q_proj.lora_magnitude_vector',
                      'base_model.model.layers.0.self_attn.q_proj.bias',
                      'layers.0.self_attn.q_proj.lora_A.weight',
-                     'base_model.model.encoder.layers.0.self_attn.q_proj.lora_A.weight',
-                     'base_model.model.layers.x.self_attn.q_proj.lora_A.weight',
                      'base_model.model.layers.0.self_attn.q_proj.lora_C.weight',
-                     'base_model.model.layers.0.self_attn.q_proj.lora_A.weight.extra',
-                     'base_model.model.layers.0.other_attn.q_proj.lora_A.weight',
-                     'base_model.model.layers.0.self_attn.q_norm.lora_A.weight'):
+                     'base_model.model.layers.0.self_attn.q_proj.lora_A.weight.extra'):
             self.refused({**self.pair(), name: extra})
+
+    def test_modules_outside_the_decoders_projections_are_refused_even_with_both_halves(self):
+        # with A and B both present, only the name check can say no (a half pair would be refused for that reason instead)
+        for module in ('encoder.layers.0.self_attn.q_proj', 'decoder.layers.0.self_attn.q_proj',
+                       'layers.0.mlp.gate_proj', 'layers.x.self_attn.q_proj', 'layers.0.other_attn.q_proj',
+                       'layers.0.self_attn.q_norm', 'layers.0.self_attn.q_proj.base_layer', 'layers.0.self_attn.proj',
+                       'model.layers.0.self_attn.q_proj', 'layers.-1.self_attn.q_proj'):
+            with self.assertRaises(ace.StyleProblem) as caught:
+                self.save({**self.pair(), **self.pair(module)})
+            self.assertEqual(str(caught.exception), 'the adapter has a weight this worker does not fold', module)
+        self.assertEqual(len(self.save({**self.pair(), **self.pair('layers.12.cross_attn.v_proj')})), 2)
 
     def test_half_a_pair_an_empty_file_and_a_wrong_rank_are_refused(self):
         import torch
