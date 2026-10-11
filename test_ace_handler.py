@@ -35,7 +35,8 @@ ACE_REAL_LINK = ace._link
 
 
 def reset_state():
-    ace.STATE.update(ckpt=None, built=set(), dit={}, llm=None, planner_tries=0, api=None, env=False)
+    ace.STATE.update(ckpt=None, built=set(), dit={}, llm=None, planner_tries=0, api=None, env=False, dirty=set(),
+                     styles={})
     ace.RESOLVED.clear()
 
 
@@ -62,6 +63,20 @@ class FakeS3:
         self.fail = fail
         self.uploads = []
         self.presigned = []
+        self.objects = {}          # key -> bytes, what download_file can fetch
+        self.downloads = []        # (bucket, key) in the order they were asked for
+        self.broken = set()        # keys whose download raises half way (after writing some bytes)
+
+    def download_file(self, bucket, key, filename):
+        """boto3's S3.Client.download_file(Bucket, Key, Filename), positionally."""
+        self.downloads.append((bucket, key))
+        if key not in self.objects:
+            raise OSError('404 not found')          # botocore raises ClientError; any exception is handled the same
+        data = self.objects[key]
+        if key in self.broken:
+            Path(filename).write_bytes(data[:len(data) // 2])
+            raise ConnectionError('connection reset')
+        Path(filename).write_bytes(data)
 
     def upload_file(self, path, bucket, key, ExtraArgs=None):
         if self.fail:
@@ -379,19 +394,18 @@ class TestRequestInput(unittest.TestCase):
     def test_odd_json_values_in_any_field_are_refused_in_plain_words_never_crash(self):
         fields = ('mode', 'model', 'caption', 'lyrics', 'duration', 'seed', 'batch_size', 'bpm', 'keyscale',
                   'timesignature', 'vocal_language', 'thinking', 'steps', 'guidance_scale', 'shift', 'lm_temperature',
-                  'lora_key')
+                  'lora_key', 'lora_scale')
         values = ([], {}, ['xl-turbo'], {'a': 1}, [[1]], [None], True, False, 0, -1, 1.5, '', 'x', float('nan'),
                   float('inf'), 10 ** 30, -10 ** 30, 10 ** 400, -10 ** 400, ' ', '\x00', 2 ** 31)
         for field in fields:
             for value in values:
-                raw = valid(**{field: value})
-                try:
-                    ace.refuse_adapter(raw)
-                    ace.request_input(raw)
-                except ace.RequestError:
-                    pass
-                except Exception as error:      # any other type would reach the generic handler as a vague failure
-                    self.fail(f'{field}={value!r} raised {type(error).__name__}')
+                for extra in ({}, {'model': 'xl-sft', 'lora_key': 'ace-loras/soul-real-v1'}):     # with a style, too
+                    try:
+                        ace.request_input(valid(**{**extra, field: value}))
+                    except ace.RequestError:
+                        pass
+                    except Exception as error:      # any other type would reach the generic handler as a vague failure
+                        self.fail(f'{field}={value!r} raised {type(error).__name__}')
 
     def test_caption(self):
         self.check('Describe the music in a few words.', caption='')
@@ -563,7 +577,7 @@ class TestRenderOutput(Harness):
         self.assertIs(out['truncated'], False)
         self.assertEqual(out['gpu'], 'Fake A40')
         self.assertEqual(out['memory'], {'render_peak_gib': 12.5})
-        self.assertEqual(out['features'], ['ace-xl-turbo', 'ace-xl-sft', 'batch', 'instrumental', 'probe'])
+        self.assertEqual(out['features'], ['ace-xl-turbo', 'ace-xl-sft', 'batch', 'instrumental', 'probe', 'lora'])
         self.assertEqual(set(out['versions']), {'ace_step_commit', 'torch', 'worker'})
         self.assertEqual(out['versions']['ace_step_commit'], ace.UPSTREAM_COMMIT)
         self.assertTrue(all(isinstance(note, str) and note.endswith('.') for note in out['worker_notes']))
@@ -1136,37 +1150,206 @@ class TestFailures(Harness):
         self.engine.assert_not_called()
 
 
-class TestAdapterSeam(Harness):
-    def test_lora_key_is_refused_before_any_work(self):
-        out = self.run_job(lora_key='ace-loras/style.pt')
-        self.assertEqual(out, {'error': 'Custom ACE styles are not available yet.'})
-        self.engine.assert_not_called()
-        self.planner.assert_not_called()
-        self.assertEqual(self.api.calls, [])
+# ---------------------------------------------------------------- trained styles: the request
 
-    def test_any_value_other_than_null_or_empty_is_refused(self):
-        for value in ('x', 0, False, True, ['a'], {'a': 1}):
-            self.assertEqual(self.run_job(lora_key=value), {'error': ace.ADAPTER_SENTENCE}, repr(value))
+STYLE_KEY = 'ace-loras/soul-real-v1'
 
-    def test_null_or_empty_lora_key_is_the_same_as_none(self):
+
+def styled(**changes):
+    """A valid request for a styled song (Best quality, a style key)."""
+    return valid(**{'model': 'xl-sft', 'lora_key': STYLE_KEY, **changes})
+
+
+class TestStyleRequest(unittest.TestCase):
+    def check(self, sentence, **changes):
+        with self.assertRaises(ace.RequestError) as caught:
+            ace.request_input(valid(**changes))
+        self.assertEqual(str(caught.exception), sentence)
+
+    def test_a_styled_request_carries_the_key_and_a_scale_of_one_by_default(self):
+        request = ace.request_input(styled())
+        self.assertEqual(request['style'], {'key': STYLE_KEY, 'scale': 1.0})
+        self.assertIs(type(request['style']['scale']), float)
+        self.assertEqual(request['model'], 'xl-sft')
+
+    def test_without_a_style_nothing_about_a_style_is_in_the_request(self):
+        for changes in ({}, {'lora_key': None}, {'lora_key': ''}, {'lora_key': None, 'lora_scale': None},
+                        {'lora_scale': 0.5}, {'lora_scale': 1}, {'model': 'xl-sft', 'lora_scale': 1.5}):
+            request = ace.request_input(valid(**changes))
+            self.assertIsNone(request['style'], changes)
+            self.assertEqual(request['notes'], [], changes)
+            self.assertEqual(request['vocal_language'], 'unknown', changes)
+
+    def test_valid_keys(self):
+        for name in ('soul-real-v1', 'a', 'A', '0', 'x' * 60, 'a.b_c-d', 'v1.2', 'a.', 'Soul_Real.V1', 'a-'):
+            request = ace.request_input(styled(lora_key='ace-loras/' + name))
+            self.assertEqual(request['style']['key'], 'ace-loras/' + name, name)
+
+    def test_every_malformed_key_gets_the_one_plain_sentence(self):
+        keys = ('k', 'ace-loras', 'ace-loras/', 'ace-loras//', 'ace-loras/a/b', 'ace-loras/a/', 'ace-loras/../x',
+                'ace-loras/..', 'ace-loras/.', 'ace-loras/.hidden', 'ace-loras/a..b', 'ace-loras/a/..', '../ace-loras/x',
+                '/ace-loras/x', 'ace-loras/' + 'a' * 61, 'ace-loras/a b', 'ace-loras/a\n', 'ace-loras/a\x00',
+                'ace-loras/é', 'ace-loras/a;b', 'ace-loras/a%2Fb', 'ace-loras\\x', 'ACE-LORAS/x', 'ace-loras/ x',
+                ' ace-loras/x', 'ace-loras/x ', 'ace-loras/a:b', 'ace-loras/a*', 'other/soul-real-v1', 'ace/x',
+                'ace-loras/a\r\n', 'ace-loras/%00', 's3://ace-loras/x', 'ace-loras/x?y=1', 'ace-loras/x#1')
+        for key in keys:
+            self.check(ace.ADAPTER_SENTENCE, model='xl-sft', lora_key=key)
+            self.check(ace.ADAPTER_SENTENCE, lora_key=key)       # the key is judged before the model
+        for value in (0, 1, False, True, ['ace-loras/x'], {'a': 1}, 1.5, b'ace-loras/x'):
+            self.check(ace.ADAPTER_SENTENCE, model='xl-sft', lora_key=value)
+
+    def test_a_null_or_empty_key_means_none(self):
         for value in (None, ''):
-            self.assertNotIn('error', self.run_job(lora_key=value))
+            self.assertIsNone(ace.request_input(valid(lora_key=value))['style'])
 
-    def test_probe_refuses_it_too(self):
-        out = silently(ace.handler, {'input': {'mode': 'probe', 'lora_key': 'x'}})
-        self.assertEqual(out, {'error': ace.ADAPTER_SENTENCE})
+    def test_only_the_best_quality_model_may_carry_a_style(self):
+        self.check(ace.STYLE_MODEL_SENTENCE, lora_key=STYLE_KEY)                          # model absent = xl-turbo
+        self.check(ace.STYLE_MODEL_SENTENCE, model='xl-turbo', lora_key=STYLE_KEY)
+        self.check(ace.STYLE_MODEL_SENTENCE, model=None, lora_key=STYLE_KEY, lora_scale=0)      # even at strength 0
+        self.assertEqual(ace.STYLE_MODEL, 'xl-sft')
 
-    def test_apply_adapter_is_a_seam_that_raises_today(self):
-        with self.assertRaises(NotImplementedError) as caught:
-            ace.apply_adapter(object(), 'ace-loras/style.pt')
-        self.assertEqual(str(caught.exception), 'Custom ACE styles are not available yet.')
+    def test_scale_range_and_types(self):
+        for value in (0.01, 0.5, 1, 1.0, 1.25, 1.5, 0.6):
+            self.assertEqual(ace.request_input(styled(lora_scale=value))['style']['scale'], float(value))
+        for value in (-0.001, -1, 1.5000001, 1.51, 2, 100, 10 ** 30, 10 ** 400, -10 ** 400, float('nan'), float('inf'),
+                      float('-inf'), True, False, '1', '0.5', '', ' ', [1], {'s': 1}, [], {}):
+            self.check(ace.STYLE_SCALE_SENTENCE, model='xl-sft', lora_key=STYLE_KEY, lora_scale=value)
 
-    def test_the_handler_maps_apply_adapter_but_not_other_not_implemented_errors(self):
-        self.engine.side_effect = NotImplementedError(ace.ADAPTER_SENTENCE)
-        self.assertEqual(self.run_job(), {'error': ace.ADAPTER_SENTENCE})
-        self.engine.side_effect = NotImplementedError('operator not implemented for this device')
-        self.assertEqual(self.run_job(),
-                         {'error': 'ACE-Step could not finish (NotImplementedError). Your writing is saved.'})
+    def test_the_scale_is_checked_even_without_a_key(self):
+        for value in (2, -1, float('nan'), True, 'x'):
+            self.check(ace.STYLE_SCALE_SENTENCE, lora_scale=value)
+        self.check(ace.STYLE_SCALE_SENTENCE, lora_key='', lora_scale=1.6)
+
+    def test_the_sentences(self):
+        self.assertEqual(ace.ADAPTER_SENTENCE, 'That style is not available right now.')
+        self.assertEqual(ace.STYLE_SCALE_SENTENCE, 'Style strength must be a number from 0 to 1.5.')
+        self.assertEqual(ace.STYLE_MODEL_SENTENCE, 'A style needs the best-quality model.')
+
+    def test_a_strength_of_zero_is_a_plain_song_and_says_so(self):
+        for value in (0, 0.0):
+            request = ace.request_input(styled(lora_scale=value))
+            self.assertIsNone(request['style'])
+            self.assertEqual(request['notes'], ['The style strength was 0, so the song was made without the style.'])
+            self.assertEqual(request['vocal_language'], 'unknown')       # a plain song keeps the plain default
+
+    def test_order_of_checks_is_key_then_model_then_scale(self):
+        self.check(ace.ADAPTER_SENTENCE, lora_key='k', lora_scale=9)
+        self.check(ace.STYLE_MODEL_SENTENCE, lora_key=STYLE_KEY, lora_scale=9)
+        self.check(ace.STYLE_SCALE_SENTENCE, model='xl-sft', lora_key=STYLE_KEY, lora_scale=9)
+
+    def test_language_defaults_to_english_only_for_a_style(self):
+        self.assertEqual(ace.request_input(styled())['vocal_language'], 'en')
+        self.assertEqual(ace.request_input(styled(vocal_language=None))['vocal_language'], 'en')
+        self.assertEqual(ace.request_input(styled(vocal_language=''))['vocal_language'], 'en')
+        self.assertEqual(ace.request_input(styled())['notes'], [])
+        self.assertEqual(ace.request_input(valid(model='xl-sft'))['vocal_language'], 'unknown')
+        self.assertEqual(ace.request_input(valid())['vocal_language'], 'unknown')
+
+    def test_a_language_the_caller_sent_is_kept_with_a_note_that_the_style_is_english(self):
+        note = 'The style was taught on English songs, so another language may sound less like it.'
+        for sent, want in (('es', 'es'), ('FR', 'fr'), ('unknown', 'unknown')):
+            request = ace.request_input(styled(vocal_language=sent))
+            self.assertEqual(request['vocal_language'], want)
+            self.assertEqual(request['notes'], [note], sent)
+        self.assertEqual(ace.request_input(styled(vocal_language='en'))['notes'], [])
+        self.assertEqual(ace.request_input(styled(vocal_language=' EN '))['notes'], [])
+        self.check('Vocal language must be a short code such as en.', model='xl-sft', lora_key=STYLE_KEY,
+                   vocal_language='english')
+
+    def test_the_other_fields_are_validated_the_same_with_a_style(self):
+        self.check('Seed must be a whole number from 0 to 2147483647.', model='xl-sft', lora_key=STYLE_KEY, seed=-1)
+        self.check('Steps must be a whole number from 4 to 100.', model='xl-sft', lora_key=STYLE_KEY, steps=3)
+        request = ace.request_input(styled(steps=30, guidance_scale=9, shift=2))
+        self.assertEqual((request['steps'], request['guidance_scale'], request['shift']), (30, 9, 2))
+
+
+class TestStyleCaption(unittest.TestCase):
+    def test_the_tag_goes_first_with_a_comma_and_a_space(self):
+        self.assertEqual(ace.tagged_caption('kdsoulr', 'warm soul ballad'), ('kdsoulr, warm soul ballad', None))
+
+    def test_a_caption_that_just_fits_is_not_cut(self):
+        tag = 'kdsoulr'
+        room = 512 - len(tag) - 2
+        caption = ('word ' * 200)[:room - 1] + 'x'
+        text, note = ace.tagged_caption(tag, caption)
+        self.assertEqual(len(caption), room)
+        self.assertEqual((text, note), (f'{tag}, {caption}', None))
+        self.assertEqual(len(text), 512)
+
+    def test_one_character_over_is_cut_at_a_word_and_says_so(self):
+        tag = 'kdsoulr'
+        room = 512 - len(tag) - 2
+        caption = 'abcd ' * 120
+        caption = caption[:room + 1]
+        text, note = ace.tagged_caption(tag, caption)
+        self.assertEqual(note, 'The music description was shortened to make room for the style.')
+        self.assertLessEqual(len(text), 512)
+        self.assertTrue(text.startswith('kdsoulr, abcd'))
+        self.assertTrue(all(word == 'abcd' for word in text.split(', ', 1)[1].split()))     # no word was cut in half
+
+    def test_the_tag_is_never_cut_whatever_the_lengths(self):
+        for tag in ('k', 'kdsoulr', 't' * 40):
+            for length in (1, 50, 400, 470, 471, 480, 500, 505, 510, 511, 512):
+                for word in ('a', 'wordy', 'x' * 30):
+                    caption = (word + ' ') * 600
+                    caption = caption[:length].strip() or 'a'
+                    text, note = ace.tagged_caption(tag, caption)
+                    self.assertTrue(text.startswith(tag + ', '), (tag, length, word))
+                    self.assertLessEqual(len(text), 512, (tag, length, word))
+                    self.assertEqual(note is None, len(caption) <= 512 - len(tag) - 2, (tag, length, word))
+
+    def test_a_caption_with_no_spaces_still_leaves_the_tag_whole(self):
+        text, note = ace.tagged_caption('kdsoulr', 'x' * 512)
+        self.assertTrue(text.startswith('kdsoulr, xxxx'))
+        self.assertLessEqual(len(text), 512)
+        self.assertIsNotNone(note)
+
+    def test_trailing_punctuation_is_not_left_dangling(self):
+        caption = 'warm soul, ' * 60
+        text, _note = ace.tagged_caption('kdsoulr', caption)
+        self.assertFalse(text.endswith((',', ' ', ';', ':', '-')))
+
+
+class TestPlainCaptionPlanner(unittest.TestCase):
+    class Llm:
+        llm_initialized = True
+        llm_backend = 'pt'
+
+        def __init__(self):
+            self.calls = []
+
+        def generate_with_stop_condition(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return {'success': True, 'audio_codes': 'codes'}
+
+        def other(self):
+            return 'other'
+
+    def test_the_planner_reads_the_plain_caption(self):
+        llm = self.Llm()
+        proxy = ace.PlainCaptionPlanner(llm, 'plain words')
+        result = proxy.generate_with_stop_condition(caption='kdtag, plain words', lyrics='[Verse]', infer_type='llm_dit',
+                                                    temperature=1.3)
+        self.assertEqual(result, {'success': True, 'audio_codes': 'codes'})
+        self.assertEqual(llm.calls, [((), {'caption': 'plain words', 'lyrics': '[Verse]', 'infer_type': 'llm_dit',
+                                           'temperature': 1.3})])
+
+    def test_every_other_attribute_is_the_real_planners(self):
+        llm = self.Llm()
+        proxy = ace.PlainCaptionPlanner(llm, 'plain')
+        self.assertIs(proxy.llm_initialized, True)
+        self.assertEqual((proxy.llm_backend, proxy.other()), ('pt', 'other'))
+        llm.llm_initialized = False
+        self.assertIs(proxy.llm_initialized, False)
+        with self.assertRaises(AttributeError):
+            proxy.nothing_like_this
+        with self.assertRaises(AttributeError):
+            proxy._private_thing
+
+    def test_a_missing_inner_planner_cannot_recurse_forever(self):
+        proxy = ace.PlainCaptionPlanner.__new__(ace.PlainCaptionPlanner)       # no __init__: no _llm
+        with self.assertRaises(AttributeError):
+            proxy.anything
 
 
 class TestProbe(Harness):
@@ -2244,7 +2427,7 @@ class TestQuietLogsWithRealLoguru(unittest.TestCase):
 
 class TestMisc(unittest.TestCase):
     def test_features_and_versions(self):
-        self.assertEqual(ace.FEATURES, ('ace-xl-turbo', 'ace-xl-sft', 'batch', 'instrumental', 'probe'))
+        self.assertEqual(ace.FEATURES, ('ace-xl-turbo', 'ace-xl-sft', 'batch', 'instrumental', 'probe', 'lora'))
         with mock.patch.dict(os.environ, {'ACE_STEP_COMMIT': 'abc', 'ACE_WORKER_VERSION': 'w9'}):
             self.assertEqual(ace.versions()['ace_step_commit'], 'abc')
             self.assertEqual(ace.versions()['worker'], 'w9')
@@ -2285,7 +2468,8 @@ class TestMisc(unittest.TestCase):
                 self.assertNotIn(word, sentence)
 
     def test_every_sentence_returned_to_the_booth_is_short(self):
-        for sentence in (ace.ADAPTER_SENTENCE, ace.TOO_BIG, ace.FAILED):
+        for sentence in (ace.ADAPTER_SENTENCE, ace.STYLE_MODEL_SENTENCE, ace.STYLE_SCALE_SENTENCE, ace.TOO_BIG,
+                         ace.FAILED):
             self.assertLessEqual(len(sentence), 100)
 
 

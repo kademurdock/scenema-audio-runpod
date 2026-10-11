@@ -17,9 +17,17 @@ Environment (all optional; the Dockerfile pins the snapshot folders):
   ACE_LM_BACKEND                              pt (default) or vllm
   ACE_PLANNER_REWRITES_CAPTION                1 lets the planner rewrite the caption (default: the caller's words are kept)
   ACE_STEP_DIR, ACE_STEP_COMMIT, ACE_WORKER_VERSION   where upstream is cloned and what the answer reports
+  ACE_LORA_DIR                                where trained styles are cached on this worker (default /tmp/ace-lora)
   AWS_ENDPOINT_URL, AWS_BUCKET_NAME, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY   B2 (boto3), as for YuE2
+
+Trained styles (request fields lora_key and lora_scale; ACE_STYLE_CONTRACT.md, ACE_NOTES.md section 9): the adapter is
+fetched from B2, checked against its serve.json, and FOLDED into the xl-sft decoder weights for the length of one
+generate_music call, then put back from a pristine CPU copy and verified (apply_adapter). Upstream's own add_lora /
+unload_lora is not used: its unload leaves the PEFT layers, and the adapter, in the decoder (ACE_NOTES 9.2).
 """
+import contextlib
 import gc
+import hashlib
 import json
 import math
 import os
@@ -30,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -74,7 +83,7 @@ BOTH_MODELS_GIB = 40   # a card with less memory holds one DiT at a time
 # GenerationParams itself only carries the non-Think pair, so the planner case has to be passed explicitly.
 DCW_STRENGTHS = {True: (0.02, 0.06), False: (0.05, 0.02)}
 
-FEATURES = ('ace-xl-turbo', 'ace-xl-sft', 'batch', 'instrumental', 'probe')
+FEATURES = ('ace-xl-turbo', 'ace-xl-sft', 'batch', 'instrumental', 'probe', 'lora')
 VALID_LANGUAGES = frozenset((
     'ar az bg bn ca cs da de el en es fa fi fr he hi hr ht hu id is it ja ko la lt ms ne nl no pa pl pt ro ru sa sk '
     'sr sv sw ta te th tl tr uk ur vi yue zh unknown').split())
@@ -90,11 +99,41 @@ LM_TEMPERATURE_MIN, LM_TEMPERATURE_MAX = 0.0, 2.0
 SAMPLE_RATE = 48000
 URL_SECONDS = 604800
 INSTRUMENTAL = '[Instrumental]'
-ADAPTER_SENTENCE = 'Custom ACE styles are not available yet.'
+ADAPTER_SENTENCE = 'That style is not available right now.'     # an unknown, malformed, missing or damaged style
+STYLE_MODEL_SENTENCE = 'A style needs the best-quality model.'
 TOO_BIG = 'This song is too long for the memory that is free right now. Try a shorter length.'
 FAILED = 'ACE-Step could not finish this song. Your writing is saved.'
 
-STATE = {'ckpt': None, 'built': set(), 'dit': {}, 'llm': None, 'planner_tries': 0, 'api': None, 'env': False}
+# Trained styles. The adapter was trained on the xl-sft decoder (q/k/v/o projections of self and cross attention); how it
+# transfers to xl-turbo is unproven, so only xl-sft may carry one.
+STYLE_MODEL = 'xl-sft'
+STYLE_KEY = re.compile(r'^ace-loras/[A-Za-z0-9._-]{1,60}$')    # a B2 prefix, one level below ace-loras/
+STYLE_SCALE_MIN, STYLE_SCALE_MAX = 0.0, 1.5
+STYLE_SCALE_SENTENCE = f'Style strength must be a number from {STYLE_SCALE_MIN:g} to {STYLE_SCALE_MAX:g}.'
+STYLE_LANGUAGE = 'en'              # the language written in the adapter's training lyric header
+STYLE_TAG_MAX = 40
+STYLE_NAME_MAX = 40
+STYLE_DIR = '/tmp/ace-lora'
+STYLE_SERVE, STYLE_CONFIG, STYLE_WEIGHTS = 'serve.json', 'adapter_config.json', 'adapter_model.safetensors'
+STYLE_FILE_MAX = 1 << 20           # serve.json and adapter_config.json are tiny; anything bigger is not one
+TAG_FIELDS = ('trigger_tag', 'trigger_word', 'custom_tag')       # serve.json names the trigger word one of these ways
+PROJECTIONS = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
+# PEFT's saved names for a LoRA over the decoder: base_model.model.<decoder module path>.lora_A.weight (no adapter name)
+ADAPTER_KEY = re.compile(r'^base_model\.model\.(layers\.\d+\.(?:self_attn|cross_attn)\.(?:q|k|v|o)_proj)\.lora_([AB])\.weight$')
+ADAPTER_DTYPES = ('F32', 'F16', 'BF16')       # safetensors dtype names the fold can read
+# adapter_config.json settings that change what "W += (alpha / r) * B @ A" means; any of them set means: not folded
+VARIANT_FIELDS = ('use_rslora', 'use_dora', 'use_qalora', 'lora_bias', 'fan_in_fan_out', 'rank_pattern', 'alpha_pattern',
+                  'modules_to_save', 'target_parameters', 'trainable_token_indices', 'alora_invocation_tokens',
+                  'layer_replication', 'arrow_config')
+SHA256 = re.compile(r'^[0-9a-fA-F]{64}$')
+
+STATE = {'ckpt': None, 'built': set(), 'dit': {}, 'llm': None, 'planner_tries': 0, 'api': None, 'env': False,
+         # models whose decoder weights may differ from the checkpoint (a style fold not yet undone and verified):
+         # engine() reloads such a model before it is used again. styles: key -> the adapter fetched and checked.
+         'dirty': set(), 'styles': {}}
+# One render at a time. RunPod runs one job per worker, but a style is folded into the one shared decoder, so this
+# keeps an accidental second job (a concurrency setting someone adds later) from rendering on adapted weights.
+RENDER_LOCK = threading.Lock()
 
 
 class RequestError(Exception):
@@ -471,6 +510,11 @@ def load_dit(model):
 def engine(model):
     """The loaded DiT handler for a model, loading it (and releasing the other DiT on a small card) if needed."""
     handler = STATE['dit'].get(model)
+    if model in STATE['dirty']:
+        # A style fold that could not be undone and verified: these weights are never served, to a plain song or a
+        # styled one. They are let go and loaded again from the checkpoint below.
+        print(f'ACE-Step {model}: weights reloaded after a style could not be removed cleanly', flush=True)
+        handler = None
     if handler is not None and getattr(handler, 'model', None) is not None:
         return handler
     require_gpu()
@@ -485,6 +529,7 @@ def engine(model):
         release_dit(stale)      # a handler whose model was lost may still hold the VAE or text encoder
     began = time.monotonic()
     STATE['dit'][model] = load_dit(model)
+    STATE['dirty'].discard(model)      # a fresh load is the checkpoint's own weights
     print(f'ACE-Step {model} loaded in {time.monotonic() - began:.1f}s', flush=True)
     return STATE['dit'][model]
 
@@ -605,6 +650,8 @@ def request_input(raw):
         raise RequestError('Model must be xl-turbo or xl-sft.')
     spec = DIT_MODELS[model]
     notes = []
+    style, style_notes = style_choice(raw, model)
+    notes += style_notes
 
     caption = raw.get('caption')
     if not isinstance(caption, str):
@@ -668,10 +715,12 @@ def request_input(raw):
             raise RequestError('Time signature must be 2, 3, 4 or 6.')
 
     language = raw.get('vocal_language')
-    language = 'unknown' if language in (None, '') else language
+    language = (STYLE_LANGUAGE if style else 'unknown') if language in (None, '') else language
     if not isinstance(language, str) or language.strip().lower() not in VALID_LANGUAGES:
         raise RequestError('Vocal language must be a short code such as en.')
     language = language.strip().lower()
+    if style and language != STYLE_LANGUAGE:
+        notes.append('The style was taught on English songs, so another language may sound less like it.')
 
     thinking = raw.get('thinking')
     thinking = True if thinking is None else thinking
@@ -704,23 +753,384 @@ def request_input(raw):
     return dict(mode=mode, model=model, caption=caption, lyrics=lyrics, instrumental=instrumental,
                 duration=float(duration), seed=seed, batch_size=batch, bpm=bpm, keyscale=keyscale,
                 timesignature=signature, vocal_language=language, thinking=thinking, steps=steps,
-                guidance_scale=guidance, shift=shift, lm_temperature=temperature, notes=notes)
+                guidance_scale=guidance, shift=shift, lm_temperature=temperature, style=style, notes=notes)
 
 
-def refuse_adapter(raw):
-    """lora_key is reserved for a later phase: refuse it before any work is done."""
-    if raw.get('lora_key') not in (None, ''):
+# ---------------------------------------------------------------- trained styles (ACE_NOTES section 9)
+
+class StyleProblem(Exception):
+    """An adapter that cannot be used; the message is a short fixed reason for the worker log, never shown to a caller."""
+
+
+def style_choice(raw, model):
+    """(style, notes) from lora_key and lora_scale. style is None (a plain song) or {'key', 'scale'}.
+
+    A key that is unknown to the regex, or a style asked of the fast model, is a plain refusal sentence. A strength of 0
+    means no style at all (the evaluation harness renders scale 0 as the plain model, without the trigger word), so it
+    fetches nothing and folds nothing."""
+    key = raw.get('lora_key')
+    if key in (None, ''):
+        style_scale(raw)        # a strength with no style is checked like any field and then means nothing
+        return None, []
+    if not isinstance(key, str) or not STYLE_KEY.fullmatch(key) or '..' in key or key.split('/')[1].startswith('.'):
         raise RequestError(ADAPTER_SENTENCE)
+    if model != STYLE_MODEL:
+        raise RequestError(STYLE_MODEL_SENTENCE)
+    scale = style_scale(raw)
+    if scale == 0:
+        return None, ['The style strength was 0, so the song was made without the style.']
+    return {'key': key, 'scale': scale}, []
 
 
-def apply_adapter(pipe, key):
-    """RESERVED (LoRA phase). Today a request with lora_key is refused before the pipeline is touched.
+def style_scale(raw):
+    """lora_scale as a float from 0 to 1.5 (1.0 when absent); a plain sentence for anything else."""
+    scale = raw.get('lora_scale')
+    if scale is None:
+        return 1.0
+    scale = _real(scale)
+    if scale is None or not STYLE_SCALE_MIN <= scale <= STYLE_SCALE_MAX:
+        raise RequestError(STYLE_SCALE_SENTENCE)
+    return float(scale)
 
-    Where it will go: fetch the adapter file for `key` from B2 into the job's temp folder, then on the DiT handler
-    `pipe`: add_lora(folder, name), set_lora_scale(name, scale) (acestep core/generation/handler/lora_manager.py),
-    render, and in a finally block unload_lora() so the next job starts from the plain model. peft is not in the
-    image yet, and the LoRA manager refuses quantized models, which is why INT8 stays off."""
-    raise NotImplementedError(ADAPTER_SENTENCE)
+
+def tagged_caption(tag, caption):
+    """(text, note): the trigger word ahead of the caption the way the adapter was trained ("<tag>, <caption>"), inside
+    the 512-character limit. The caption gives way at a word boundary; the tag is never cut."""
+    cut, shortened = trim_caption(caption, CAPTION_MAX - len(tag) - 2)
+    return f'{tag}, {cut}', ('The music description was shortened to make room for the style.' if shortened else None)
+
+
+def style_root():
+    return Path(os.environ.get('ACE_LORA_DIR', STYLE_DIR))
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _small_json(path):
+    path = Path(path)
+    if path.stat().st_size > STYLE_FILE_MAX:
+        raise StyleProblem('a settings file is too big')
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except ValueError:
+        raise StyleProblem('a settings file is not JSON') from None
+    if not isinstance(data, dict):
+        raise StyleProblem('a settings file is not an object')
+    return data
+
+
+def read_serve(path, key):
+    """(sha256, tag, name) from serve.json: the weights' checksum, the trigger word and a short display name."""
+    data = _small_json(path)
+    sha = data.get('adapter_model_sha256')
+    if not isinstance(sha, str) or not SHA256.fullmatch(sha):
+        raise StyleProblem('serve.json has no usable checksum')
+    tag = next((data[field] for field in TAG_FIELDS if isinstance(data.get(field), str) and data[field].strip()), None)
+    tag = tag.strip() if tag else None
+    if not tag or len(tag) > STYLE_TAG_MAX or not tag.isprintable():
+        raise StyleProblem('serve.json has no usable trigger word')
+    name = data.get('name')
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > STYLE_NAME_MAX or not name.isprintable():
+        name = key.split('/', 1)[1]
+    return sha.lower(), tag, name.strip()
+
+
+def read_adapter_config(path):
+    """(rank, alpha) from adapter_config.json. Only the plain LoRA this fold implements is accepted: PEFT's scale is
+    alpha / r, so anything that changes that rule (rsLoRA, DoRA, per-module ranks or alphas, a bias, a transposed
+    weight, saved extra modules) is refused rather than folded wrongly."""
+    data = _small_json(path)
+    rank, alpha = data.get('r'), data.get('lora_alpha')
+    if type(rank) is not int or rank < 1 or _real(alpha) is None or alpha <= 0:
+        raise StyleProblem('adapter_config.json has no usable rank or alpha')
+    targets = data.get('target_modules')
+    if data.get('peft_type') != 'LORA' or not isinstance(targets, list) or not targets \
+            or not set(targets) <= set(PROJECTIONS):
+        raise StyleProblem('adapter_config.json is not a LoRA over the attention projections')
+    if any(data.get(field) for field in VARIANT_FIELDS) or data.get('bias') not in (None, 'none'):
+        raise StyleProblem('adapter_config.json uses a LoRA variant this worker does not fold')
+    return rank, float(alpha)
+
+
+def adapter_modules(path, rank):
+    """{decoder module path: (A shape, B shape)} read from the safetensors header alone (no tensor data is read), after
+    checking every name, number format and rank. Raises StyleProblem for anything the fold cannot do exactly."""
+    from safetensors import safe_open
+    found = {}
+    with safe_open(str(path), framework='pt', device='cpu') as handle:
+        for name in handle.keys():
+            match = ADAPTER_KEY.fullmatch(name)
+            if not match:
+                raise StyleProblem('the adapter has a weight this worker does not fold')
+            piece = handle.get_slice(name)
+            if piece.get_dtype() not in ADAPTER_DTYPES:
+                raise StyleProblem('the adapter has an unexpected number format')
+            found.setdefault(match.group(1), {})[match.group(2)] = tuple(piece.get_shape())
+    modules = {}
+    for module, parts in sorted(found.items()):
+        if set(parts) != {'A', 'B'}:
+            raise StyleProblem('the adapter has half a pair')
+        a, b = parts['A'], parts['B']
+        if len(a) != 2 or len(b) != 2 or a[0] != rank or b[1] != rank:
+            raise StyleProblem('the adapter does not have the rank its settings say')
+        modules[module] = (a, b)
+    if not modules:
+        raise StyleProblem('the adapter is empty')
+    return modules
+
+
+class Adapter:
+    """A trained style that was fetched, checked and is ready to fold: files in `folder`, what serve.json says
+    (sha256, tag, name), PEFT's scaling (alpha / r) and the shape of every pair."""
+
+    def __init__(self, key, folder, sha256, tag, name, rank, alpha, modules, size):
+        self.key, self.folder, self.sha256, self.tag, self.name = key, folder, sha256, tag, name
+        self.rank, self.alpha, self.modules, self.size = rank, alpha, modules, size
+        self.scaling = alpha / rank
+
+    def pair(self, module):
+        """(A, B) float tensors of one decoder module, read from the file when asked (one pair at a time)."""
+        from safetensors import safe_open
+        with safe_open(str(self.folder / STYLE_WEIGHTS), framework='pt', device='cpu') as handle:
+            return (handle.get_tensor(f'base_model.model.{module}.lora_A.weight'),
+                    handle.get_tensor(f'base_model.model.{module}.lora_B.weight'))
+
+
+def _present(adapter):
+    try:
+        return (adapter.folder / STYLE_WEIGHTS).stat().st_size == adapter.size
+    except OSError:
+        return False
+
+
+def _download(client, bucket, key, destination):
+    """One object to `destination`, through a .part file so a half-written file is never at the final name."""
+    part = destination.with_name(destination.name + '.part')
+    try:
+        client.download_file(bucket, key, str(part))
+        return part
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+
+
+def fetch_adapter(client, bucket, key, say=None):
+    """The Adapter for a style key: from this worker's cache, or fetched from B2 (three files), checked against its
+    serve.json checksum and read for shape. Any problem is a plain WorkerError and a fixed line in the log; nothing is
+    cached unless every check passed."""
+    cached = STATE['styles'].get(key)
+    if cached is not None and _present(cached):
+        return cached
+    if say is not None:
+        say('Loading the style')
+    try:
+        folder = style_root() / key.split('/', 1)[1]
+        folder.mkdir(parents=True, exist_ok=True)
+        for name in (STYLE_SERVE, STYLE_CONFIG):
+            os.replace(_download(client, bucket, f'{key}/{name}', folder / name), folder / name)
+        sha, tag, label = read_serve(folder / STYLE_SERVE, key)
+        rank, alpha = read_adapter_config(folder / STYLE_CONFIG)
+        part = _download(client, bucket, f'{key}/{STYLE_WEIGHTS}', folder / STYLE_WEIGHTS)
+        try:
+            if file_sha256(part) != sha:
+                raise StyleProblem('the adapter does not match its checksum')
+            modules = adapter_modules(part, rank)
+            os.replace(part, folder / STYLE_WEIGHTS)
+        finally:
+            part.unlink(missing_ok=True)
+        adapter = Adapter(key, folder, sha, tag, label, rank, alpha, modules, (folder / STYLE_WEIGHTS).stat().st_size)
+    except StyleProblem as problem:
+        print('ACE-Step style refused:', problem, flush=True)
+        raise WorkerError(ADAPTER_SENTENCE) from None
+    except Exception as error:      # a missing object, a network or disk problem, a bad file: only the type is logged
+        print('ACE-Step style could not be fetched:', type(error).__name__, flush=True)
+        raise WorkerError(ADAPTER_SENTENCE) from None
+    STATE['styles'][key] = adapter
+    print(f'ACE-Step style {adapter.name} fetched: {len(modules)} pairs, rank {rank}', flush=True)
+    return adapter
+
+
+class TorchOps:
+    """The five operations a fold needs on real weights. Nothing else touches torch tensors, so the fold's bookkeeping
+    (the order of things, the restore, the dirty flag) is tested with a plain-Python stand-in as well as with this one."""
+
+    def __init__(self):
+        import torch
+        self.torch = torch
+
+    def mode(self):
+        # inference_mode, not no_grad: the decoder's parameters still require grad (upstream never freezes them, so a
+        # plain in-place write raises), and a parameter that was ever created inside inference mode can only be written
+        # inside it. inference_mode accepts both.
+        return self.torch.inference_mode()
+
+    def supported(self, param):
+        return param.dim() == 2 and param.dtype in (self.torch.bfloat16, self.torch.float16, self.torch.float32)
+
+    def snapshot(self, param):
+        return param.detach().to('cpu', copy=True)
+
+    def nbytes(self, saved):
+        return saved.numel() * saved.element_size()
+
+    def checksum(self, param):
+        """Two integer sums over the exact bit patterns (plain and position weighted), computed where the weight lives."""
+        torch = self.torch
+        bits = param.detach().reshape(-1).view(torch.int16 if param.element_size() == 2 else torch.int32).to(torch.int64)
+        place = torch.arange(1, bits.numel() + 1, dtype=torch.int64, device=bits.device)
+        return int(bits.sum()), int((bits * place).sum())
+
+    def fold(self, param, a, b, factor):
+        """param += factor * (B @ A), computed in fp32 and written back in the weight's own dtype (round to nearest)."""
+        torch = self.torch
+        a32 = a.to(device=param.device, dtype=torch.float32)
+        b32 = b.to(device=param.device, dtype=torch.float32)
+        delta = b32 @ a32
+        delta.mul_(factor)
+        merged = param.detach().to(torch.float32, copy=True)
+        merged.add_(delta)
+        param.copy_(merged)
+
+    def put_back(self, param, saved):
+        param.copy_(saved)
+
+
+class StyleFold:
+    """An adapter folded into a decoder: W += (alpha / r) * scale * (B @ A) for every pair, undone from a pristine copy.
+
+    Order of events, which is what keeps the next song clean:
+      1. resolve every target and check its shape and number format (nothing is written if any is wrong);
+      2. copy every touched weight to the CPU and record a checksum of each (still nothing written);
+      3. mark the model dirty, then write the folded weights;
+      4. restore(): copy the pristine weights back, compare checksums, and only then clear the dirty mark.
+    A model left dirty is reloaded from the checkpoint by engine() before anyone uses it again."""
+
+    def __init__(self, decoder, adapter, scale, model, ops=None):
+        self.decoder, self.adapter, self.model, self.scale = decoder, adapter, model, scale
+        self.factor = adapter.scaling * scale
+        self.ops = ops or TorchOps()
+        self.params, self.saved, self.sums = {}, {}, {}
+        self.armed = False          # true from the first write on: the weights may differ from the checkpoint
+        self.restored = None        # None until restore() ran; then True (verified) or False (marked dirty)
+        self.held_bytes = 0
+        self.apply_s = self.restore_s = 0.0
+
+    def resolve(self):
+        seen = set()
+        for module, (a_shape, b_shape) in self.adapter.modules.items():
+            try:
+                param = self.decoder.get_parameter(module + '.weight')
+            except Exception:
+                raise StyleProblem('the decoder does not have a weight the adapter targets') from None
+            if tuple(param.shape) != (b_shape[0], a_shape[1]) or not self.ops.supported(param):
+                raise StyleProblem('a decoder weight does not fit the adapter')
+            if id(param) in seen:
+                raise StyleProblem('two adapter pairs target one shared weight')
+            seen.add(id(param))
+            self.params[module] = param
+
+    def apply(self):
+        if self.model in STATE['dirty'] or getattr(self.decoder, 'peft_config', None) is not None:
+            raise StyleProblem('the decoder is not in its plain state')
+        began = time.monotonic()
+        ops = self.ops
+        with ops.mode():
+            self.resolve()
+            for module, param in self.params.items():
+                self.saved[module] = ops.snapshot(param)
+                self.sums[module] = ops.checksum(param)
+                self.held_bytes += ops.nbytes(self.saved[module])
+            STATE['dirty'].add(self.model)
+            self.armed = True
+            for module, param in self.params.items():
+                a, b = self.adapter.pair(module)
+                ops.fold(param, a, b, self.factor)
+        self.apply_s = time.monotonic() - began
+        print(f'ACE-Step style {self.adapter.name} folded into {len(self.params)} weights at strength {self.scale:g} '
+              f'in {self.apply_s:.1f}s ({self.held_bytes / 2 ** 30:.2f} GiB held on the CPU)', flush=True)
+
+    def restore(self):
+        """Put every touched weight back, verify it bit for bit, and only then clear the dirty mark. Never raises (a
+        KeyboardInterrupt aside): a restore that cannot be proven leaves the model marked dirty and says so in the log."""
+        if not self.armed:
+            self.saved.clear()
+            self.restored = True        # nothing was ever written
+            return
+        began = time.monotonic()
+        ops = self.ops
+        failed = list(self.params)
+        for _attempt in range(2):
+            try:
+                with ops.mode():
+                    for module in failed:
+                        ops.put_back(self.params[module], self.saved[module])
+                    failed = [module for module in failed if ops.checksum(self.params[module]) != self.sums[module]]
+            except Exception as error:
+                print('ACE-Step style restore error:', type(error).__name__, flush=True)
+            if not failed:
+                break
+        self.restore_s = time.monotonic() - began
+        self.restored = not failed
+        self.saved.clear()      # the pristine copy is let go either way: a model that failed is reloaded, not repaired
+        if self.restored:
+            STATE['dirty'].discard(self.model)
+            print(f'ACE-Step style {self.adapter.name} removed and the {len(self.params)} weights verified in '
+                  f'{self.restore_s:.1f}s', flush=True)
+        else:
+            print(f'ACE-Step style {self.adapter.name}: RESTORE FAILED for {len(failed)} weights; the {self.model} '
+                  'model is marked dirty and will be reloaded before its next use', flush=True)
+
+
+@contextlib.contextmanager
+def apply_adapter(pipe, adapter, scale, model=STYLE_MODEL, ops=None):
+    """Fold `adapter` into the DiT handler `pipe` at `scale` for the length of the with block, then undo it.
+
+    The undo runs in a finally, so it also runs when the render raises, fails or is cancelled (KeyboardInterrupt and
+    SystemExit included). Yields the StyleFold (timings, restored flag). Problems found before anything is written are
+    WorkerError(ADAPTER_SENTENCE); the weights are untouched then."""
+    model_object = getattr(pipe, 'model', None)
+    decoder = getattr(model_object, 'decoder', None)
+    if decoder is None or getattr(pipe, 'lora_loaded', False):
+        print('ACE-Step style refused: the decoder is not available or already carries an upstream adapter', flush=True)
+        raise WorkerError(ADAPTER_SENTENCE)
+    fold = StyleFold(decoder, adapter, scale, model, ops)
+    try:
+        try:
+            fold.apply()
+        except StyleProblem as problem:
+            print('ACE-Step style refused:', problem, flush=True)
+            raise WorkerError(ADAPTER_SENTENCE) from None
+        yield fold
+    finally:
+        fold.restore()
+        empty_cache()
+
+
+class PlainCaptionPlanner:
+    """Wraps the loaded planner so it reads the caller's PLAIN caption while the DiT keeps the tagged one.
+
+    generate_music hands params.caption to both. The adapter was trained with the trigger word in the DiT's caption, but
+    the planner never saw it, and the evaluation samples had the planner plan on the plain caption. Upstream calls
+    llm_handler.generate_with_stop_condition(caption=..., ...) by keyword and reads llm_handler.llm_initialized,
+    nothing else (a test pins this to the source); every other attribute is the real planner's."""
+
+    def __init__(self, llm, caption):
+        self._llm, self._caption = llm, caption
+
+    def __getattr__(self, name):
+        if name.startswith('_'):
+            raise AttributeError(name)
+        return getattr(self._llm, name)
+
+    def generate_with_stop_condition(self, *args, **kwargs):
+        kwargs['caption'] = self._caption
+        return self._llm.generate_with_stop_condition(*args, **kwargs)
 
 
 def take_seeds(seed, count):
@@ -757,9 +1167,12 @@ def planner_temperature(request, planner_used):
 
 # ---------------------------------------------------------------- one render
 
-def build_generation(api, request, settings, seeds, thinking):
-    """GenerationParams and GenerationConfig for one request (field names checked against the pinned source)."""
-    rewrite = thinking and os.environ.get('ACE_PLANNER_REWRITES_CAPTION') == '1'
+def build_generation(api, request, settings, seeds, thinking, caption=None):
+    """GenerationParams and GenerationConfig for one request (field names checked against the pinned source).
+
+    `caption` is the DiT's caption when it is not the caller's own: a styled request sends the trigger word ahead of it.
+    Then the planner may not rewrite it either (the rewrite would drop the trigger word the adapter answers to)."""
+    rewrite = thinking and caption is None and os.environ.get('ACE_PLANNER_REWRITES_CAPTION') == '1'
     strengths = {}
     if settings['dcw_enabled']:
         scaler, high_scaler = DCW_STRENGTHS[bool(thinking)]
@@ -769,7 +1182,7 @@ def build_generation(api, request, settings, seeds, thinking):
     if temperature is not None:
         sampling = dict(lm_temperature=temperature)   # left out otherwise, so upstream keeps its own 0.85
     params = api.GenerationParams(
-        task_type='text2music', caption=request['caption'], lyrics=request['lyrics'],
+        task_type='text2music', caption=request['caption'] if caption is None else caption, lyrics=request['lyrics'],
         instrumental=request['instrumental'], vocal_language=request['vocal_language'], bpm=request['bpm'],
         keyscale=request['keyscale'], timesignature=request['timesignature'], duration=request['duration'],
         inference_steps=settings['steps'], guidance_scale=settings['guidance_scale'], shift=settings['shift'],
@@ -930,8 +1343,14 @@ def render(job, request, start):
     notes += setting_notes
     seeds = take_seeds(request['seed'], request['batch_size'])
     progress = make_progress(job)
+    style, adapter, fold, style_fetch_s = request['style'], None, None, 0.0
     with tempfile.TemporaryDirectory() as td:
         client, bucket = storage()   # a missing setting fails here, before any GPU time is spent
+        if style:
+            # fetched and checked before the model loads: a style that cannot be used should not cost a model load
+            fetch_began = time.monotonic()
+            adapter = fetch_adapter(client, bucket, style['key'], lambda text: announce(job, text))
+            style_fetch_s = round(time.monotonic() - fetch_began, 1)
         load_began = time.monotonic()
         if request['model'] not in STATE['dit']:
             announce(job, 'Loading the music model')   # xl-sft loads on its first use and takes a while
@@ -948,19 +1367,34 @@ def render(job, request, start):
             notes.append('The creative variation setting was not used because the planner did not run.')
         model_load_s = round(time.monotonic() - load_began, 1)
 
-        # LoRA seam: a request's lora_key would be applied here (apply_adapter(dit, key)) and removed in a finally
-        # after generate_music. request_input refuses lora_key today, so nothing is applied.
+        # A styled request: the DiT's caption carries the trigger word, the planner is shown the plain caption (as the
+        # evaluation samples were made), and the adapter is folded into the decoder for the length of generate_music only.
+        dit_caption, brain = None, llm
+        if adapter is not None:
+            dit_caption, shortened = tagged_caption(adapter.tag, request['caption'])
+            if shortened:
+                notes.append(shortened)
+            if llm is not None:
+                brain = PlainCaptionPlanner(llm, request['caption'])
+            notes.append(f'Made in the {adapter.name} style at strength {style["scale"]:g}, with its trigger word '
+                         f'"{adapter.tag}" ahead of the music description.')
         api = upstream()
-        params, config = build_generation(api, request, settings, seeds, llm is not None)
+        params, config = build_generation(api, request, settings, seeds, llm is not None, caption=dit_caption)
         seed_everything(seeds[0])
-        gpu_peak(reset=True)
-        began = time.monotonic()
-        result = api.generate_music(dit, llm, params, config, save_dir=None, progress=progress)
-        generate_s = time.monotonic() - began
-        peak = gpu_peak()
+        scope = (apply_adapter(dit, adapter, style['scale'], request['model']) if adapter is not None
+                 else contextlib.nullcontext())
+        with scope as fold:     # on the way out the weights are put back and checked, whatever happened inside
+            gpu_peak(reset=True)
+            began = time.monotonic()
+            result = api.generate_music(dit, brain, params, config, save_dir=None, progress=progress)
+            generate_s = time.monotonic() - began
+            peak = gpu_peak()
+        if fold is not None and not fold.restored:
+            notes.append('The music model will be reloaded before the next song.')
         audios = [a for a in (result.audios or []) if a.get('tensor') is not None] if result.success else []
         if not audios:
-            print('ACE-Step generation failed:', scrub(result.error, request['caption'], request['lyrics']), flush=True)
+            print('ACE-Step generation failed:', scrub(result.error, request['caption'], request['lyrics'], dit_caption),
+                  flush=True)
             raise WorkerError(plain_failure(result.error))
         if len(audios) < len(seeds):
             notes.append(f'Only {len(audios)} of {len(seeds)} takes fit in memory.')
@@ -993,6 +1427,10 @@ def render(job, request, start):
     controls = {'steps': settings['steps'], 'guidance_scale': settings['guidance_scale'], 'shift': settings['shift']}
     if temperature is not None:
         controls['lm_temperature'] = temperature   # only what the planner really used; absent otherwise
+    if adapter is not None:
+        timing.update(style_fetch_s=style_fetch_s, style_apply_s=round(fold.apply_s, 2),
+                      style_restore_s=round(fold.restore_s, 2))
+        controls.update(style=adapter.name, style_scale=style['scale'], style_tag=adapter.tag)
     output = {'engine': 'ace', 'mode': 'render', 'model': request['model'], 'key': first['key'],
               'wav_key': first['wav_key'], 'url': first['url'], 'wav_url': first['wav_url'],
               'duration_s': first['duration_s'], 'bytes': first['bytes'], 'seed': first['seed'],
@@ -1003,6 +1441,9 @@ def render(job, request, start):
               'features': list(FEATURES), 'versions': versions(), 'worker_notes': notes}
     if plan:
         output['plan'] = plan
+    if adapter is not None:
+        output['style'] = {'key': style['key'], 'name': adapter.name, 'scale': style['scale'], 'tag': adapter.tag,
+                           'sha256': adapter.sha256}
     return output
 
 
@@ -1027,18 +1468,17 @@ def handler(job):
         raw = {} if raw is None else raw
         if not isinstance(raw, dict):
             raise RequestError('Send the request as named fields.')
-        refuse_adapter(raw)
         if raw.get('mode') == 'probe':
             return probe(start)
-        return render(job, request_input(raw), start)
+        request = request_input(raw)
+        with RENDER_LOCK:       # one render at a time: a style is folded into the one shared decoder (see RENDER_LOCK)
+            return render(job, request, start)
     except RequestError as error:
         return {'error': str(error)}
     except WorkerError as error:
         print('ACE-Step failed:', type(error).__name__, flush=True)
         return {'error': str(error)}
     except Exception as error:
-        if isinstance(error, NotImplementedError) and str(error) == ADAPTER_SENTENCE:
-            return {'error': ADAPTER_SENTENCE}   # apply_adapter's own refusal, not a torch "not implemented"
         # only the type is logged: a message can carry the caption, the lyrics or a URL
         print('ACE-Step failed:', type(error).__name__, flush=True)
         gc.collect()
