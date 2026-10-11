@@ -1011,21 +1011,36 @@ class StyleFold:
       4. restore(): copy the pristine weights back, compare checksums, and only then clear the dirty mark.
     A model left dirty is reloaded from the checkpoint by engine() before anyone uses it again."""
 
-    def __init__(self, decoder, adapter, scale, model, ops=None):
-        self.decoder, self.adapter, self.model, self.scale = decoder, adapter, model, scale
+    def __init__(self, pipe, adapter, scale, model, ops=None):
+        self.pipe, self.adapter, self.model, self.scale = pipe, adapter, model, scale
         self.factor = adapter.scaling * scale
         self.ops = ops or TorchOps()
         self.params, self.saved, self.sums = {}, {}, {}
         self.armed = False          # true from the first write on: the weights may differ from the checkpoint
         self.restored = None        # None until restore() ran; then True (verified) or False (marked dirty)
+        self.moved = set()          # modules whose weight was a different object at restore time than at fold time
         self.held_bytes = 0
         self.apply_s = self.restore_s = 0.0
 
+    def decoder(self):
+        """The module that holds the DiT decoder weights right now: pipe.model.decoder (the lyric and timbre encoders have
+        q_proj and the rest too, and are not the decoder). Looked up again at restore time, never kept."""
+        return getattr(getattr(self.pipe, 'model', None), 'decoder', None)
+
+    def live(self, module):
+        """The weight object that holds `module` now. If something replaced the Parameter (or the whole decoder) during
+        the render, the restore still goes to the live one, and fails loudly if there is none."""
+        param = self.decoder().get_parameter(module + '.weight')
+        if param is not self.params[module]:
+            self.moved.add(module)
+        return param
+
     def resolve(self):
         seen = set()
+        decoder = self.decoder()
         for module, (a_shape, b_shape) in self.adapter.modules.items():
             try:
-                param = self.decoder.get_parameter(module + '.weight')
+                param = decoder.get_parameter(module + '.weight')
             except Exception:
                 raise StyleProblem('the decoder does not have a weight the adapter targets') from None
             if tuple(param.shape) != (b_shape[0], a_shape[1]) or not self.ops.supported(param):
@@ -1036,7 +1051,7 @@ class StyleFold:
             self.params[module] = param
 
     def apply(self):
-        if self.model in STATE['dirty'] or getattr(self.decoder, 'peft_config', None) is not None:
+        if self.model in STATE['dirty'] or getattr(self.decoder(), 'peft_config', None) is not None:
             raise StyleProblem('the decoder is not in its plain state')
         began = time.monotonic()
         ops = self.ops
@@ -1069,8 +1084,8 @@ class StyleFold:
             try:
                 with ops.mode():
                     for module in failed:
-                        ops.put_back(self.params[module], self.saved[module])
-                    failed = [module for module in failed if ops.checksum(self.params[module]) != self.sums[module]]
+                        ops.put_back(self.live(module), self.saved[module])
+                    failed = [module for module in failed if ops.checksum(self.live(module)) != self.sums[module]]
             except Exception as error:
                 print('ACE-Step style restore error:', type(error).__name__, flush=True)
             if not failed:
@@ -1078,6 +1093,9 @@ class StyleFold:
         self.restore_s = time.monotonic() - began
         self.restored = not failed
         self.saved.clear()      # the pristine copy is let go either way: a model that failed is reloaded, not repaired
+        if self.moved:
+            print(f'ACE-Step style {self.adapter.name}: the render replaced decoder weight objects; the weights were '
+                  'restored into the live ones', flush=True)
         if self.restored:
             STATE['dirty'].discard(self.model)
             print(f'ACE-Step style {self.adapter.name} removed and the {len(self.params)} weights verified in '
@@ -1094,18 +1112,17 @@ def apply_adapter(pipe, adapter, scale, model=STYLE_MODEL, ops=None):
     The undo runs in a finally, so it also runs when the render raises, fails or is cancelled (KeyboardInterrupt and
     SystemExit included). Yields the StyleFold (timings, restored flag). Problems found before anything is written are
     WorkerError(ADAPTER_SENTENCE); the weights are untouched then."""
-    model_object = getattr(pipe, 'model', None)
-    decoder = getattr(model_object, 'decoder', None)
-    if decoder is None or getattr(pipe, 'lora_loaded', False):
+    fold = StyleFold(pipe, adapter, scale, model, ops)
+    if fold.decoder() is None or getattr(pipe, 'lora_loaded', False):
         print('ACE-Step style refused: the decoder is not available or already carries an upstream adapter', flush=True)
         raise WorkerError(ADAPTER_SENTENCE)
-    fold = StyleFold(decoder, adapter, scale, model, ops)
     try:
         try:
             fold.apply()
         except StyleProblem as problem:
             print('ACE-Step style refused:', problem, flush=True)
             raise WorkerError(ADAPTER_SENTENCE) from None
+        empty_cache()       # the fold's temporaries (about 0.3 GB of fp32) are handed back before the render starts
         yield fold
     finally:
         fold.restore()

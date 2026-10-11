@@ -1680,10 +1680,18 @@ class TestFoldBookkeeping(unittest.TestCase):
             self.assertEqual(ace.STATE['dirty'], {'xl-turbo', 'xl-sft'})
         self.assertEqual(ace.STATE['dirty'], {'xl-turbo'})
 
-    def test_the_memory_given_back_after_a_fold(self):
-        with mock.patch.object(ace, 'empty_cache') as emptied, quiet(), self.scope():
-            pass
-        emptied.assert_called()
+    def test_the_memory_is_given_back_before_the_render_and_again_after_it(self):
+        seen = []
+        with mock.patch.object(ace, 'empty_cache', side_effect=lambda: seen.append('empty')) as emptied, quiet():
+            with self.scope():
+                seen.append('render')
+        self.assertEqual(seen, ['empty', 'render', 'empty'])
+        self.assertEqual(emptied.call_count, 2)
+        seen.clear()
+        with mock.patch.object(ace, 'empty_cache', side_effect=lambda: seen.append('empty')), quiet():
+            with self.assertRaises(RuntimeError), self.scope():
+                raise RuntimeError('render failed')
+        self.assertEqual(seen, ['empty', 'empty'])
 
     def test_the_log_says_how_much_was_held_and_never_a_path_or_a_word_of_the_song(self):
         buffer = io.StringIO()
@@ -1694,6 +1702,39 @@ class TestFoldBookkeeping(unittest.TestCase):
         self.assertIn('GiB held on the CPU', log)
         self.assertIn('removed and the 16 weights verified', log)
         self.assertNotIn('/nowhere', log)
+
+    def test_a_weight_object_replaced_during_the_render_is_restored_in_place(self):
+        name = 'layers.1.cross_attn.k_proj.weight'
+        with quiet(), self.scope() as fold:
+            old = self.decoder.params[name]
+            self.decoder.params[name] = ListParam(old.values, old.shape, old.dtype)       # same numbers, a new object
+        self.assertIs(fold.restored, True)
+        self.assertEqual(self.weights(), self.pristine)             # the live object was restored, not the old one
+        self.assertNotEqual(old.values, self.pristine[name])        # the one that was replaced is dead and stays as it was
+        self.assertEqual(fold.moved, {'layers.1.cross_attn.k_proj'})
+        self.assertEqual(ace.STATE['dirty'], set())
+
+    def test_a_decoder_replaced_during_the_render_is_restored_in_place(self):
+        copy = ListDecoder({name: ListParam(param.values, param.shape, param.dtype)
+                            for name, param in self.decoder.params.items()})
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), self.scope() as fold:
+            self.handler.model.decoder = copy
+        self.assertIs(fold.restored, True)
+        self.assertEqual({name: list(param.values) for name, param in copy.params.items()}, self.pristine)
+        self.assertEqual(len(fold.moved), 16)
+        self.assertIn('the render replaced decoder weight objects', buffer.getvalue())
+
+    def test_a_decoder_that_lost_the_weights_is_a_failed_restore_and_never_a_silent_one(self):
+        for replacement in (ListDecoder({}), None):
+            ace.STATE['dirty'].clear()
+            self.handler.model.decoder = self.decoder
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer), self.scope() as fold:
+                self.handler.model.decoder = replacement
+            self.assertIs(fold.restored, False)
+            self.assertEqual(ace.STATE['dirty'], {'xl-sft'})
+            self.assertIn('RESTORE FAILED for 16 weights', buffer.getvalue())
 
     def test_a_second_fold_after_a_clean_restore_is_allowed(self):
         for _ in range(3):
@@ -2022,6 +2063,9 @@ class StyledApi(FakeApi):
         return super().generate_music(dit, llm, params, config, save_dir, progress)
 
 
+REAL_FETCH_ADAPTER = ace.fetch_adapter
+
+
 class StyledHarness(Harness):
     def setUp(self):
         super().setUp()
@@ -2087,6 +2131,38 @@ class TestStyledSong(StyledHarness):
         self.assertIsInstance(self.last().llm, ace.PlainCaptionPlanner)
         self.assertEqual([t['seed'] for t in out['takes']], [5])
         json.dumps(out)
+
+    def test_the_whole_path_with_the_real_fetch_and_a_fake_bucket(self):
+        weights = b'W' * 3000
+        prefix = {'serve.json': json.dumps({'adapter_model_sha256': hashlib.sha256(weights).hexdigest(),
+                                            'trigger_tag': 'kdsoulr', 'name': 'Soul'}).encode(),
+                  'adapter_config.json': json.dumps(style_config()).encode(), 'adapter_model.safetensors': weights}
+        for name, data in prefix.items():
+            self.s3.objects[f'{STYLE_KEY}/{name}'] = data
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {'ACE_LORA_DIR': td}):
+            self.patch(ace, 'fetch_adapter', REAL_FETCH_ADAPTER)
+            self.patch(ace, 'adapter_modules', lambda path, rank: dict(self.adapter.modules))
+            self.patch(ace.Adapter, 'pair', lambda adapter, module: ([[1.0, 2.0]], [[3.0], [4.0]]))
+            out = self.styled()
+            self.assertNotIn('error', out)
+            self.assertEqual(out['style'], {'key': STYLE_KEY, 'name': 'Soul', 'scale': 1.0, 'tag': 'kdsoulr',
+                                            'sha256': hashlib.sha256(weights).hexdigest()})
+            self.assertEqual(self.last().params.caption, 'kdsoulr, Warm acoustic folk, brushed drums')
+            self.assertIn(('job-1', 'Loading the style'), self.progress_log)
+            self.assertEqual(len(self.s3.downloads), 3)
+            self.assertEqual((Path(td) / 'soul-real-v1' / 'adapter_model.safetensors').read_bytes(), weights)
+            self.assertEqual(self.weights(), self.pristine)
+            self.progress_log.clear()
+            again = self.styled(seed=3)                      # the next styled song on the same worker: nothing is fetched
+            self.assertNotIn('error', again)
+            self.assertEqual(len(self.s3.downloads), 3)
+            self.assertNotIn(('job-1', 'Loading the style'), self.progress_log)
+            self.assertIsInstance(out['timing']['style_fetch_s'], float)
+            self.assertLess(again['timing']['style_fetch_s'], 1.0)
+            self.s3.objects[f'{STYLE_KEY}/adapter_model.safetensors'] = b'X' * 3000      # a damaged copy in the bucket
+            ace.STATE['styles'].clear()
+            self.assertEqual(self.styled(), {'error': ace.ADAPTER_SENTENCE})
+            self.assertEqual((self.weights(), ace.STATE['dirty']), (self.pristine, set()))
 
     def test_the_answer_says_the_style_its_strength_and_its_tag(self):
         out = self.styled(lora_scale=0.6)
@@ -2860,7 +2936,7 @@ class TestAdapterFile(unittest.TestCase):
         with torch.device('meta'):
             decoder = Decoder().to(torch.bfloat16)
         adapter = ace.Adapter('ace-loras/real', REAL_ADAPTER, 'd' * 64, 'kdsoulr', 'Soul', 64, 128.0, modules, 1)
-        fold = ace.StyleFold(decoder, adapter, 1.0, 'xl-sft')
+        fold = ace.StyleFold(SimpleNamespace(model=SimpleNamespace(decoder=decoder)), adapter, 1.0, 'xl-sft')
         fold.resolve()
         self.assertEqual(len(fold.params), 256)
         held = sum(p.numel() * 2 for p in fold.params.values())
@@ -4404,6 +4480,18 @@ class TestPinnedUpstream(unittest.TestCase):
         loader = (folder / 'init_service_loader.py').read_text(encoding='utf-8')
         self.assertIn('self.model = self.model.to(device).to(self.dtype)', loader)
         self.assertIn('self.model.eval()', loader)
+
+    def test_no_decoder_derived_state_outlives_one_generation_call(self):
+        # A fold changes the weights between songs. That is only safe if nothing computed from the old weights is kept:
+        # the cross-attention key/value cache is a local of generate_audio, and the model keeps no cache attributes.
+        text = (UPSTREAM / 'acestep' / 'models' / 'xl_sft' / 'modeling_acestep_v15_xl_base.py').read_text(encoding='utf-8')
+        self.assertIn('        past_key_values = EncoderDecoderCache(DynamicCache(), DynamicCache())\n        momentum_buffer', text)
+        self.assertEqual(re.findall(r'self\.\w*(?:cache|past_key)\w*\s*=(?!=)', text), [])
+        handler = UPSTREAM / 'acestep' / 'core' / 'generation' / 'handler'
+        for path in [handler.parent.parent.parent / 'models' / 'xl_sft' / 'modeling_acestep_v15_xl_base.py',
+                     *sorted(handler.glob('*.py'))]:
+            if not path.name.endswith('_test.py'):                  # no captured CUDA graph holds the old weights either
+                self.assertNotRegex(path.read_text(encoding='utf-8'), r'CUDAGraph|make_graphed_callables|cuda\.graph', path.name)
 
 
 # ---------------------------------------------------------------- the built folder against upstream's own functions
