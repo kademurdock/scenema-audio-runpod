@@ -27,6 +27,18 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ace_handler as ace  # noqa: E402
 
+# Several tests restore sys.modules wholesale when they finish (mock.patch.dict), which forgets every module first
+# imported inside the test. A compiled extension such as safetensors' cannot be imported a second time in one process
+# ("PyO3 modules compiled for CPython 3.8 or older may only be initialized once per interpreter process"), so a test that
+# first-imported it would break the next test that needs it. The real packages are therefore imported up front, where
+# they exist; where they do not (Python 3.14 on this PC, the CI runner) the tests that need them are skipped.
+try:
+    import torch  # noqa: F401
+    import safetensors  # noqa: F401
+    import safetensors.torch  # noqa: F401
+except Exception:
+    pass
+
 KEY_MP3 = re.compile(r'^ace/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/master\.mp3$')
 KEY_WAV = re.compile(r'^ace/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/master\.wav$')
 SECRET_CAPTION = 'ZEBRA-CAPTION-SENTINEL for the log check'
@@ -45,6 +57,24 @@ def reset_state():
 def silently(function, *args, **kwargs):
     with contextlib.redirect_stdout(io.StringIO()):
         return function(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def fake_modules(**modules):
+    """These names point at the given objects in sys.modules for the length of the block; afterwards exactly those names
+    are put back (or removed if they were absent). Unlike mock.patch.dict(sys.modules, ...), which restores the whole
+    dictionary, a module that something first imported inside the block stays imported."""
+    absent = object()
+    before = {name: sys.modules.get(name, absent) for name in modules}
+    sys.modules.update(modules)
+    try:
+        yield
+    finally:
+        for name, module in before.items():
+            if module is absent:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 def valid(**changes):
@@ -68,6 +98,17 @@ class FakeS3:
         self.objects = {}          # key -> bytes, what download_file can fetch
         self.downloads = []        # (bucket, key) in the order they were asked for
         self.broken = set()        # keys whose download raises half way (after writing some bytes)
+        self.heads = []            # (bucket, key) of every head request
+        self.sizes = {}            # key -> what head_object reports instead of the real length ('' = no ContentLength)
+
+    def head_object(self, *, Bucket, Key):
+        """boto3's S3.Client.head_object(Bucket=..., Key=...): keyword only (boto3 raises TypeError for positional
+        arguments), answers a dict with ContentLength."""
+        self.heads.append((Bucket, Key))
+        if Key not in self.objects:
+            raise OSError('404 not found')
+        size = self.sizes.get(Key, len(self.objects[Key]))
+        return {} if size == '' else {'ContentLength': size}
 
     def download_file(self, bucket, key, filename):
         """boto3's S3.Client.download_file(Bucket, Key, Filename), positionally."""
@@ -162,9 +203,9 @@ class Harness(unittest.TestCase):
         self.progress_log = []
         fake_runpod = SimpleNamespace(serverless=SimpleNamespace(
             progress_update=lambda job, text: self.progress_log.append((job['id'], text))))
-        modules = mock.patch.dict(sys.modules, {'runpod': fake_runpod})
-        modules.start()
-        self.addCleanup(modules.stop)
+        modules = fake_modules(runpod=fake_runpod)       # only this entry: see fake_modules for why not patch.dict
+        modules.__enter__()
+        self.addCleanup(modules.__exit__, None, None, None)
         self.s3 = FakeS3()
         self.api = FakeApi()
         self.ffmpeg_log = []
@@ -183,6 +224,45 @@ class Harness(unittest.TestCase):
 
     def run_job(self, **changes):
         return silently(ace.handler, {'id': 'job-1', 'input': valid(**changes)})
+
+
+class TestHarnessKeepsImports(unittest.TestCase):
+    """The Harness must not forget modules that a test first imports (see the note at the top of this file)."""
+
+    def setUp(self):
+        for name in ('zz_inside', 'zz_faked', 'zz_kept'):
+            self.addCleanup(sys.modules.pop, name, None)
+
+    def test_fake_modules_puts_back_only_the_names_it_set(self):
+        kept, inside = ModuleType('zz_kept'), ModuleType('zz_inside')
+        sys.modules['zz_kept'] = kept
+        with fake_modules(zz_kept=None, zz_faked=ModuleType('zz_faked')):
+            self.assertIsNone(sys.modules['zz_kept'])
+            self.assertTrue('zz_faked' in sys.modules)
+            sys.modules['zz_inside'] = inside                    # something first imported inside the block
+        self.assertIs(sys.modules['zz_kept'], kept)              # an existing entry is restored, not dropped
+        self.assertFalse('zz_faked' in sys.modules)              # an absent one is removed again
+        self.assertIs(sys.modules['zz_inside'], inside)          # and the new import is left alone
+
+    def test_fake_modules_restores_after_an_exception(self):
+        with self.assertRaises(RuntimeError), fake_modules(zz_faked=ModuleType('zz_faked')):
+            raise RuntimeError('boom')
+        self.assertFalse('zz_faked' in sys.modules)
+
+    def test_a_harness_test_leaves_a_module_it_imported_in_place_and_removes_its_own_runpod(self):
+        inside = ModuleType('zz_inside')
+        before = sys.modules.get('runpod')
+
+        class Inner(Harness):
+            def test_imports_something(self):
+                self.assertIsNot(sys.modules['runpod'], before)          # the harness's own stand-in
+                sys.modules['zz_inside'] = inside
+
+        result = unittest.TestResult()
+        unittest.defaultTestLoader.loadTestsFromTestCase(Inner).run(result)
+        self.assertEqual((result.testsRun, result.errors, result.failures), (1, [], []))
+        self.assertIs(sys.modules['zz_inside'], inside)
+        self.assertIs(sys.modules.get('runpod'), before)
 
 
 # ---------------------------------------------------------------- pure helpers
@@ -847,6 +927,25 @@ class TestGenerationRequest(Harness):
         ace.STATE['dit']['xl-turbo'] = self.dits['xl-turbo']
         self.run_job()
         self.assertNotIn('Loading the music model', [text for _job, text in self.progress_log])
+
+    def test_a_loaded_model_that_must_be_reloaded_is_announced(self):
+        # a model marked dirty (a style that could not be removed cleanly) is still in STATE['dit'] until engine() lets
+        # it go, and loading it again takes minutes, so the booth is told
+        self.dits['xl-turbo'] = SimpleNamespace(model=object(), name='xl-turbo')
+        ace.STATE['dit']['xl-turbo'] = self.dits['xl-turbo']
+        ace.STATE['dirty'].add('xl-turbo')
+        self.run_job()
+        self.assertEqual([text for _job, text in self.progress_log].count('Loading the music model'), 1)
+
+    def test_only_the_model_that_is_dirty_is_announced(self):
+        for model in ('xl-turbo', 'xl-sft'):
+            self.dits[model] = SimpleNamespace(model=object(), name=model)
+            ace.STATE['dit'][model] = self.dits[model]
+        ace.STATE['dirty'].add('xl-sft')
+        self.run_job(model='xl-turbo')
+        self.assertNotIn('Loading the music model', [text for _job, text in self.progress_log])
+        self.run_job(model='xl-sft')
+        self.assertEqual([text for _job, text in self.progress_log].count('Loading the music model'), 1)
 
     def test_progress_updates_never_break_a_render(self):
         sys.modules['runpod'].serverless.progress_update = mock.Mock(side_effect=ConnectionError('offline'))
@@ -1894,6 +1993,104 @@ class TestStyleFetch(unittest.TestCase):
             log = self.refused(f'could not be fetched: {type(error).__name__}')
             self.assertNotIn('AccessDenied', log)
 
+    def test_any_exception_from_the_size_check_is_a_plain_refusal_and_nothing_is_downloaded(self):
+        class ClientError(Exception):
+            pass
+        for error in (ClientError('AccessDenied'), ValueError('x'), KeyError('k'), RuntimeError('r'), TimeoutError(),
+                      PermissionError('p'), ImportError('boto')):
+            self.s3.head_object = mock.Mock(side_effect=error)
+            self.s3.downloads.clear()
+            log = self.refused(f'could not be fetched: {type(error).__name__}')
+            self.assertNotIn('AccessDenied', log)
+            self.assertEqual(self.s3.downloads, [])                # the first thing asked is a length, and it failed
+        weights = f'{STYLE_PREFIX}/adapter_model.safetensors'
+        real_head = self.s3.__class__.head_object
+        for error in (ClientError('AccessDenied'), ValueError('x'), TimeoutError()):
+            def head_object(*, Bucket, Key, error=error):         # only the weights' length cannot be had
+                if Key == weights:
+                    raise error
+                return real_head(self.s3, Bucket=Bucket, Key=Key)
+            self.s3.head_object = head_object
+            self.s3.downloads.clear()
+            self.refused(f'could not be fetched: {type(error).__name__}')
+            self.assertEqual([key for _, key in self.s3.downloads],
+                             [f'{STYLE_PREFIX}/serve.json', f'{STYLE_PREFIX}/adapter_config.json'])
+        del self.s3.head_object
+        self.assertEqual(self.fetch().size, 5000)                  # and the real client method works again afterwards
+
+    def test_each_objects_size_is_asked_by_exact_key_just_before_that_object_is_downloaded(self):
+        events = []
+        real_head, real_download = self.s3.head_object, self.s3.download_file
+        self.s3.head_object = lambda Bucket, Key: (events.append(('head', Key)), real_head(Bucket=Bucket, Key=Key))[1]
+        self.s3.download_file = lambda bucket, key, filename: (events.append(('get', key)),
+                                                                real_download(bucket, key, filename))[1]
+        self.fetch()
+        serve, config, weights = (f'{STYLE_PREFIX}/{name}' for name in ('serve.json', 'adapter_config.json',
+                                                                         'adapter_model.safetensors'))
+        self.assertEqual(self.s3.heads, [('sound-bucket', serve), ('sound-bucket', config), ('sound-bucket', weights)])
+        self.assertEqual(events, [('head', serve), ('get', serve), ('head', config), ('get', config),
+                                  ('head', weights), ('get', weights)])
+        self.fetch()
+        self.assertEqual(len(self.s3.heads), 3)                                # a cached style asks nothing
+
+    def test_weights_bigger_than_the_limit_are_refused_before_a_byte_is_downloaded(self):
+        weights = f'{STYLE_PREFIX}/adapter_model.safetensors'
+        self.s3.sizes[weights] = ace.STYLE_WEIGHTS_MAX + 1
+        log = self.refused('ACE-Step style refused: the adapter file is too big')
+        self.assertEqual(self.s3.downloads, [('sound-bucket', f'{STYLE_PREFIX}/serve.json'),
+                                             ('sound-bucket', f'{STYLE_PREFIX}/adapter_config.json')])
+        self.assertFalse((Path(self.tmp.name) / 'test-v1' / 'adapter_model.safetensors').exists())
+        self.assertEqual(self.read, [])
+        self.assertNotIn(STYLE_PREFIX, log)
+        self.s3.sizes[weights] = 5 << 40                                        # a hundred times too big is no different
+        self.refused('the adapter file is too big')
+        self.s3.sizes.clear()                                                   # and the real size works after
+        self.assertEqual(self.fetch().size, 5000)
+
+    def test_weights_exactly_at_the_limit_pass_the_size_check_and_then_face_the_checksum(self):
+        weights = f'{STYLE_PREFIX}/adapter_model.safetensors'
+        self.s3.sizes[weights] = ace.STYLE_WEIGHTS_MAX
+        self.assertEqual(self.fetch().size, 5000)
+
+    def test_a_weights_length_that_is_missing_or_not_a_positive_whole_number_is_refused(self):
+        weights = f'{STYLE_PREFIX}/adapter_model.safetensors'
+        for odd in ('', 0, -1, True, False, 5000.0, '5000', None, [5000]):
+            self.s3.sizes[weights] = odd
+            self.s3.downloads.clear()
+            self.refused('ACE-Step style refused: the adapter file has no usable size')
+            self.assertNotIn(('sound-bucket', weights), self.s3.downloads, repr(odd))
+
+    def test_the_two_small_files_are_bounded_before_they_are_downloaded_too(self):
+        serve, config = f'{STYLE_PREFIX}/serve.json', f'{STYLE_PREFIX}/adapter_config.json'
+        for key, downloaded_before in ((serve, []), (config, [serve])):
+            for size in (ace.STYLE_FILE_MAX + 1, 5 << 30):
+                self.s3.sizes[key] = size
+                self.s3.downloads.clear()
+                log = self.refused('ACE-Step style refused: a settings file is too big')
+                self.assertEqual([k for _, k in self.s3.downloads], downloaded_before, (key, size))
+                self.assertFalse(list(Path(self.tmp.name).rglob('*.part')))
+            for odd in ('', -1, True, 5.0, '5', None, [5]):
+                self.s3.sizes[key] = odd
+                self.s3.downloads.clear()
+                self.refused('ACE-Step style refused: a settings file has no usable size')
+                self.assertEqual([k for _, k in self.s3.downloads], downloaded_before, (key, odd))
+            self.s3.sizes[key] = ace.STYLE_FILE_MAX                              # exactly the limit passes the length check
+            self.s3.downloads.clear()
+            self.assertEqual(self.fetch().size, 5000)
+            ace.STATE['styles'].clear()
+            self.s3.sizes.clear()
+
+    def test_an_empty_small_file_is_left_to_the_content_check(self):
+        # a length of 0 is not "no length": the file is downloaded and judged by what is in it, as before
+        self.put(raw_serve=b'')
+        self.refused('ACE-Step style refused: a settings file is not JSON')
+        self.assertIn(f'{STYLE_PREFIX}/serve.json', [key for _, key in self.s3.downloads])
+
+    def test_the_limit_leaves_room_for_the_real_adapter_and_stays_near_a_gigabyte(self):
+        self.assertGreater(ace.STYLE_WEIGHTS_MAX, 3 * 335_611_184)         # the real file is a third of it or less
+        self.assertLessEqual(ace.STYLE_WEIGHTS_MAX, 1 << 30)
+        self.assertLess(ace.STYLE_FILE_MAX, ace.STYLE_WEIGHTS_MAX)
+
     def test_an_interrupt_during_the_download_goes_through_and_leaves_no_part_file(self):
         self.s3.download_file = mock.Mock(side_effect=KeyboardInterrupt())
         with quiet(), self.assertRaises(KeyboardInterrupt):
@@ -2167,6 +2364,28 @@ class TestStyledSong(StyledHarness):
             ace.STATE['styles'].clear()
             self.assertEqual(self.styled(), {'error': ace.ADAPTER_SENTENCE})
             self.assertEqual((self.weights(), ace.STATE['dirty']), (self.pristine, set()))
+
+    def test_an_oversize_object_in_the_bucket_is_refused_before_the_model_loads_or_the_weights_download(self):
+        weights = b'W' * 3000
+        for name, data in {'serve.json': json.dumps({'adapter_model_sha256': hashlib.sha256(weights).hexdigest(),
+                                                     'trigger_tag': 'kdsoulr', 'name': 'Soul'}).encode(),
+                           'adapter_config.json': json.dumps(style_config()).encode(),
+                           'adapter_model.safetensors': weights}.items():
+            self.s3.objects[f'{STYLE_KEY}/{name}'] = data
+        self.s3.sizes[f'{STYLE_KEY}/adapter_model.safetensors'] = ace.STYLE_WEIGHTS_MAX + 1
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {'ACE_LORA_DIR': td}):
+            self.patch(ace, 'fetch_adapter', REAL_FETCH_ADAPTER)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                out = ace.handler({'id': 'job-1', 'input': valid(model='xl-sft', lora_key=STYLE_KEY)})
+            self.assertEqual(out, {'error': ace.ADAPTER_SENTENCE})
+            self.assertIn('ACE-Step style refused: the adapter file is too big', buffer.getvalue())
+            self.assertEqual([key for _, key in self.s3.downloads],
+                             [f'{STYLE_KEY}/serve.json', f'{STYLE_KEY}/adapter_config.json'])
+            self.assertEqual(list(Path(td).rglob('adapter_model*')), [])
+            self.assertNotIn('engine', self.events)                          # the model was never asked for
+            self.assertEqual(self.folds(), [])
+            self.assertEqual((self.weights(), ace.STATE['dirty'], ace.STATE['styles']), (self.pristine, set(), {}))
 
     def test_the_answer_says_the_style_its_strength_and_its_tag(self):
         out = self.styled(lora_scale=0.6)
@@ -3790,9 +4009,37 @@ class TestEngine(unittest.TestCase):
 
     def test_a_dirty_model_that_is_not_loaded_any_more_is_just_loaded(self):
         ace.STATE['dirty'].add('xl-sft')
-        handler = silently(ace.engine, 'xl-sft')
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            handler = ace.engine('xl-sft')
         self.assertIsNotNone(handler.model)
         self.assertEqual((self.loads(), ace.STATE['dirty']), ([('load', 'xl-sft')], set()))
+        self.assertNotIn('weights reloaded', buffer.getvalue())          # nothing was dropped, so nothing is reported
+
+    def test_a_dirty_model_that_a_small_card_already_released_is_loaded_without_the_reload_line(self):
+        self.gib = 31.8
+        silently(ace.engine, 'xl-sft')
+        ace.STATE['dirty'].add('xl-sft')
+        silently(ace.engine, 'xl-turbo')                    # one DiT at a time: this lets the dirty xl-sft go
+        self.assertEqual(set(ace.STATE['dit']), {'xl-turbo'})
+        self.assertEqual(ace.STATE['dirty'], {'xl-sft'})     # the mark stays until a fresh load clears it
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            fresh = ace.engine('xl-sft')
+        self.assertNotIn('weights reloaded', buffer.getvalue())
+        self.assertEqual((ace.STATE['dirty'], ace.STATE['dit']['xl-sft']), (set(), fresh))
+        self.assertEqual([e for e in self.loads() if e[0] == 'load'], [('load', 'xl-sft'), ('load', 'xl-turbo'), ('load', 'xl-sft')])
+
+    def test_a_dirty_handler_whose_model_is_already_gone_is_loaded_again_without_the_reload_line(self):
+        first = silently(ace.engine, 'xl-sft')
+        first.model = None
+        ace.STATE['dirty'].add('xl-sft')
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            second = ace.engine('xl-sft')
+        self.assertIsNot(first, second)
+        self.assertNotIn('weights reloaded', buffer.getvalue())
+        self.assertEqual(ace.STATE['dirty'], set())
 
     def test_a_reload_that_fails_keeps_the_mark_and_the_next_call_tries_again(self):
         silently(ace.engine, 'xl-sft')
@@ -3820,6 +4067,7 @@ class TestEngine(unittest.TestCase):
         with contextlib.redirect_stdout(buffer):
             ace.engine('xl-sft')
         self.assertIn('ACE-Step xl-sft: weights reloaded after a style could not be removed cleanly', buffer.getvalue())
+        self.assertEqual(buffer.getvalue().count('weights reloaded'), 1)
 
     def test_a_model_that_is_not_dirty_is_never_reloaded_for_that_reason(self):
         first = silently(ace.engine, 'xl-sft')

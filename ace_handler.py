@@ -116,6 +116,7 @@ STYLE_NAME_MAX = 40
 STYLE_DIR = '/tmp/ace-lora'
 STYLE_SERVE, STYLE_CONFIG, STYLE_WEIGHTS = 'serve.json', 'adapter_config.json', 'adapter_model.safetensors'
 STYLE_FILE_MAX = 1 << 20           # serve.json and adapter_config.json are tiny; anything bigger is not one
+STYLE_WEIGHTS_MAX = 1 << 30        # the real weights are 335,611,184 bytes; a bigger object is refused before it is downloaded
 TAG_FIELDS = ('trigger_tag', 'trigger_word', 'custom_tag')       # serve.json names the trigger word one of these ways
 PROJECTIONS = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
 # PEFT's saved names for a LoRA over the decoder: base_model.model.<decoder module path>.lora_A.weight (no adapter name)
@@ -512,8 +513,11 @@ def engine(model):
     handler = STATE['dit'].get(model)
     if model in STATE['dirty']:
         # A style fold that could not be undone and verified: these weights are never served, to a plain song or a
-        # styled one. They are let go and loaded again from the checkpoint below.
-        print(f'ACE-Step {model}: weights reloaded after a style could not be removed cleanly', flush=True)
+        # styled one. They are let go and loaded again from the checkpoint below. The line is printed only when loaded
+        # weights are really being dropped: a dirty model that was already released (a small card that loaded the
+        # other model) is just loaded, and has nothing to report.
+        if handler is not None and getattr(handler, 'model', None) is not None:
+            print(f'ACE-Step {model}: weights reloaded after a style could not be removed cleanly', flush=True)
         handler = None
     if handler is not None and getattr(handler, 'model', None) is not None:
         return handler
@@ -920,6 +924,19 @@ def _download(client, bucket, key, destination):
         raise
 
 
+def _check_size(client, bucket, key, limit, subject, smallest=0):
+    """Refuse an object whose length is missing, below `smallest` or above `limit` before any of it is downloaded, so
+    an object far bigger than expected cannot fill the container's disk. A head request is a read like the download
+    (boto3's download_file sends one of its own too, unless the client opts out of response checksums; not tried
+    against B2). The two small files are also checked by _small_json once they are on disk; this is what keeps a huge
+    one from getting there."""
+    size = client.head_object(Bucket=bucket, Key=key).get('ContentLength')
+    if type(size) is not int or size < smallest:
+        raise StyleProblem(f'{subject} has no usable size')
+    if size > limit:
+        raise StyleProblem(f'{subject} is too big')
+
+
 def fetch_adapter(client, bucket, key, say=None):
     """The Adapter for a style key: from this worker's cache, or fetched from B2 (three files), checked against its
     serve.json checksum and read for shape. Any problem is a plain WorkerError and a fixed line in the log; nothing is
@@ -933,9 +950,11 @@ def fetch_adapter(client, bucket, key, say=None):
         folder = style_root() / key.split('/', 1)[1]
         folder.mkdir(parents=True, exist_ok=True)
         for name in (STYLE_SERVE, STYLE_CONFIG):
+            _check_size(client, bucket, f'{key}/{name}', STYLE_FILE_MAX, 'a settings file')
             os.replace(_download(client, bucket, f'{key}/{name}', folder / name), folder / name)
         sha, tag, label = read_serve(folder / STYLE_SERVE, key)
         rank, alpha = read_adapter_config(folder / STYLE_CONFIG)
+        _check_size(client, bucket, f'{key}/{STYLE_WEIGHTS}', STYLE_WEIGHTS_MAX, 'the adapter file', smallest=1)
         part = _download(client, bucket, f'{key}/{STYLE_WEIGHTS}', folder / STYLE_WEIGHTS)
         try:
             if file_sha256(part) != sha:
@@ -1369,8 +1388,10 @@ def render(job, request, start):
             adapter = fetch_adapter(client, bucket, style['key'], lambda text: announce(job, text))
             style_fetch_s = round(time.monotonic() - fetch_began, 1)
         load_began = time.monotonic()
-        if request['model'] not in STATE['dit']:
-            announce(job, 'Loading the music model')   # xl-sft loads on its first use and takes a while
+        if request['model'] not in STATE['dit'] or request['model'] in STATE['dirty']:
+            # xl-sft loads on its first use and takes a while; so does a model that is reloaded because a style could
+            # not be removed cleanly (it is still in STATE['dit'] until engine() lets it go)
+            announce(job, 'Loading the music model')
         dit = engine(request['model'])
         llm = planner() if request['thinking'] else None
         if request['thinking'] and llm is None:
