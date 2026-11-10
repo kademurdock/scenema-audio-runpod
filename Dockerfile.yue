@@ -22,7 +22,7 @@ COPY --from=coverenv /opt/cover /opt/cover
 ENV YUE_ALIGN_HOME=/opt/align
 RUN TORCH_HOME=/opt/align LD_LIBRARY_PATH=/opt/cover/lib /opt/cover/bin/python -c "import torchaudio; p = torchaudio.pipelines; p.HDEMUCS_HIGH_MUSDB_PLUS.get_model(); p.MMS_FA.get_model(with_star=False); print('aligner labels', ''.join(p.MMS_FA.get_dict(star=None)))" && du -sh /opt/align
 COPY yue_handler.py lyric_sync.py auk_handler.py auk_contract.py /app/
-COPY test_yue_styles.py /app/
+COPY test_yue_styles.py test_yue_fixes.py /app/
 COPY instrumental/ /app/instrumental/
 COPY cover.py align.py /app/
 ENV YUE_SCORE_DIR=/runpod-volume/huggingface-cache/hub/models--m-a-p--SheetSage2/snapshots/80af707174fc7ee521c25925d5f014729f0e61ae
@@ -31,6 +31,10 @@ ENV HF_HUB_CACHE=/runpod-volume/huggingface-cache/hub
 RUN LD_LIBRARY_PATH=/opt/cover/lib /opt/cover/bin/python -c "import torch, torchaudio, transformers; from torchaudio.io import StreamReader; assert torch.__version__.startswith('2.8.0') and 'sm_120' in torch._C._cuda_getArchFlags(), torch.__version__"
 RUN python -c "from yue2 import YuE2Pipeline; import yue_handler; import soundfile; import boto3; import runpod"
 RUN python -m unittest test_yue_styles.py
+# Nov 10 2026: a trained style's sound stage can read the plain weights (lora_sound_stage), which runs YuE2's four stages
+# one by one. The build stops here if the pinned YuE2 ever renames what that path calls.
+RUN python -c "import inspect; from yue2 import YuE2Pipeline as P; from yue2.pipeline import SongResult; from yue2.storage import identity; from yue2.protocol import SongRequest; assert all(hasattr(P, n) for n in ('plan', 'generate_semantic', 'synthesize', 'decode', 'effective_config')); assert list(inspect.signature(SongResult).parameters) == ['audio', 'sample_rate', 'semantic', 'latents', 'config', 'weights', 'timing', 'request_identity']; assert 'cfg_scale' in inspect.signature(SongRequest).parameters"
+RUN python -m unittest test_yue_fixes.py
 RUN python -c "import yue_handler, abc_tools; from yue2.protocol import SongRequest, Sampling; Sampling(max_tokens=2088); assert abc_tools.__file__ == '/app/instrumental/abc_tools.py', abc_tools.__file__"
 RUN python -c "import yue_handler, lyric_sync; assert {'lyric-sync', 'fit-score', 'fit-tempo'} <= set(yue_handler.FEATURES)"
 RUN LD_LIBRARY_PATH=/opt/cover/lib /opt/cover/bin/python /app/align.py --selftest

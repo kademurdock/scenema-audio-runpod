@@ -53,10 +53,28 @@ def _filled(folder):
         return False
 
 
-def model_folder(pinned, repo, roots=None):
-    """(folder, how) for one model: the pinned snapshot, else the newest snapshot of that repo in the cache."""
+def _complete(folder):
+    """A snapshot whose every file is really there: no link into a blob that has not arrived, and
+    no download still open beside it. Only the second look after a missing-file failure asks
+    this (recover_models); the first look is _filled, as always."""
+    try:
+        if not folder.is_dir():
+            return False
+        files = [p for p in folder.rglob('*') if not p.is_dir()]
+        if not files or not all(p.exists() for p in files):
+            return False
+        blobs = folder.parent.parent / 'blobs'
+        return not (blobs.is_dir() and any(blobs.glob('*.incomplete')))
+    except OSError:
+        return False
+
+
+def model_folder(pinned, repo, roots=None, filled=None):
+    """(folder, how) for one model: the pinned snapshot, else the newest snapshot of that repo in the cache.
+    filled: the test a snapshot must pass (_filled by default; _complete on the second look)."""
+    ok = filled or _filled
     pinned = Path(pinned)
-    if _filled(pinned):
+    if ok(pinned):
         return pinned, 'pinned'
     name = 'models--' + repo.replace('/', '--')
     if roots is None:
@@ -67,7 +85,7 @@ def model_folder(pinned, repo, roots=None):
         snaps = Path(root) / name / 'snapshots'
         if not snaps.is_dir():
             continue
-        found = sorted((s for s in snaps.iterdir() if _filled(s)), key=lambda s: s.stat().st_mtime, reverse=True)
+        found = sorted((s for s in snaps.iterdir() if ok(s)), key=lambda s: s.stat().st_mtime, reverse=True)
         if found:
             return found[0], 'cached ' + found[0].name[:12]
     return None, 'missing'
@@ -87,15 +105,27 @@ def fetch_model(repo, revision):
         os.environ['HF_HUB_OFFLINE'] = '1'
 
 
-def resolve_models(download=True):
+CACHE_WAIT_S = 45  # how long the second look waits for a model cache that is still arriving
+
+
+def resolve_models(download=True, strict=False, wait=None, sleep=time.sleep):
+    """strict (the second look, after a missing-file failure): a snapshot counts only when it is
+    complete, and a cache that is still arriving is waited for, up to `wait` seconds, before
+    anything is downloaded."""
     if RESOLVED['done']:
         return
     report = []
+    deadline = time.monotonic() + (CACHE_WAIT_S if wait is None else wait)
     for env, repo in MODELS:
-        pinned = os.environ.get(env)
+        # the folder as the image pinned it, remembered before this function points the variable elsewhere
+        pinned = os.environ.get(env + '_PINNED') or os.environ.get(env)
         if not pinned:
             continue
-        folder, how = model_folder(pinned, repo)
+        os.environ[env + '_PINNED'] = pinned
+        folder, how = model_folder(pinned, repo, filled=_complete if strict else None)
+        while strict and folder is None and time.monotonic() < deadline and model_folder(pinned, repo)[0] is not None:
+            sleep(5)  # files are there but not all of them yet: the machine's model cache is still filling
+            folder, how = model_folder(pinned, repo, filled=_complete)
         if folder is None and download:
             folder = fetch_model(repo, Path(pinned).name)
             how = 'downloaded' if folder else 'missing'
@@ -104,15 +134,45 @@ def resolve_models(download=True):
         report.append(f'{repo.split("/")[1]} {how}')
     RESOLVED['done'] = all(not r.endswith('missing') for r in report)
     print('YuE2 models:', '; '.join(report), flush=True)
+
+
+def recover_models(wait=None):
+    """Nov 10 2026: one fresh machine failed every song it was handed with FileNotFoundError for
+    six minutes (three of her takes) while its model cache was still arriving; the first look
+    had found files in the pinned folders and never looked again. After such a failure the
+    pipeline is dropped and the folders are looked at again, this time for whole snapshots."""
+    global PIPE
+    PIPE = None
+    STYLE.update(applied=None, plain=None)
+    RESOLVED['done'] = False
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    resolve_models(strict=True, wait=wait)
+
+
+def missing_file(error):
+    """The last two parts of the path a FileNotFoundError names ('snapshots-id/model.safetensors'),
+    or ''. Short enough to sit in the take's error, so the next failure can be read from the job
+    store after the worker's own log is gone."""
+    name = getattr(error, 'filename', None)
+    if not name:
+        return ''
+    return re.sub(r'[^A-Za-z0-9._/-]', '_', '/'.join(Path(str(name)).parts[-2:]))[:80]
 STYLE_KEY = re.compile(r'^yue2-loras/[A-Za-z0-9._-]{1,80}\.pt$')
 TAKE_KEY = re.compile(r'^yue2/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/master\.(?:wav|mp3)$')
 # What this worker can do; the booth checks this before offering an option.
 # lyric-sync: fit_lyrics="timing"; fit-score: measure_fit and mode="measure"; score-touchup:
 # fit_score_touchup; lyric-fit-v2: lyric_fit rows paired by section name; meter-check: meter_check;
-# fit-tempo: fit_tempo and the tempo_fit report.
+# fit-tempo: fit_tempo and the tempo_fit report. sampling-v2: sampling_map="v2"; sound-stage:
+# lora_sound_stage; style-scope: lora_modules and lora_layers (Nov 10 2026).
 FEATURES = ('keep-harmony', 'instrumental', 'transcribe', 'score-cache', 'length-guard',
             'match-tempo', 'sections', 'lyric-fit', 'chord-check', 'lyric-sync', 'fit-score',
-            'score-touchup', 'lyric-fit-v2', 'meter-check', 'fit-tempo')
+            'score-touchup', 'lyric-fit-v2', 'meter-check', 'fit-tempo',
+            'sampling-v2', 'sound-stage', 'style-scope')
 ALIGN_REVISION = 'mmsfa-star-hdemucs-2'  # word timing cache revision (align.py's models and recipe)
 TOKENS_PER_SECOND, TOKEN_CAP, TOKEN_FLOOR, GUARD_HEADROOM = 25, 9000, 200, 1.10
 # Fit by tempo (COVER_SPEED design). YuE2 stops at 9,000 tokens, six minutes. A fixed score longer
@@ -164,20 +224,73 @@ def sound_controls(inp):
                 guidance=number('guidance', 1.0, 1.0, 3.0))
 
 
-def render_song(pipe, inp, controls, max_tokens=None):
+def sampling_option(inp):
+    """sampling_map (optional): "v1" (the default, today's numbers) or "v2". Leaving it out keeps
+    today's request exactly."""
+    value = inp.get('sampling_map', 'v1')
+    if value not in ('v1', 'v2'):
+        raise ValueError('sampling_map must be "v1" or "v2".')
+    return value
+
+
+def sampling_plan(variation, version='v1', fixed_score=False):
+    """(score sampling, singing sampling) for one Creative variation setting. Pure.
+
+    v1, as always: the score's temperature is 0.4 + 0.006 x variation and the singing's is
+    0.7 + 0.006 x variation, so 50 is YuE2's own default (0.7 and 1.0) and 100 sings at 1.3.
+    v2 (Nov 10 2026): up to 50 both are as before. Above 50 the variation goes into the SCORE,
+    where a bolder melody and chords come from (same temperature as before, plus a wider choice
+    of notes: top_p 0.90 to 0.95 and top_k 30 to 50), and the singing only rises to 1.10 at 100
+    instead of 1.30: past YuE2's default the singing tokens slur words long before they add
+    ideas, and a song with no score to vary (a trained style, a cover) got nothing else from the
+    dial. With a fixed score (a cover or a given score) there is no score left to vary, so the
+    singing stays at YuE2's default 1.0 above 50 and holds the tune it was given."""
+    score = {'temperature': round(.4 + .006 * variation, 3)}
+    if version != 'v2' or variation <= 50:
+        return score, {'temperature': round(.7 + .006 * variation, 3)}
+    over = (variation - 50) / 50
+    score.update(top_p=round(.9 + .05 * over, 3), top_k=round(30 + 20 * over))
+    return score, {'temperature': 1.0 if fixed_score else round(1.0 + .1 * over, 3)}
+
+
+def staged_song(pipe, request, abc_sampling, semantic_sampling, between):
+    """YuE2Pipeline.__call__ in its own four stages (upstream commit ab2e5a3, pipeline.py), with
+    `between()` run after the singing tokens are written and before the sound stage reads them.
+    Same request, config, seed and artifacts as one pipe(...) call."""
+    from yue2.pipeline import SongResult
+    from yue2.storage import identity
+    config = pipe.effective_config(request, abc_sampling, semantic_sampling)
+    request_id = identity({'request': request.to_dict(), 'config': config, 'weights': pipe.weights})
+    start = time.perf_counter()
+    plan = pipe.plan(request=request, abc_sampling=abc_sampling)
+    semantic = pipe.generate_semantic(plan, sampling=semantic_sampling)
+    between()
+    nar_start = time.perf_counter()
+    latents = pipe.synthesize(semantic)
+    nar_seconds = time.perf_counter() - nar_start
+    vae_start = time.perf_counter()
+    audio = pipe.decode(latents)
+    timing = {'abc': plan.timing, 'semantic': semantic.timing, 'nar_seconds': nar_seconds,
+              'vae_seconds': time.perf_counter() - vae_start, 'load': dict(pipe.load_timing),
+              'e2e_seconds': time.perf_counter() - start}
+    return SongResult(audio, 48000, semantic, latents, config, pipe.weights, timing, request_id)
+
+
+def render_song(pipe, inp, controls, max_tokens=None, sampling='v1', fixed_score=False, between=None):
     # Reset per request: a previous song's advanced settings must not leak.
     original = pipe.generation_config
     pipe.generation_config = replace(original, ode_steps=controls['steps'])
-    variation = controls['weirdness']
     # Score-free songs use YuE2's own 1.01 default; at exactly 1.0 that mode loses its guidance pass.
     guidance = 1.01 if inp.get('cot') == 'off' and controls['guidance'] == 1.0 else controls['guidance']
-    semantic = {'temperature': round(.7 + .006 * variation, 3)}
+    score, semantic = sampling_plan(controls['weirdness'], sampling, fixed_score)
     if max_tokens is not None:
         semantic['max_tokens'] = max_tokens  # length guard; without it YuE2 allows 9,000 (six minutes)
     try:
-        return pipe(**inp, cfg_scale=guidance,
-                    abc_sampling={'temperature': round(.4 + .006 * variation, 3)},
-                    semantic_sampling=semantic)
+        if between is None:
+            return pipe(**inp, cfg_scale=guidance, abc_sampling=score, semantic_sampling=semantic)
+        # A trained style whose sound stage reads the plain model: the stages run one by one.
+        from yue2.protocol import SongRequest
+        return staged_song(pipe, SongRequest(**inp, cfg_scale=guidance), score, semantic, between)
     finally:
         pipe.generation_config = original
 
@@ -696,6 +809,54 @@ def style_request(inp):
     return (key, float(scale)) if scale else None
 
 
+STYLE_PER_LAYER = 7  # style_linears' order: attention q, k, v, o then mlp gate, up, down
+STYLE_ATTENTION = 4
+
+
+def style_scope(inp):
+    """Where in the composer a trained style is folded (both optional; leaving them out folds it
+    everywhere, as always). lora_modules: "all", "attn" (the attention projections, which decide
+    what each position reads: the lyrics, the score) or "mlp" (the feed-forward blocks, which
+    decide what is written). lora_layers: [first, last], counted from 0, inclusive.
+    Returns () for the whole model, else (modules, first, last)."""
+    modules, layers = inp.get('lora_modules', 'all'), inp.get('lora_layers')
+    if modules not in ('all', 'attn', 'mlp'):
+        raise ValueError('lora_modules must be "all", "attn" or "mlp".')
+    if layers is None:
+        return () if modules == 'all' else (modules, 0, None)
+    if (not isinstance(layers, (list, tuple)) or len(layers) != 2 or any(type(x) is not int for x in layers)
+            or not 0 <= layers[0] <= layers[1] <= 255):
+        raise ValueError('lora_layers must be two whole numbers, first and last layer, counted from 0.')
+    return (modules, layers[0], layers[1])
+
+
+def style_selected(index, scope):
+    """Whether the index-th linear (style_linears' order) takes the style under this scope."""
+    if not scope:
+        return True
+    modules, first, last = scope
+    layer, slot = divmod(index, STYLE_PER_LAYER)
+    if layer < first or (last is not None and layer > last):
+        return False
+    return modules == 'all' or (modules == 'attn') == (slot < STYLE_ATTENTION)
+
+
+def sound_stage_option(inp):
+    """lora_sound_stage (optional): which composer weights the SOUND stage reads for a take in a
+    trained style. "styled" (the default, as always): the style stays folded in for the whole
+    take. "plain": the style writes the singing tokens, then the plain weights are put back
+    before the sound stage turns them into audio. Why: the sound stage reads those tokens
+    through the composer's attention (nar.py's prefill), and it was only ever trained against
+    the plain composer; a style is trained on the token loss alone, so nothing kept its changed
+    activations readable to the sound stage. "both": the plain-stage song is the take, and a
+    second master of the SAME tokens through the styled stage is saved beside it, for an A/B by
+    ear (about 40% more GPU time). Ignored without a style."""
+    value = inp.get('lora_sound_stage', 'styled')
+    if value not in ('styled', 'plain', 'both'):
+        raise ValueError('lora_sound_stage must be "styled", "plain" or "both".')
+    return value
+
+
 def style_linears(model):
     # Same order the trainer saved: per layer, attention q,k,v,o then mlp gate,up,down.
     for layer in model.model.layers:
@@ -737,7 +898,8 @@ def apply_style(pipe, wanted, fetch):
 
     The LoRA is folded in place (W = plain + scale * B @ A) because the sampler
     runs on CUDA graphs that hold these tensors. Plain weights are kept on the
-    CPU and copied back, so switching styles never drifts."""
+    CPU and copied back, so switching styles never drifts.
+    wanted: None for plain, (key, scale), or (key, scale, scope) with style_scope()'s answer."""
     if STYLE['applied'] == wanted:
         return
     import torch
@@ -751,9 +913,10 @@ def apply_style(pipe, wanted, fetch):
             STYLE['plain'] = [lin.weight.detach().to('cpu', copy=True) for lin in linears]
         STYLE['applied'] = 'changing'
         try:
+            scope = wanted[2] if wanted and len(wanted) > 2 else ()
             for index, (lin, plain) in enumerate(zip(linears, STYLE['plain'])):
                 lin.weight.copy_(plain)
-                if tensors:
+                if tensors and style_selected(index, scope):
                     a = tensors[2 * index].to(lin.weight.device, torch.float32)
                     b = tensors[2 * index + 1].to(lin.weight.device, torch.float32)
                     lin.weight.add_((wanted[1] * (b @ a)).to(lin.weight.dtype))
@@ -1261,6 +1424,30 @@ def measure_only(job, inp, options, start):
                 'gpu': gpu_name(), 'features': list(FEATURES)}
 
 
+def styled_stage_master(pipe, result, controls, wanted, fetch, work, notes):
+    """lora_sound_stage="both": the SAME singing tokens once more through the sound stage with the
+    style folded back in (how every styled take was made before), saved as
+    master-styled-stage.mp3 for an A/B by ear. Returns its path, or None with a note: a failure
+    here never costs the take. The style stays folded in afterwards, as apply_style records."""
+    import soundfile as sf
+    from auk_handler import ffmpeg
+    original = pipe.generation_config
+    try:
+        apply_style(pipe, wanted, fetch)
+        pipe.generation_config = replace(original, ode_steps=controls['steps'])
+        audio = pipe.decode(pipe.synthesize(result.semantic))
+        flac, mp3 = work / 'audio-styled-stage.flac', work / 'master-styled-stage.mp3'
+        sf.write(flac, audio, result.sample_rate, subtype='PCM_24')
+        ffmpeg('-i', flac, '-c:a', 'libmp3lame', '-b:a', '320k', mp3)
+        return mp3
+    except Exception as error:
+        print('Styled sound stage copy failed:', type(error).__name__, flush=True)
+        notes.append('The comparison copy through the styled sound stage could not be made this time.')
+        return None
+    finally:
+        pipe.generation_config = original
+
+
 def warm():
     # FlashBoot snapshots a booted worker. Loading here, not inside the first
     # job, puts a ready model in that snapshot and keeps loading out of the
@@ -1275,6 +1462,7 @@ def warm():
 
 def handler(job):
     start = time.monotonic()
+    rendering = False  # a missing file before the render begins is worth one second look; after it, never
     try:
         resolve_models()  # a cover reads SheetSage2 and MERT before YuE2 loads
         raw = job.get('input') or {}
@@ -1286,6 +1474,9 @@ def handler(job):
         inp = request_input(raw)
         controls = sound_controls(raw)
         wanted = style_request(raw)
+        scope, stage, sampling = style_scope(raw), sound_stage_option(raw), sampling_option(raw)
+        if wanted and scope:
+            wanted = wanted + (scope,)
         reference = raw.get('reference_voice_url')
         check_combination(inp, options, reference)
         sync_opts = sync_options(raw)
@@ -1358,11 +1549,19 @@ def handler(job):
                 notes.append(f'The score is {score_tokens} tokens, above the usual 4096; the song may drift.')
             gpu_peak(reset=True)
             render_began = time.monotonic()
-            result = render_song(pipe, render, controls, budget)
+            rendering = True
+            plain_stage = bool(wanted) and stage != 'styled'
+            result = render_song(pipe, render, controls, budget, sampling=sampling, fixed_score=fixed is not None,
+                                 between=(lambda: apply_style(pipe, None, fetch)) if plain_stage else None)
             render_s = round(time.monotonic() - render_began, 1)
             render_peak = gpu_peak()
             work = Path(td) / 'song'
             result.save_artifacts(work)
+            styled_mp3 = None
+            if plain_stage and stage == 'both':
+                began = time.monotonic()
+                styled_mp3 = styled_stage_master(pipe, result, controls, wanted, fetch, work, notes)
+                timing['styled_stage_s'] = round(time.monotonic() - began, 1)
             if options['instrumental'] and fixed is not None:
                 (work / 'source-score.abc').write_text(fixed)
                 (work / 'transfer.json').write_text(json.dumps(extras.get('transfer')))
@@ -1382,6 +1581,8 @@ def handler(job):
                 timing['measure_s'] = round(time.monotonic() - began, 1)
             prefix = f'yue2/{uuid.uuid4()}'
             files = [(mp3, 'audio/mpeg'), (wav, 'audio/wav')]
+            if styled_mp3 is not None:
+                files.append((styled_mp3, 'audio/mpeg'))
             files += [(p, 'text/plain' if p.suffix == '.abc' else 'application/json')
                       for p in work.iterdir() if p.suffix in ('.abc', '.json')]
             for p, mime in files:
@@ -1412,6 +1613,14 @@ def handler(job):
                 'semantic_budget_tokens': budget, 'worker_notes': notes, 'gpu': gpu_name(),
                 'memory': {'render_peak_gib': render_peak, 'transcribe_peak_gib': read['peak'] if read else None},
                 'features': list(FEATURES)})
+            if sampling != 'v1':
+                output['sampling_map'] = sampling
+            if wanted:
+                output['lora_sound_stage'] = stage
+                if scope:
+                    output['lora_scope'] = list(scope)
+            if styled_mp3 is not None:
+                output.update(styled_stage_key=prefix+'/'+styled_mp3.name, styled_stage_url=url(styled_mp3.name))
             if sync is not None:
                 output['lyric_sync'] = extras.get('lyric_sync')
             if fit:
@@ -1425,8 +1634,18 @@ def handler(job):
         return {'error':str(error)}
     except Exception as error:
         # a missing file names its path in the worker log (only that error is spelled out: others can carry a URL)
-        print('YuE2 failed:',type(error).__name__, str(error)[:300] if isinstance(error, FileNotFoundError) else '',flush=True)
-        return {'error':f'YuE2 could not finish ({type(error).__name__}). Your writing is saved.'}
+        missing = isinstance(error, FileNotFoundError)
+        print('YuE2 failed:',type(error).__name__, str(error)[:300] if missing else '',flush=True)
+        if missing and not rendering and not job.get('second_look'):
+            # Before any song was rendered: look at the model folders again, whole snapshots only, and try once more.
+            try:
+                recover_models()
+            except Exception as again:
+                print('YuE2 second look failed:', type(again).__name__, flush=True)
+            else:
+                return handler(dict(job, second_look=True))
+        detail = missing_file(error) if missing else ''
+        return {'error':f"YuE2 could not finish ({type(error).__name__}{', ' + detail if detail else ''}). Your writing is saved."}
 
 
 if __name__ == '__main__':
