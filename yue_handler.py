@@ -55,16 +55,21 @@ def _filled(folder):
 
 def _complete(folder):
     """A snapshot whose every file is really there: no link into a blob that has not arrived, and
-    no download still open beside it. Only the second look after a missing-file failure asks
-    this (recover_models); the first look is _filled, as always."""
+    none of its OWN files still being written (a '.incomplete' file in the snapshot, or beside
+    the blob one of its links points to). A leftover '.incomplete' blob that no file of this
+    snapshot points to says nothing about it and is ignored. Only the second look after a
+    missing-file failure asks this (recover_models); the first look is _filled, as always."""
     try:
         if not folder.is_dir():
             return False
         files = [p for p in folder.rglob('*') if not p.is_dir()]
         if not files or not all(p.exists() for p in files):
             return False
-        blobs = folder.parent.parent / 'blobs'
-        return not (blobs.is_dir() and any(blobs.glob('*.incomplete')))
+        for p in files:
+            target = p.resolve()
+            if p.name.endswith('.incomplete') or target.with_name(target.name + '.incomplete').exists():
+                return False
+        return True
     except OSError:
         return False
 
@@ -138,9 +143,10 @@ def resolve_models(download=True, strict=False, wait=None, sleep=time.sleep):
 
 def recover_models(wait=None):
     """Nov 10 2026: one fresh machine failed every song it was handed with FileNotFoundError for
-    six minutes (three of her takes) while its model cache was still arriving; the first look
-    had found files in the pinned folders and never looked again. After such a failure the
-    pipeline is dropped and the folders are looked at again, this time for whole snapshots."""
+    six minutes (three of her takes). Which file was missing is NOT known (its log was gone); a
+    model cache that was still arriving is one explanation, a snapshot mismatch like Sep 28 is
+    another, and this helps only with the first. After a missing MODEL file the pipeline is
+    dropped and the folders are looked at again, this time for whole snapshots."""
     global PIPE
     PIPE = None
     STYLE.update(applied=None, plain=None)
@@ -154,11 +160,40 @@ def recover_models(wait=None):
     resolve_models(strict=True, wait=wait)
 
 
+def missing_path(error):
+    """The path a FileNotFoundError is about: its filename, else a model-cache path quoted in its
+    message (some loaders raise the error with words only), else ''."""
+    name = getattr(error, 'filename', None)
+    if name:
+        return str(name)
+    found = re.search(r'[A-Za-z0-9._:/\\-]*models--[A-Za-z0-9._/\\-]+', str(error))
+    return found.group(0) if found else ''
+
+
+def model_file_missing(error):
+    """Whether the missing file is one of the models': under a Hugging Face cache folder
+    ('models--org--name') or under a folder the model variables point to. Only that earns the
+    second look. A style file, a cover's temporary file or anything else missing has nothing to
+    do with the model folders, and dropping a healthy loaded pipeline for it would only cost a
+    reload."""
+    path = missing_path(error).replace('\\', '/')
+    if not path:
+        return False
+    if '/models--' in path or path.startswith('models--'):
+        return True
+    for env, _ in MODELS:
+        for name in (env, env + '_PINNED'):
+            folder = (os.environ.get(name) or '').replace('\\', '/').rstrip('/')
+            if folder and path.startswith(folder + '/'):
+                return True
+    return False
+
+
 def missing_file(error):
     """The last two parts of the path a FileNotFoundError names ('snapshots-id/model.safetensors'),
     or ''. Short enough to sit in the take's error, so the next failure can be read from the job
     store after the worker's own log is gone."""
-    name = getattr(error, 'filename', None)
+    name = missing_path(error)
     if not name:
         return ''
     return re.sub(r'[^A-Za-z0-9._/-]', '_', '/'.join(Path(str(name)).parts[-2:]))[:80]
@@ -1636,8 +1671,10 @@ def handler(job):
         # a missing file names its path in the worker log (only that error is spelled out: others can carry a URL)
         missing = isinstance(error, FileNotFoundError)
         print('YuE2 failed:',type(error).__name__, str(error)[:300] if missing else '',flush=True)
-        if missing and not rendering and not job.get('second_look'):
-            # Before any song was rendered: look at the model folders again, whole snapshots only, and try once more.
+        if missing and not rendering and not job.get('second_look') and model_file_missing(error):
+            # A model file, before any song was rendered: look at the model folders again, whole snapshots only, and
+            # try once more. The second look can wait up to CACHE_WAIT_S and, if a model still has no whole snapshot,
+            # download it once (fetch_model), all on this job's clock. What caused the Nov 10 failures is not known.
             try:
                 recover_models()
             except Exception as again:

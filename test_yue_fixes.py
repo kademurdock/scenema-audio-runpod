@@ -248,20 +248,29 @@ class SoundStageTest(unittest.TestCase):
 class WholeTakeTest(unittest.TestCase):
     """The handler end to end with every outside part faked: storage, the encoder, the pipeline."""
 
-    def run_take(self, raw, pipe_error=None):
+    def run_take(self, raw, pipe_error=None, render_error=None, style_error=None):
         log, uploads = [], []
         pipe = StagedPipe(log)
         pipe.tokenizer = types.SimpleNamespace(encode=lambda text: [1] * 10)
 
         def one_call(**kwargs):
             log.append('one call')
+            if render_error:
+                raise render_error
             return self.result(log)
         pipe.__class__ = type('Pipe', (StagedPipe,), {'__call__': lambda self, **kwargs: one_call(**kwargs)})
 
         def engine():
+            if style_error:
+                log.append('engine')
             if pipe_error and not log.count('second look'):
                 raise pipe_error
             return pipe
+
+        def style(pipe, wanted, fetch):
+            if style_error:
+                raise style_error
+            log.append(('style', wanted))
 
         def recover(wait=None):
             log.append('second look')
@@ -275,7 +284,7 @@ class WholeTakeTest(unittest.TestCase):
         with mock.patch.dict(sys.modules, fakes), mock.patch.object(yue, 'engine', engine), \
                 mock.patch.object(yue, 'storage', lambda: (client, 'bucket')), mock.patch.object(yue, 'resolve_models', lambda **k: None), \
                 mock.patch.object(yue, 'recover_models', recover), mock.patch.object(yue, 'gpu_name', lambda: 'Test GPU'), \
-                mock.patch.object(yue, 'apply_style', lambda pipe, wanted, fetch: log.append(('style', wanted))):
+                mock.patch.object(yue, 'apply_style', style):
             return yue.handler({'input': raw}), log, uploads
 
     @staticmethod
@@ -326,7 +335,7 @@ class WholeTakeTest(unittest.TestCase):
         self.assertNotIn('lora_sound_stage', out)
 
     def test_a_missing_model_file_gets_one_second_look_and_then_the_song(self):
-        out, log, _ = self.run_take(self.STYLED, pipe_error=FileNotFoundError(2, 'No such file', '/cache/snapshots/abc/model.safetensors'))
+        out, log, _ = self.run_take(self.STYLED, pipe_error=FileNotFoundError(2, 'No such file', '/cache/models--m-a-p--YuE2-3B/snapshots/abc/model.safetensors'))
         self.assertNotIn('error', out)
         self.assertEqual(log[0], 'second look')
         self.assertEqual(log.count('one call'), 1)
@@ -345,6 +354,34 @@ class WholeTakeTest(unittest.TestCase):
             out = yue.handler({'input': self.STYLED})
         self.assertEqual(len(looks), 1)
         self.assertEqual(out, {'error': 'YuE2 could not finish (FileNotFoundError, abc123/model.safetensors). Your writing is saved.'})
+
+    def test_a_file_missing_once_the_render_has_begun_is_never_a_second_song(self):
+        # Review, Nov 10: only the 'rendering' flag stops a whole song being rendered twice at full GPU cost.
+        error = FileNotFoundError(2, 'No such file', '/cache/models--m-a-p--YuE2-Vae/snapshots/abc123/vae.safetensors')
+        out, log, _ = self.run_take(self.STYLED, render_error=error)
+        self.assertEqual(log.count('one call'), 1)
+        self.assertNotIn('second look', log)
+        self.assertEqual(out, {'error': 'YuE2 could not finish (FileNotFoundError, abc123/vae.safetensors). Your writing is saved.'})
+
+    def test_a_missing_file_that_is_not_a_model_keeps_the_loaded_pipeline(self):
+        # Review, Nov 10: a style's download or a cover's temporary file going missing is not the model cache.
+        out, log, _ = self.run_take(self.STYLED, style_error=FileNotFoundError(2, 'No such file', '/tmp/yue2-loras_test.part'))
+        self.assertEqual(log, ['engine'])
+        self.assertEqual(out, {'error': 'YuE2 could not finish (FileNotFoundError, tmp/yue2-loras_test.part). Your writing is saved.'})
+
+    def test_only_a_model_file_counts_as_a_model_file(self):
+        pins = 'C:' + chr(92) + 'pins' + chr(92) + 'yue'
+        with mock.patch.dict(os.environ, {'YUE_VAE_DIR': '/models/vae', 'YUE_MODEL_DIR_PINNED': pins}, clear=False):
+            for path, said in (('/runpod-volume/huggingface-cache/hub/models--m-a-p--YuE2-3B/snapshots/a/model.safetensors', True),
+                               ('/tmp/hf-hub/models--m-a-p--SheetSage2/blobs/abc', True), ('/models/vae/config.json', True),
+                               (pins + chr(92) + 'config.json', True), ('/models/vae-other/config.json', False),
+                               ('/tmp/yue2-loras_test.part', False), ('/tmp/tmpabc/song/audio.flac', False)):
+                with self.subTest(path=path):
+                    self.assertEqual(yue.model_file_missing(FileNotFoundError(2, 'No such file', path)), said)
+        self.assertFalse(yue.model_file_missing(FileNotFoundError('no filename')))
+        worded = FileNotFoundError('Weights not found: /cache/models--m-a-p--YuE2-3B/snapshots/abc123/model.safetensors')
+        self.assertTrue(yue.model_file_missing(worded))
+        self.assertEqual(yue.missing_file(worded), 'abc123/model.safetensors')
 
     def test_any_other_failure_reads_as_it_always_did(self):
         out, log, _ = self.run_take(self.STYLED, pipe_error=RuntimeError('CUDA out of memory at https://secret.invalid/x'))
@@ -366,11 +403,27 @@ class SecondLookTest(unittest.TestCase):
             blobs = folder.parent.parent / 'blobs'
             blobs.mkdir()
             (blobs / 'abc.incomplete').write_text('')
+            self.assertTrue(yue._complete(folder), 'a leftover download no file of this snapshot points to says nothing about it')
+            (folder / 'config.json.incomplete').write_text('')
             self.assertFalse(yue._complete(folder))
             self.assertTrue(yue._filled(folder), 'the first look would have taken it')
-            (blobs / 'abc.incomplete').unlink()
+            (folder / 'config.json.incomplete').unlink()
             self.assertTrue(yue._complete(folder))
             self.assertFalse(yue._complete(folder / 'nothing-here'))
+
+    def test_a_link_into_a_blob_still_being_written_is_not_whole(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = self.snapshot(Path(td))
+            blobs = folder.parent.parent / 'blobs'
+            blobs.mkdir()
+            (blobs / 'abc').write_text('half')
+            try:
+                os.symlink(str(blobs / 'abc'), str(folder / 'model.safetensors'))
+            except (OSError, NotImplementedError):
+                self.skipTest('this machine does not allow symbolic links')
+            self.assertTrue(yue._complete(folder))
+            (blobs / 'abc.incomplete').write_text('')
+            self.assertFalse(yue._complete(folder))
 
     def test_a_link_to_a_file_that_has_not_arrived_is_not_whole(self):
         with tempfile.TemporaryDirectory() as td:
@@ -385,15 +438,14 @@ class SecondLookTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             hub = Path(td)
             folder = self.snapshot(hub)
-            blobs = folder.parent.parent / 'blobs'
-            blobs.mkdir()
-            (blobs / 'abc.incomplete').write_text('')
+            part = folder / 'model.safetensors.incomplete'
+            part.write_text('')
             naps = []
 
             def nap(seconds):
                 naps.append(seconds)
                 if len(naps) == 2:
-                    (blobs / 'abc.incomplete').unlink()  # the cache finished arriving
+                    part.unlink()  # the cache finished arriving
             env = {'YUE_MODEL_DIR': str(folder), 'HF_HUB_CACHE': str(hub)}
             with mock.patch.dict(os.environ, env, clear=False), mock.patch.dict(yue.RESOLVED, {'done': False}), \
                     mock.patch.object(yue, 'MODELS', (('YUE_MODEL_DIR', 'm-a-p/YuE2-3B'),)):
@@ -407,9 +459,7 @@ class SecondLookTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             hub = Path(td)
             folder = self.snapshot(hub)
-            blobs = folder.parent.parent / 'blobs'
-            blobs.mkdir()
-            (blobs / 'abc.incomplete').write_text('')
+            (folder / 'model.safetensors.incomplete').write_text('')
             env = {'YUE_MODEL_DIR': str(folder), 'HF_HUB_CACHE': str(hub)}
             with mock.patch.dict(os.environ, env, clear=False), mock.patch.dict(yue.RESOLVED, {'done': False}), \
                     mock.patch.object(yue, 'MODELS', (('YUE_MODEL_DIR', 'm-a-p/YuE2-3B'),)):
