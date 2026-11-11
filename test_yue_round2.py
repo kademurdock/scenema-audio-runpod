@@ -176,5 +176,40 @@ class ScoreTagsTest(unittest.TestCase):
         self.assertNotIn('score_tags', extras)
 
 
+class HandlerWiringTest(unittest.TestCase):
+    """Review, Nov 10 2026: the helpers above were tested, but nothing proved that handler() hands a
+    request's max_seconds, match_score_key and score_section_tags to them. test_yue_fixes.py runs
+    whole takes through the handler inside the image; this reads the handler's own source, so the
+    CPU step fails too if one of the three wires is cut or moved."""
+
+    @classmethod
+    def setUpClass(cls):
+        import inspect
+        cls.source = inspect.getsource(yue.handler)
+
+    def order(self, *pieces):
+        at = [self.source.find(piece) for piece in pieces]
+        for piece, where in zip(pieces, at):
+            self.assertGreater(where, -1, piece)
+        self.assertEqual(at, sorted(at), pieces)
+
+    def test_the_three_fields_are_read_from_the_raw_request_before_any_gpu_work(self):
+        self.order('cap, more = length_cap(raw), score_options(raw)', 'pipe = engine()')
+
+    def test_the_ceiling_is_applied_to_the_budget_the_render_is_given(self):
+        self.order('render, budget, facts, extras = inp, None, {}, {}',
+                   'budget = capped_budget(budget, cap)',
+                   'result = render_song(pipe, render, controls, budget,')
+        self.assertEqual(self.source.count('budget = capped_budget(budget, cap)'), 1)
+
+    def test_the_score_options_reach_the_fixed_score_render(self):
+        call = self.source[self.source.index('fixed_score_render('):]
+        call = call[:call.index(')\n') + 1]
+        self.assertIn('more=more', call)
+
+    def test_the_take_reports_what_it_was_asked(self):
+        self.order("output['max_seconds'] = cap", "output['score_options'] = dict(more, tags_renamed=extras.get('score_tags'))")
+
+
 if __name__ == '__main__':
     unittest.main()

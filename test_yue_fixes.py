@@ -329,6 +329,69 @@ class WholeTakeTest(unittest.TestCase):
         self.assertTrue(out['styled_stage_url'].endswith('/master-styled-stage.mp3'))
         self.assertIn('styled_stage_s', out['timing'])
 
+    # ---- Round two review, Nov 10 2026: the handler's own wiring of max_seconds and match_score_key. The helpers were
+    # tested; nothing proved a request carrying the fields reaches them. Each line below fails if its wiring is cut. ----
+    SCORE = ('X:1\nT:\nM:4/4\nL:1/16\nQ:1/4=97\n'
+             'V: Vocal clef=treble name="Vocal Melody" snm="Vocal"\nV: Ins clef=treble name="Ins Melody" snm="Inst."\nK:Fm\n'
+             '% verse\nV: Vocal\n"Fm"F4A4c4A4|"Bbm"B4d4f4d4|"C"c4e4g4e4|"Fm"F16|\n'
+             'V: Ins\nF,4C4F4C4|B,4F4B4F4|C4G4c4G4|F,16|\n')
+
+    def spied_take(self, raw):
+        """run_take, plus what render_song was handed and what the singing stage was handed."""
+        calls, singing = [], []
+        real_render, real_singing = yue.render_song, StagedPipe.generate_semantic
+
+        def render(pipe, inp, controls, max_tokens=None, **kwargs):
+            calls.append(dict(inp=dict(inp), max_tokens=max_tokens, kwargs=kwargs))
+            return real_render(pipe, inp, controls, max_tokens, **kwargs)
+
+        def sing(pipe, plan, sampling):
+            singing.append(dict(sampling))
+            return real_singing(pipe, plan, sampling)
+        with mock.patch.object(yue, 'render_song', render), mock.patch.object(StagedPipe, 'generate_semantic', sing):
+            out, log, _ = self.run_take(raw)
+        return out, log, calls, singing
+
+    def test_max_seconds_reaches_the_singing_stage_when_the_sound_stage_is_plain(self):
+        # With YUE_STYLE_SOUND_STAGE=plain every styled take goes stage by stage: the only path the ceiling ever uses.
+        out, log, calls, singing = self.spied_take(dict(self.STYLED, lora_sound_stage='plain', max_seconds=276))
+        self.assertNotIn('error', out)
+        self.assertEqual(log, [('style', ('yue2-loras/test.pt', .8)), 'plan', 'singing tokens', ('style', None),
+                               'sound stage at 32 steps', 'decode'])
+        self.assertEqual(calls[0]['max_tokens'], 6900)
+        self.assertEqual(singing, [{'temperature': 1.0, 'max_tokens': 6900}])
+        self.assertEqual((out['max_seconds'], out['semantic_budget_tokens']), (276.0, 6900))
+        self.assertIn('length-cap', out['features'])
+
+    def test_max_seconds_reaches_a_one_call_take_too_and_no_ceiling_sends_none(self):
+        out, log, calls, _ = self.spied_take(dict(self.STYLED, max_seconds=120))
+        self.assertEqual((log.count('one call'), calls[0]['max_tokens'], out['semantic_budget_tokens']), (1, 3000, 3000))
+        out, log, calls, singing = self.spied_take(dict(self.STYLED, lora_sound_stage='plain'))
+        self.assertIsNone(calls[0]['max_tokens'])
+        self.assertEqual(singing, [{'temperature': 1.0}])
+        self.assertNotIn('max_seconds', out)
+        self.assertIsNone(out['semantic_budget_tokens'])
+
+    def test_a_bad_max_seconds_is_refused_before_anything_is_rendered(self):
+        for bad in (30, 400, '200', True):
+            out, log, calls, _ = self.spied_take(dict(self.STYLED, max_seconds=bad))
+            self.assertIn('error', out, bad)
+            self.assertEqual(calls, [], bad)
+
+    def test_match_score_key_reaches_the_style_the_model_is_given(self):
+        song = {'style': 'Warm soul, female lead vocal', 'lyrics': '[Verse]\nla la la la', 'seed': 5, 'abc': self.SCORE,
+                'cot': 'full', 'match_score_tempo': True}
+        out, log, calls, _ = self.spied_take(dict(song, match_score_key=True))
+        self.assertNotIn('error', out)
+        self.assertEqual(calls[0]['inp']['style'], 'Warm soul, female lead vocal, F minor, 97 BPM')
+        self.assertEqual(out['score_options']['match_score_key'], True)
+        out, log, calls, _ = self.spied_take(song)
+        self.assertEqual(calls[0]['inp']['style'], 'Warm soul, female lead vocal, 97 BPM')
+        self.assertNotIn('score_options', out)
+        out, log, calls, _ = self.spied_take(dict(song, match_score_key='yes'))
+        self.assertIn('error', out)
+        self.assertEqual(calls, [])
+
     def test_the_sound_stage_choice_does_nothing_without_a_style(self):
         out, log, _ = self.run_take({'style': 'pop', 'lyrics': '[Verse]\nla la', 'seed': 5, 'lora_sound_stage': 'both'})
         self.assertEqual(log, [('style', None), 'one call'])
