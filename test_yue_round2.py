@@ -32,6 +32,12 @@ class OldRequestsTest(unittest.TestCase):
                                            PLANNED, 'score', None)):
             inp, options = yue.request_input(raw), yue.cover_options(raw)
             before = yue.fixed_score_render(inp, options, abc, origin, seconds)
+            # nothing names the score's key or renames a tag unless it was asked for
+            key = yue.key_words(before[2]['score_musical_key'])
+            self.assertIsNotNone(key)
+            self.assertNotIn(key, before[0]['style'])
+            self.assertEqual(before[0]['lyrics'], inp['lyrics'])
+            self.assertNotIn('score_tags', before[3])
             for more in (None, {}, yue.score_options(raw)):
                 self.assertEqual(yue.fixed_score_render(inp, options, abc, origin, seconds, more=more), before)
 
