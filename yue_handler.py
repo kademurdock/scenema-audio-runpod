@@ -203,11 +203,13 @@ TAKE_KEY = re.compile(r'^yue2/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 # lyric-sync: fit_lyrics="timing"; fit-score: measure_fit and mode="measure"; score-touchup:
 # fit_score_touchup; lyric-fit-v2: lyric_fit rows paired by section name; meter-check: meter_check;
 # fit-tempo: fit_tempo and the tempo_fit report. sampling-v2: sampling_map="v2"; sound-stage:
-# lora_sound_stage; style-scope: lora_modules and lora_layers (Nov 10 2026).
+# lora_sound_stage; style-scope: lora_modules and lora_layers (Nov 10 2026). length-cap: max_seconds;
+# match-key: match_score_key; score-tags: score_section_tags (Nov 10 2026, round two).
 FEATURES = ('keep-harmony', 'instrumental', 'transcribe', 'score-cache', 'length-guard',
             'match-tempo', 'sections', 'lyric-fit', 'chord-check', 'lyric-sync', 'fit-score',
             'score-touchup', 'lyric-fit-v2', 'meter-check', 'fit-tempo',
-            'sampling-v2', 'sound-stage', 'style-scope')
+            'sampling-v2', 'sound-stage', 'style-scope',
+            'length-cap', 'match-key', 'score-tags')
 ALIGN_REVISION = 'mmsfa-star-hdemucs-2'  # word timing cache revision (align.py's models and recipe)
 TOKENS_PER_SECOND, TOKEN_CAP, TOKEN_FLOOR, GUARD_HEADROOM = 25, 9000, 200, 1.10
 # Fit by tempo (COVER_SPEED design). YuE2 stops at 9,000 tokens, six minutes. A fixed score longer
@@ -404,6 +406,48 @@ def sync_options(inp):
     return dict(fit_lyrics=fit == 'timing', measure_fit=bool(measure), fit_score_touchup=bool(touchup))
 
 
+def length_cap(inp):
+    """max_seconds (optional): a ceiling on the song's length, 60 to 360 seconds. Leaving it out
+    keeps today's request exactly.
+
+    For a song with no score to measure against (a trained style on a new song), where the length
+    guard has nothing to go on: the booth works a generous ceiling out from the number of sung
+    lines, so a take that falls into repeating stops there instead of at six minutes."""
+    value = inp.get('max_seconds')
+    if value is None:
+        return None
+    if type(value) not in (int, float) or not math.isfinite(value) or not 60 <= value <= 360:
+        raise ValueError('max_seconds must be a number of seconds from 60 to 360.')
+    return float(value)
+
+
+def capped_budget(budget, cap_seconds):
+    """The song's token limit with max_seconds applied: the smaller of the two. None (YuE2's own
+    9,000) when there is no budget and no ceiling, or the ceiling is the full six minutes."""
+    if cap_seconds is None:
+        return budget
+    cap = max(TOKEN_FLOOR, math.ceil(round(TOKENS_PER_SECOND * cap_seconds, 6)))
+    if cap >= TOKEN_CAP:
+        return budget
+    return cap if budget is None else min(budget, cap)
+
+
+def score_options(inp):
+    """Round two (Nov 10 2026), both optional. Leaving them out keeps today's request exactly.
+
+    match_score_key: the style names the score's key beside its tempo ("F minor, 97 BPM"), as
+    upstream's own example style does, unless the style already names a key.
+    score_section_tags: a cover's lyric section tags take the names of the score's own sections
+    (upstream: align section tags and lyric order with the score), only when the sheet and the
+    score have the same number of sung sections; otherwise the sheet is left as written."""
+    def flag(key):
+        value = inp.get(key)
+        if value is not None and type(value) is not bool:
+            raise ValueError(f'{key} must be true or false.')
+        return bool(value)
+    return dict(match_score_key=flag('match_score_key'), score_section_tags=flag('score_section_tags'))
+
+
 def check_sync(inp, options, sync, reference):
     if not (sync['fit_lyrics'] or sync['measure_fit']):
         return
@@ -548,6 +592,66 @@ def tempo_style(style, bpm):
     if BPM.search(style):
         return BPM.sub(f'{bpm} BPM', style)
     return style.rstrip().rstrip('.,') + f', {bpm} BPM'
+
+
+KEY_NAME = re.compile(r'([A-G])([#b]?)(m?)')
+KEY_SAID = re.compile(r'\b[A-G](?:#|b|[- ]?(?:sharp|flat))?[- ]?(?:major|minor|maj|min)\b|\bkey of [A-G]\b', re.I)
+TRAILING_BPM = re.compile(r'[\s,]*\b\d{2,3}(?:\.\d+)?\s*bpm\b[\s.]*$', re.I)
+
+
+def key_words(key):
+    """'Fm' is 'F minor', 'Bb' is 'B-flat major', 'C#m' is 'C-sharp minor'; None for anything
+    that is not a plain major or minor key."""
+    match = KEY_NAME.fullmatch(key or '')
+    if not match:
+        return None
+    letter, accidental, minor = match.groups()
+    return letter + {'#': '-sharp', 'b': '-flat', '': ''}[accidental] + (' minor' if minor else ' major')
+
+
+def key_style(style, key):
+    """Name the score's own key in the style, before a tempo that ends it. A style that already
+    names a key is left alone."""
+    words = key_words(key)
+    if not words or KEY_SAID.search(style):
+        return style
+    tempo = TRAILING_BPM.search(style)
+    if tempo and tempo.start() > 0:
+        return style[:tempo.start()].rstrip().rstrip('.,') + f', {words}, ' + style[tempo.start():].lstrip(' ,')
+    return style.rstrip().rstrip('.,') + f', {words}'
+
+
+def tags_from_score(lyrics, sections):
+    """(lyrics, how many tags changed). Her lyric section tags renamed to the score's own section
+    names, in order, only when every sung block of the sheet has a tag, the sheet and the score
+    have the same number of sung sections and every score section has a name. Anything else
+    returns the sheet untouched and 0. Words, lines and their order never change; a tag written
+    in lower case stays lower case."""
+    names = [s['name'] for s in sung_sections(sections)] if sections else []
+    if not names or not all(names):
+        return lyrics, 0
+    lines = lyrics.split('\n')
+    blocks, current = [], None
+    for index, line in enumerate(lines):
+        if TAG.match(line):
+            current = [index, False]
+            blocks.append(current)
+        elif WORD.findall(line):
+            if current is None:
+                return lyrics, 0
+            current[1] = True
+    worded = [index for index, has_words in blocks if has_words]
+    if len(worded) != len(names):
+        return lyrics, 0
+    changed = 0
+    for index, name in zip(worded, names):
+        tag = TAG.match(lines[index]).group(1).strip()
+        if section_name(tag) == section_name(name):
+            continue
+        ending = '\r' if lines[index].endswith('\r') else ''
+        lines[index] = '[' + (name.lower() if tag == tag.lower() else name.title()) + ']' + ending
+        changed += 1
+    return ('\n'.join(lines), changed) if changed else (lyrics, 0)
 
 
 def semantic_budget(*seconds):
@@ -747,12 +851,13 @@ def apply_sync(inp, abc, sync, render, extras, notes):
                   sync_words=[words[i]['norm'] for i in order], sync_stars=stars)
 
 
-def fixed_score_render(inp, options, abc, origin, source_seconds=None, sync=None, fit_tempo=False):
+def fixed_score_render(inp, options, abc, origin, source_seconds=None, sync=None, fit_tempo=False, more=None):
     """The exact request YuE2 renders once its score is fixed: a recording's
     transcription, a given score or a YuE2 plan. Pure: no GPU, files or network.
     sync: the recording's measured timing when fit_lyrics or measure_fit was asked.
     fit_tempo: a score too long for six minutes is sped up to fit (tempo_plan); everything else,
     lyric sync included, works on the score as written and only the final Q: line changes.
+    more: score_options()'s answer (match_score_key, score_section_tags); None changes nothing.
 
     Returns (render request, semantic token budget or None, score facts, extras, notes)."""
     render, extras, notes = dict(inp, abc=abc), {}, []
@@ -765,6 +870,9 @@ def fixed_score_render(inp, options, abc, origin, source_seconds=None, sync=None
         style = tempo_style(style, plan['to_bpm'] if sped else facts['score_bpm'])
     elif sped:
         style, style_bpm = scale_style_bpm(style, plan['factor'])
+    more = more or {}
+    if more.get('match_score_key') and facts.get('score_musical_key'):
+        style = key_style(style, facts['score_musical_key'])
     if options['instrumental']:
         keep = options['keep_harmony']
         if keep is None:
@@ -801,6 +909,12 @@ def fixed_score_render(inp, options, abc, origin, source_seconds=None, sync=None
             render['cot'] = 'melody'
         if sync is not None:
             apply_sync(inp, abc, sync, render, extras, notes)
+        elif more.get('score_section_tags') and origin == 'recording':
+            render['lyrics'], renamed = tags_from_score(render['lyrics'], facts.get('sections', []))
+            extras['score_tags'] = renamed
+            if renamed:
+                notes.append(f"{renamed} section tag{'s' if renamed != 1 else ''} took the name of the section "
+                             'heard there in the recording; your words are unchanged.')
         extras['lyric_fit'] = lyric_fit(render['lyrics'], facts.get('sections', []))
     extras['meter_check'] = meter_check(render['style'], facts.get('score_meter'))
     if fit_tempo:
@@ -1518,6 +1632,7 @@ def handler(job):
         check_sync(inp, options, sync_opts, reference)
         fit = fit_option(raw)
         check_fit(inp, options, reference, fit)
+        cap, more = length_cap(raw), score_options(raw)
         if fit and inp['abc']:
             tempo_plan(inp['abc'], None, 'score')  # past the limit: refused before any GPU work
         wants_sync = sync_opts['fit_lyrics'] or sync_opts['measure_fit']
@@ -1573,12 +1688,14 @@ def handler(job):
             if fixed is not None:
                 began = time.monotonic()
                 render, budget, facts, extras, notes = fixed_score_render(
-                    inp, options, fixed, origin, read['seconds'] if read else None, sync=sync, fit_tempo=fit)
+                    inp, options, fixed, origin, read['seconds'] if read else None, sync=sync, fit_tempo=fit,
+                    more=more)
                 timing['convert_s'] = round(time.monotonic() - began, 2)
             else:
                 origin = 'YuE2' if inp['cot'] != 'off' else None
                 if options['length_guard']:
                     notes.append('The length guard needs a score before the render, so this new song kept the six-minute limit.')
+            budget = capped_budget(budget, cap)  # max_seconds: a ceiling for a song with no score to measure
             score_tokens = token_count(pipe, render.get('abc'))
             if score_tokens and score_tokens > 4096:
                 notes.append(f'The score is {score_tokens} tokens, above the usual 4096; the song may drift.')
@@ -1650,6 +1767,10 @@ def handler(job):
                 'features': list(FEATURES)})
             if sampling != 'v1':
                 output['sampling_map'] = sampling
+            if cap is not None:
+                output['max_seconds'] = cap
+            if more['match_score_key'] or more['score_section_tags']:
+                output['score_options'] = dict(more, tags_renamed=extras.get('score_tags'))
             if wanted:
                 output['lora_sound_stage'] = stage
                 if scope:
