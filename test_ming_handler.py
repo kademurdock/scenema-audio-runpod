@@ -19,6 +19,11 @@ import soundfile as sf
 import ming_contract as contract
 import ming_handler as worker
 
+try:  # Load torch (in the image) before tests patch sys.modules; a second import would fail.
+    import torch  # noqa: F401
+except ImportError:
+    pass
+
 UPSTREAM = os.environ.get("MING_UPSTREAM")
 if UPSTREAM:
     sys.path.insert(0, UPSTREAM)
