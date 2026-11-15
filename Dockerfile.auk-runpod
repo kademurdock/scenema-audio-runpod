@@ -9,14 +9,19 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip==25.3 setuptools==80.9.0
 RUN python3 -c "import torch; assert torch.__version__.split('+')[0] == '2.7.1'"
 WORKDIR /app
 ENV PYTHONPATH=/app/upstream/src
-RUN git clone https://github.com/Tencent-Hunyuan/AuK /app/upstream && cd /app/upstream && git checkout e1c935e81e356c87419d9509d7f8a4091457bdca && pip install --no-cache-dir --no-build-isolation . "torch==2.7.1" "torchaudio==2.7.1" "torchvision==0.22.1" "transformers==4.57.6" "huggingface-hub==0.36.2" "runpod>=1.7,<2" "boto3>=1.35,<2" "soundfile>=0.12,<1" "requests>=2.32,<3"
+# 3253462 casts only the DiT to fp32; Qwen stays bf16 (about 7.5 GiB less), so
+# full AuK Base fits a 24 GB card without CPU offload. Repo history, demo audio,
+# docs and ComfyUI nodes are not used at runtime and are removed in this layer.
+RUN git clone https://github.com/Tencent-Hunyuan/AuK /app/upstream && cd /app/upstream && git checkout 3253462f430e6600052ef44af6afd62d61113aab && pip install --no-cache-dir --no-build-isolation . "torch==2.7.1" "torchaudio==2.7.1" "torchvision==0.22.1" "transformers==4.57.6" "huggingface-hub==0.36.2" "runpod>=1.7,<2" "boto3>=1.35,<2" "soundfile>=0.12,<1" "requests>=2.32,<3" \
+    && rm -rf /app/upstream/.git /app/upstream/assets /app/upstream/docs /app/upstream/comfyui /root/.cache
 ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ENV AUK_MODEL_DIR=/runpod-volume/huggingface-cache/hub/models--tencent--AuK/snapshots/790742b71a4430120daf2b2099192abae449eb9f
 ENV AUK_QWEN_DIR=/runpod-volume/huggingface-cache/hub/models--Qwen--Qwen2.5-Omni-3B/snapshots/f75b40e3da2003cdd6e1829b1f420ca70797c34e
 # qwen-omni-utils imports audioread, but does not declare it. Recent librosa
 # versions no longer guarantee that transitive dependency.
 RUN python3 -m pip install --no-cache-dir "audioread>=3.0.1,<4"
-COPY auk_contract.py auk_handler.py check_auk_audio.py /app/
-RUN python3 -c "from auk.infer.infer_auk import AukInfer; import auk_handler" && python3 /app/check_auk_audio.py
+COPY auk_edit.py auk_contract.py auk_handler.py check_auk_audio.py /app/
+RUN python3 -c "from auk.infer.infer_auk import AukInfer; import auk_handler" && python3 /app/check_auk_audio.py \
+    && python3 -c "import inspect, auk.infer.infer_auk as m; assert 'model.transformer.to(torch.float32)' in inspect.getsource(m), 'Qwen would be upcast to fp32'"
 ENTRYPOINT []
 CMD ["python3", "-u", "/app/auk_handler.py"]

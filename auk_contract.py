@@ -4,6 +4,8 @@ import json
 import re
 import xml.etree.ElementTree as ET
 
+from auk_edit import words_edit_spec
+
 
 def edit_windows(total, inp):
     """Frame-aligned, bounded windows, including a selected range's untouched edges."""
@@ -25,10 +27,29 @@ def edit_windows(total, inp):
     } for i in range(count)]
 
 
+def prepare_edit_instruction(instruction):
+    """Put single voice-change requests in AuK's documented timbre template."""
+    match = re.fullmatch(
+        r'(?:please\s+)?(?:make|change|turn|convert)\s+(?:this|the)\s+'
+        r'(?:speaking\s+)?voice\s+(?:sound\s+like|into|to)\s+([^\r\n.!?;]+?)[.!]?',
+        instruction, re.IGNORECASE)
+    if not match:
+        return instruction
+    description = match.group(1).strip()
+    if not description or re.search(
+            r'\b(?:replace|insert|remove|delete|add|then|say|sing|words|lyrics|content|'
+            r'raise|lower|adjust|increase|decrease|separate)\b', description, re.IGNORECASE):
+        return instruction
+    return ('Keep the spoken content unchanged and change the timbre to: ' +
+            json.dumps(description, ensure_ascii=False) + '.')
+
+
 def model_instruction(piece, has_reference=False):
-    """Use AuK's distinct speech contracts; edit requests keep their own words."""
+    """AuK's speech contracts, word edits in their template, timbre requests normalized."""
+    if piece.get("words_edit"):
+        return piece["words_edit"]["instruction"]
     if "text" not in piece:
-        return piece["instruction"]
+        return prepare_edit_instruction(piece["instruction"])
     text = json.dumps(piece["text"], ensure_ascii=False)
     if has_reference:
         return f"Say the following with the same voice: {text}"
@@ -45,6 +66,11 @@ def plan(inp):
     if not isinstance(seed, int) or not 0 <= seed < 2**32:
         raise ValueError("Seed must be an integer from 0 to 4294967295.")
     if task == "edit":
+        # Word and lyric changes use the trained template, several seeds.
+        words = words_edit_spec(inp)
+        if words is not None:
+            return [{"instruction": words["instruction"], "seconds": None,
+                     "seed": words["seeds"][0], "words_edit": words}]
         instruction = str(inp.get("instruction") or "").strip()
         if not instruction or not inp.get("reference_voice_url"):
             raise ValueError("Editing needs an imported recording and an instruction.")

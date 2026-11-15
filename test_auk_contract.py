@@ -42,13 +42,53 @@ class ContractTests(unittest.TestCase):
         self.assertEqual([p["text"] for p in pieces], ["Hello & welcome.", "Goodbye."])
         self.assertIn("sad", pieces[1]["instruction"])
 
-    def test_edit_retains_exact_instruction_and_duration(self):
-        instruction = 'Replace "Tuesday" with "Thursday".'
+    def test_free_form_word_edit_becomes_the_trained_template(self):
+        p = plan({"auk_task": "edit", "instruction": 'Replace "Tuesday" with "Thursday".',
+                  "reference_voice_url": "https://example.test/a", "gen_seconds": 9, "seed": 5})
+        self.assertEqual(p[0]["instruction"], "Replace 'Tuesday' with 'Thursday'.")
+        self.assertEqual(p[0]["words_edit"]["seeds"], [5, 5 + 7919, 5 + 2 * 7919])
+        self.assertEqual(model_instruction(p[0], has_reference=True), "Replace 'Tuesday' with 'Thursday'.")
+
+    def test_style_edit_keeps_its_instruction_and_duration(self):
+        instruction = 'Make this a whisper.'
         p = plan({"auk_task": "edit", "instruction": instruction,
                   "reference_voice_url": "https://example.test/a", "gen_seconds": 9})
         self.assertEqual(p[0]["instruction"], instruction)
         self.assertEqual(p[0]["seconds"], 9)
+        self.assertNotIn("words_edit", p[0])
         self.assertEqual(model_instruction(p[0], has_reference=True), instruction)
+
+    def test_plain_voice_change_uses_timbre_template_without_changing_requested_traits(self):
+        cases = (
+            ('Turn this voice into a man.', 'a man'),
+            ('Make this voice sound like a twelve year old child.', 'a twelve year old child'),
+            ('Please change the voice to an older woman with a Southern accent.', 'an older woman with a Southern accent'),
+            ('Convert this speaking voice into a light, clear youthful voice!', 'a light, clear youthful voice'),
+        )
+        for instruction, description in cases:
+            with self.subTest(instruction=instruction):
+                piece = plan({'auk_task': 'edit', 'instruction': instruction,
+                              'reference_voice_url': 'https://example.test/a'})[0]
+                self.assertEqual(piece['instruction'], instruction)
+                self.assertEqual(model_instruction(piece, has_reference=True),
+                                 'Keep the spoken content unchanged and change the timbre to: ' +
+                                 '"' + description + '".')
+
+    def test_edit_preparation_leaves_other_tasks_and_combined_requests_intact(self):
+        instructions = (
+            'Keep the spoken content unchanged and change the timbre to: "a youthful voice".',
+            'Replace "Tuesday" with "Thursday".',
+            'Change the emotion to happy.',
+            'Give this voice a strong Irish accent.',
+            'Make this voice sound like a child. Remove the noise.',
+            'Make this voice sound like a child, then replace "Tuesday" with "Thursday".',
+            'Make this voice sound like a child and sing different words.',
+            'Make this voice sound like a child, lower the pitch by two semitones.',
+            'Make this voice sound like   .',
+        )
+        for instruction in instructions:
+            with self.subTest(instruction=instruction):
+                self.assertEqual(model_instruction({'instruction': instruction}, has_reference=True), instruction)
 
     def test_reference_speech_never_appends_voice_or_stage_directions(self):
         import json

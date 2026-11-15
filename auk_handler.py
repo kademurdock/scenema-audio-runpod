@@ -8,36 +8,61 @@ from pathlib import Path
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import uuid
 
 from auk_contract import plan, model_instruction, edit_windows
+from auk_edit import crop_bounds, rank_candidates, score_transcript, splice, target_seconds
 
 log = logging.getLogger("auk-worker")
 logging.basicConfig(level=logging.INFO)
 ENGINE = None
 
 
+ENGINE_LOCK = threading.Lock()
+
+
 def engine():
     global ENGINE
-    if ENGINE is None:
-        model_dir = Path(os.environ.get('AUK_MODEL_DIR', '/models/AuK'))
-        qwen_dir = Path(os.environ.get('AUK_QWEN_DIR', '/models/Qwen'))
-        if not (model_dir / 'auk_base.safetensors').is_file():
-            raise ValueError('The AuK model cache is not ready. No audio was generated.')
-        if not (qwen_dir / 'config.json').is_file():
-            raise ValueError('The Qwen model cache is not ready. No audio was generated.')
-        from auk.infer.infer_auk import AukInfer
-        import torch
-        offload_setting = os.environ.get('AUK_CPU_OFFLOAD', 'auto').lower()
-        offload = (torch.cuda.get_device_properties(0).total_memory < 40 * 1024**3
-                   if offload_setting == 'auto' else offload_setting not in ('0', 'false'))
-        log.info('AuK CPU offload: %s', offload)
-        ENGINE = AukInfer(str(model_dir / 'config.yaml'), str(model_dir / 'auk_base.safetensors'),
-                          qwen_path=str(qwen_dir), dtype="bf16", device="cuda",
-                          cpu_offload=offload)
+    # One load only: the boot thread and a first job may both ask for it.
+    with ENGINE_LOCK:
+        if ENGINE is None:
+            ENGINE = load_engine()
     return ENGINE
+
+
+def load_engine():
+    model_dir = Path(os.environ.get('AUK_MODEL_DIR', '/models/AuK'))
+    qwen_dir = Path(os.environ.get('AUK_QWEN_DIR', '/models/Qwen'))
+    if not (model_dir / 'auk_base.safetensors').is_file():
+        raise ValueError('The AuK model cache is not ready. No audio was generated.')
+    if not (qwen_dir / 'config.json').is_file():
+        raise ValueError('The Qwen model cache is not ready. No audio was generated.')
+    from auk.infer.infer_auk import AukInfer
+    import torch
+    offload = use_cpu_offload(torch.cuda.get_device_properties(0).total_memory)
+    started = time.monotonic()
+    log.info('AuK CPU offload: %s', offload)
+    runtime = AukInfer(str(model_dir / 'config.yaml'), str(model_dir / 'auk_base.safetensors'),
+                       qwen_path=str(qwen_dir), dtype="bf16", device="cuda",
+                       cpu_offload=offload)
+    log.info('AuK loaded in %.1f s; %.1f GiB on the GPU', time.monotonic() - started,
+             torch.cuda.memory_allocated() / 1024**3)
+    return runtime
+
+
+def use_cpu_offload(total_bytes, setting=None):
+    """Upstream 3253462 keeps Qwen in bf16: full AuK Base is ~14 GiB of weights.
+
+    A 24 GB card (about 22 GiB usable) runs it on the GPU. Only smaller cards
+    offload. AUK_CPU_OFFLOAD=1/0 forces it either way.
+    """
+    setting = (setting if setting is not None else os.environ.get('AUK_CPU_OFFLOAD', 'auto')).lower()
+    if setting != 'auto':
+        return setting not in ('0', 'false')
+    return total_bytes < float(os.environ.get('AUK_OFFLOAD_BELOW_GIB', '20')) * 1024**3
 
 
 def generate(messages, **kwargs):
@@ -80,11 +105,149 @@ def ffmpeg(*args):
                    check=True, timeout=180, capture_output=True)
 
 
+def transcribe(path, kind):
+    """Optional ranking ASR with the Qwen2.5-Omni Thinker AuK already holds.
+
+    No extra model, download or GPU memory beyond a short decode. Off unless a
+    job asks (rank: true); the bridge can rank instead.
+    """
+    runtime = engine()
+    if getattr(runtime, 'cpu_offload', False):
+        raise RuntimeError('ranking is off while the model is offloaded')
+    import torch
+    from qwen_omni_utils import process_mm_info
+    thinker = runtime.model.text_encoder
+    processor = runtime.model.text_processor
+    ask = ('Transcribe the lyrics sung in this audio. Output only the words.' if kind == 'vocal'
+           else 'Transcribe the speech in this audio. Output only the words.')
+    conversation = [
+        {'role': 'system', 'content': [{'type': 'text', 'text': 'You are a speech recognition model.'}]},
+        {'role': 'user', 'content': [{'type': 'audio', 'audio': str(path)}, {'type': 'text', 'text': ask}]},
+    ]
+    text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+    audios, _, _ = process_mm_info(conversation, use_audio_in_video=False)
+    inputs = processor(text=text, audio=audios, return_tensors='pt', padding=True, use_audio_in_video=False)
+    inputs = inputs.to(thinker.device).to(thinker.dtype)
+    with torch.inference_mode():
+        out = thinker.generate(**inputs, max_new_tokens=160, do_sample=False)
+    return processor.batch_decode(out[:, inputs['input_ids'].shape[1]:], skip_special_tokens=True)[0].strip()
+
+
+class Store:
+    """Private B2 outputs with seven-day signed links."""
+
+    def __init__(self):
+        import boto3
+        self.s3 = boto3.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"],
+                               region_name=os.environ.get("AWS_REGION", "us-east-005"))
+        self.bucket = os.environ["AWS_BUCKET_NAME"]
+
+    def put(self, wav, mp3):
+        # UUID prevents overwriting an existing take or escaping its prefix.
+        key = f"auk/{uuid.uuid4()}"
+        for path, suffix, mime in [(wav, ".wav", "audio/wav"), (mp3, ".mp3", "audio/mpeg")]:
+            self.s3.upload_file(str(path), self.bucket, key + suffix, ExtraArgs={"ContentType": mime})
+
+        def sign(k):
+            return self.s3.generate_presigned_url(
+                "get_object", Params={"Bucket": self.bucket, "Key": k}, ExpiresIn=604800)
+        return {"key": key + ".mp3", "url": sign(key + ".mp3"),
+                "wav_key": key + ".wav", "wav_url": sign(key + ".wav"), "bytes": mp3.stat().st_size}
+
+
+def words_edit(job, inp, spec, started):
+    """One word or lyric change: crop the marked range, N seeds, splice each back."""
+    import numpy as np
+    import soundfile as sf
+    import runpod
+    from auk.infer.infer_auk import save_audio
+    with tempfile.TemporaryDirectory() as td:
+        work = Path(td)
+        download(inp["reference_voice_url"], work / "import")
+        source = work / "source.wav"
+        ffmpeg("-i", work / "import", "-vn", "-c:a", "pcm_s24le", source)
+        original, rate = sf.read(source, always_2d=True)
+        frames, channels = original.shape
+        bounds = crop_bounds(frames / rate, inp)
+        crop_start = int(round(bounds['crop_start'] * rate))
+        crop_end = min(frames, int(round(bounds['crop_end'] * rate)))
+        crop_seconds = (crop_end - crop_start) / rate
+        seconds = spec['target_override'] or target_seconds(
+            crop_seconds, bounds['range_end'] - bounds['range_start'],
+            spec['old'], spec['new'], spec['source_text'])
+        native_crop = work / "crop-native.wav"
+        sf.write(native_crop, original[crop_start:crop_end], rate, subtype='PCM_24')
+        reference = work / "crop.wav"
+        ffmpeg("-i", native_crop, "-ar", 24000, "-ac", 1, reference)
+        store = Store()
+        fade = int(round(spec['crossfade_ms'] * rate / 1000))
+        candidates, failures = [], []
+        for n, seed in enumerate(spec['seeds']):
+            runpod.serverless.progress_update(job, f"AuK HQ: take {n + 1} of {len(spec['seeds'])}")
+            try:
+                content = [{"type": "text", "text": spec['instruction']},
+                           {"type": "audio", "audio": str(reference)}]
+                audio, sr = generate([{"role": "user", "content": content}],
+                                     gen_seconds=seconds, nfe=32, cfg_strength=2.0, seed=seed)
+                take = work / f"take{n}.wav"
+                save_audio(audio, sr, str(take))
+                native = work / f"take{n}-native.wav"
+                # Resample only. FFmpeg's mono-to-stereo upmix drops 3 dB, so
+                # the take is copied to each channel here at full level.
+                ffmpeg("-i", take, "-ar", rate, "-ac", 1, "-c:a", "pcm_s24le", native)
+                generated, _ = sf.read(native, always_2d=True)
+                generated = np.repeat(generated[:, :1], channels, axis=1)
+                master = np.clip(splice(original, generated, crop_start, crop_end, fade), -1.0, 1.0)
+                wav, mp3 = work / f"master{n}.wav", work / f"master{n}.mp3"
+                sf.write(wav, master, rate, subtype='PCM_24')
+                ffmpeg("-i", wav, "-c:a", "libmp3lame", "-b:a", "192k", mp3)
+                candidate = {"seed": seed, **store.put(wav, mp3),
+                             "duration_s": round(master.shape[0] / rate, 2),
+                             "edited_seconds": round(generated.shape[0] / rate, 2)}
+                if spec['rank']:
+                    try:
+                        candidate['transcript'] = transcribe(take, spec['kind'])
+                        candidate.update(score_transcript(candidate['transcript'], spec['old'], spec['new']))
+                    except Exception as error:
+                        log.warning('AuK ranking skipped (%s)', type(error).__name__)
+                        candidate['rank_error'] = 'transcription_failed'
+                candidates.append(candidate)
+            except ValueError:
+                raise
+            except Exception as error:
+                # No automatic re-roll: a failed seed is reported, the others still run.
+                log.error('AuK take failed (%s)', type(error).__name__)
+                failures.append({"seed": seed, "error": type(error).__name__})
+        if not candidates:
+            raise RuntimeError('no take finished')
+        ranked = bool(spec['rank']) and any(c.get('score') is not None for c in candidates)
+        if ranked:
+            candidates = rank_candidates(candidates)
+        best = candidates[0]
+        return {
+            "engine": "auk", "quality": "base-bf16-32", "task": "words_edit",
+            "kind": spec['kind'], "instruction": spec['instruction'],
+            "old_words": spec['old'], "new_words": spec['new'],
+            "range_start": round(bounds['range_start'], 3), "range_end": round(bounds['range_end'], 3),
+            "crop_start": round(crop_start / rate, 3), "crop_end": round(crop_end / rate, 3),
+            "target_seconds": seconds, "crossfade_ms": spec['crossfade_ms'],
+            "candidates": candidates, "failed_seeds": failures,
+            "ranked": ranked, "any_matched": any(bool(c.get('matched')) for c in candidates) if ranked else None,
+            # The first (or best ranked) take, for callers that read one result.
+            "key": best["key"], "url": best["url"], "wav_key": best["wav_key"],
+            "wav_url": best["wav_url"], "bytes": best["bytes"], "duration_s": best["duration_s"],
+            "seed": best["seed"], "processing_ms": int((time.monotonic() - started) * 1000),
+            "has_reference_voice": True, "parts": 1, "voice_sample": False,
+        }
+
+
 def handler(job):
     start = time.monotonic()
     try:
         inp = job.get("input") or {}
         pieces = plan(inp)
+        if pieces[0].get("words_edit"):
+            return words_edit(job, inp, pieces[0]["words_edit"], start)
         from auk.infer.infer_auk import save_audio
         import soundfile as sf
         import boto3
@@ -184,18 +347,24 @@ def handler(job):
                 f"AuK could not finish ({type(error).__name__}). Your source recording is unchanged."}
 
 
-# NO BOOT-TIME LOAD FOR AuK YET (Part 215, Sep 19 2026). YuE2 loads at boot and it
-# works (14.7 s queue, 0 s in-job load). The same warm() was tried here twice on
-# image 02224ba and never served a job -- but the test was CONFOUNDED: the same
-# night RunPod kept renting A40 hosts in CA whose containers never started
-# (runtime null, pods cycling), and the old known-good image b6b823e sat in the
-# queue the same way. So it is NOT established that the boot load was at fault.
-# It is left out because it could not be verified and AuK must stay simple while
-# its hosts are flaky. To retry: first confirm the current image serves a job,
-# then change one thing, and prefer loading AFTER runpod.serverless.start() is
-# listening, behind a lock shared with engine().
+def warm():
+    """Load AuK while the worker already listens (Nov 14 2026).
+
+    Part 215 (Sep 19) left boot loading out after a confounded trial on hosts
+    whose containers never started. Here the load runs after
+    runpod.serverless.start() is up, behind the same lock as engine(), so a
+    job that arrives first waits for this load instead of starting another.
+    A failed boot load is retried by the first job and reported there.
+    """
+    time.sleep(float(os.environ.get('AUK_BOOT_DELAY', '2')))
+    try:
+        engine()
+    except Exception as error:
+        log.warning('AuK boot load failed (%s); the first job will retry', type(error).__name__)
 
 
 if __name__ == "__main__":
     import runpod
+    if os.environ.get('AUK_BOOT_LOAD', '1') not in ('0', 'false'):
+        threading.Thread(target=warm, name='auk-boot-load', daemon=True).start()
     runpod.serverless.start({"handler": handler})
