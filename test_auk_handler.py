@@ -94,7 +94,7 @@ class AudioTests(unittest.TestCase):
 
                 def generate(self, messages, **kwargs):
                     calls.append(kwargs)
-                    return np.zeros(round(kwargs['gen_seconds'] * 24000)), 24000
+                    return np.full(round(kwargs['gen_seconds'] * 24000), 0.125), 24000
 
             class Storage:
                 def upload_file(self, path, bucket, key, **kwargs):
@@ -123,10 +123,12 @@ class AudioTests(unittest.TestCase):
             self.assertEqual(rendered.shape, (rate * 40, 2))
             np.testing.assert_array_equal(rendered[:10 * rate], original[:10 * rate])
             np.testing.assert_array_equal(rendered[25 * rate:], original[30 * rate:])
+            # Mono take copied to both channels at full level (no -3 dB upmix).
+            np.testing.assert_allclose(np.median(rendered[11 * rate:24 * rate], axis=0), 0.125, atol=1e-3)
             self.assertEqual(len(calls), 2)
             self.assertEqual(sum(c['gen_seconds'] for c in calls), 15)
 
-    def _words_edit_run(self, inp, transcripts=None, rate=48000, seconds=20):
+    def _words_edit_run(self, inp, transcripts=None, rate=48000, seconds=20, fail_seeds=()):
         """Run the word-edit path with real PCM and FFmpeg; GPU and B2 are fakes."""
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
@@ -146,6 +148,9 @@ class AudioTests(unittest.TestCase):
                 reference, ref_rate = sf.read(content[1]['audio'])
                 calls.append({'text': content[0]['text'], 'ref_seconds': len(reference) / ref_rate,
                               'ref_rate': ref_rate, 'ref_ndim': reference.ndim, **kwargs})
+                if kwargs['seed'] in fail_seeds:
+                    # Upstream's own mid-take check (infer_auk.py) raises ValueError.
+                    raise ValueError('Audio tensor contains NaN or Inf.')
                 return np.full(round(kwargs['gen_seconds'] * 24000), 0.125), 24000
 
         class Storage:
@@ -195,15 +200,48 @@ class AudioTests(unittest.TestCase):
         self.assertEqual([c['seed'] for c in result['candidates']], [22, 33, 11])
         self.assertTrue(result['candidates'][0]['matched'])
         self.assertEqual(result['seed'], 22)
-        self.assertEqual(len(uploaded), 6)
+        self.assertEqual(len(uploaded), 9)  # WAV, MP3 and the edited clip per take
+        # The take is brought to the original's level in the padding.
+        level = np.sqrt(np.mean(np.square(original[7 * rate:int(7.3 * rate)])))
+        gain = level / 0.125
         for cand in result['candidates']:
             rendered, sr = sf.read(uploaded[cand['wav_key']], always_2d=True)
             self.assertEqual(sr, rate)
             self.assertEqual(rendered.shape, (rate * 21, 2))  # 7 s + 5 s + 9 s
-            np.testing.assert_array_equal(rendered[:7 * rate], original[:7 * rate])
-            np.testing.assert_array_equal(rendered[12 * rate:], original[11 * rate:])
-            middle = rendered[int(7.5 * rate):int(11.5 * rate)]
-            np.testing.assert_allclose(middle, 0.125, atol=1e-3)
+            # The original stays until 0.15 s before the range and from 0.15 s after it.
+            np.testing.assert_array_equal(rendered[:int(7.85 * rate)], original[:int(7.85 * rate)])
+            np.testing.assert_array_equal(rendered[int(11.15 * rate):], original[int(10.15 * rate):])
+            middle = rendered[8 * rate:11 * rate]
+            self.assertAlmostEqual(cand['level_db'], 20 * np.log10(gain), delta=0.25)
+            np.testing.assert_allclose(middle, 0.125 * 10 ** (cand['level_db'] / 20), atol=2e-3)
+            # The edited stretch with its padding, for the bridge's old-words check.
+            self.assertEqual(cand['clip_key'], cand['key'][:-4] + '-clip.mp3')
+            self.assertIn(cand['clip_key'], uploaded)
+            self.assertTrue(cand['clip_url'].endswith('-clip.mp3'))
+            self.assertEqual((cand['clip_start'], cand['clip_seconds']), (7.0, 5.0))
+        self.assertEqual(result['clip_url'], result['candidates'][0]['clip_url'])
+
+    def test_a_take_that_raises_value_error_is_reported_and_the_others_kept(self):
+        result, calls, uploaded, _ = self._words_edit_run({
+            'old_words': 'red', 'new_words': 'blue', 'edit_start': 8, 'edit_end': 9, 'seeds': [1, 2, 3]},
+            fail_seeds=(2,))
+        self.assertNotIn('error', result)
+        self.assertEqual([c['seed'] for c in result['candidates']], [1, 3])
+        self.assertEqual(result['failed_seeds'], [{'seed': 2, 'error': 'ValueError'}])
+        result, _, _, _ = self._words_edit_run({
+            'old_words': 'red', 'new_words': 'blue', 'edit_start': 8, 'edit_end': 9, 'seeds': [1]},
+            fail_seeds=(1,))
+        self.assertNotIn('NaN', result['error'])
+        self.assertIn('unchanged', result['error'])
+
+    def test_a_30_second_range_is_accepted_with_smaller_padding(self):
+        result, calls, _, _ = self._words_edit_run({
+            'old_words': 'one two three', 'new_words': 'four five six', 'edit_start': 5, 'edit_end': 34,
+            'candidates': 1}, seconds=45)
+        self.assertNotIn('error', result)
+        self.assertEqual((result['crop_start'], result['crop_end']), (4.5, 34.5))
+        self.assertAlmostEqual(calls[0]['ref_seconds'], 30.0, places=2)
+        self.assertEqual(calls[0]['gen_seconds'], 30.0)
 
     def test_unranked_takes_keep_seed_order_and_short_clip_needs_no_range(self):
         result, calls, uploaded, original = self._words_edit_run({
@@ -220,7 +258,7 @@ class AudioTests(unittest.TestCase):
     def test_word_edits_that_cannot_work_are_refused_before_the_gpu(self):
         cases = (
             ({'instruction': 'Replace "red" with "blue" and change "cat" to "dog".'}, 'One word change per render'),
-            ({'instruction': 'Fix the words so it sounds better.'}, 'trained wording'),
+            ({'instruction': 'Swap "red" for "blue".'}, 'trained wording'),
             ({'old_words': 'red', 'new_words': 'blue'}, 'need a range'),
             ({'old_words': 'red', 'new_words': 'red', 'edit_start': 1, 'edit_end': 2}, 'the same'),
             ({'old_words': 'red', 'new_words': 'blue', 'edit_start': 1, 'edit_end': 40}, 'Mark only the words'),

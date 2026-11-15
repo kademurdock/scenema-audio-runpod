@@ -1,7 +1,9 @@
 """Full-quality AuK, private B2 outputs, zero automatic inference retries."""
+import gc
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -14,7 +16,8 @@ import urllib.parse
 import uuid
 
 from auk_contract import plan, model_instruction, edit_windows
-from auk_edit import crop_bounds, rank_candidates, score_transcript, splice, target_seconds
+from auk_edit import (LEVEL_WINDOW_S, crop_bounds, level_gain, rank_candidates, score_transcript,
+                      splice, splice_points, target_seconds)
 
 log = logging.getLogger("auk-worker")
 logging.basicConfig(level=logging.INFO)
@@ -48,9 +51,48 @@ def load_engine():
     runtime = AukInfer(str(model_dir / 'config.yaml'), str(model_dir / 'auk_base.safetensors'),
                        qwen_path=str(qwen_dir), dtype="bf16", device="cuda",
                        cpu_offload=offload)
-    log.info('AuK loaded in %.1f s; %.1f GiB on the GPU', time.monotonic() - started,
+    log.info('AuK loaded in %.1f s; %.1f GiB of weights on the GPU', time.monotonic() - started,
              torch.cuda.memory_allocated() / 1024**3)
     return runtime
+
+
+def _cuda():
+    try:
+        import torch
+    except ImportError:
+        return None
+    return torch if torch.cuda.is_available() else None
+
+
+def reset_gpu_peak():
+    """Start a job's peak-memory count (the number that decides if 24 GB fits)."""
+    torch = _cuda()
+    if torch is not None:
+        torch.cuda.reset_peak_memory_stats()
+
+
+def gpu_memory(label):
+    """Log and return the job's peak so far, what is reserved and what is free."""
+    torch = _cuda()
+    if torch is None:
+        return None
+    try:
+        free, total = torch.cuda.mem_get_info()
+    except Exception as error:  # A reading must never fail a take.
+        log.warning('AuK GPU memory reading failed (%s)', type(error).__name__)
+        return None
+    note = {'peak_allocated_gib': round(torch.cuda.max_memory_allocated() / 1024**3, 2),
+            'peak_reserved_gib': round(torch.cuda.max_memory_reserved() / 1024**3, 2),
+            'reserved_gib': round(torch.cuda.memory_reserved() / 1024**3, 2),
+            'free_gib': round(free / 1024**3, 2), 'total_gib': round(total / 1024**3, 2)}
+    log.info('AuK GPU memory after %s: peak %.2f GiB allocated, %.2f GiB reserved (peak %.2f), '
+             '%.2f of %.2f GiB free', label, note['peak_allocated_gib'], note['reserved_gib'],
+             note['peak_reserved_gib'], note['free_gib'], note['total_gib'])
+    return note
+
+
+def _flag(name, default):
+    return os.environ.get(name, default).strip().lower() not in ('0', 'false', 'no', 'off')
 
 
 def use_cpu_offload(total_bytes, setting=None):
@@ -59,9 +101,9 @@ def use_cpu_offload(total_bytes, setting=None):
     A 24 GB card (about 22 GiB usable) runs it on the GPU. Only smaller cards
     offload. AUK_CPU_OFFLOAD=1/0 forces it either way.
     """
-    setting = (setting if setting is not None else os.environ.get('AUK_CPU_OFFLOAD', 'auto')).lower()
+    setting = (setting if setting is not None else os.environ.get('AUK_CPU_OFFLOAD', 'auto')).strip().lower()
     if setting != 'auto':
-        return setting not in ('0', 'false')
+        return setting not in ('0', 'false', 'no', 'off')
     return total_bytes < float(os.environ.get('AUK_OFFLOAD_BELOW_GIB', '20')) * 1024**3
 
 
@@ -142,17 +184,23 @@ class Store:
                                region_name=os.environ.get("AWS_REGION", "us-east-005"))
         self.bucket = os.environ["AWS_BUCKET_NAME"]
 
-    def put(self, wav, mp3):
+    def put(self, wav, mp3, clip=None):
         # UUID prevents overwriting an existing take or escaping its prefix.
         key = f"auk/{uuid.uuid4()}"
-        for path, suffix, mime in [(wav, ".wav", "audio/wav"), (mp3, ".mp3", "audio/mpeg")]:
+        files = [(wav, ".wav", "audio/wav"), (mp3, ".mp3", "audio/mpeg")]
+        if clip is not None:
+            files.append((clip, "-clip.mp3", "audio/mpeg"))
+        for path, suffix, mime in files:
             self.s3.upload_file(str(path), self.bucket, key + suffix, ExtraArgs={"ContentType": mime})
 
         def sign(k):
             return self.s3.generate_presigned_url(
                 "get_object", Params={"Bucket": self.bucket, "Key": k}, ExpiresIn=604800)
-        return {"key": key + ".mp3", "url": sign(key + ".mp3"),
-                "wav_key": key + ".wav", "wav_url": sign(key + ".wav"), "bytes": mp3.stat().st_size}
+        out = {"key": key + ".mp3", "url": sign(key + ".mp3"),
+               "wav_key": key + ".wav", "wav_url": sign(key + ".wav"), "bytes": mp3.stat().st_size}
+        if clip is not None:
+            out.update(clip_key=key + "-clip.mp3", clip_url=sign(key + "-clip.mp3"))
+        return out
 
 
 def words_edit(job, inp, spec, started):
@@ -168,6 +216,10 @@ def words_edit(job, inp, spec, started):
         ffmpeg("-i", work / "import", "-vn", "-c:a", "pcm_s24le", source)
         original, rate = sf.read(source, always_2d=True)
         frames, channels = original.shape
+        # Every input check runs before the first take: upstream's own checks
+        # raise ValueError mid-take.
+        if frames == 0 or not np.isfinite(original).all():
+            raise ValueError('The recording has no usable audio. Import it again.')
         bounds = crop_bounds(frames / rate, inp)
         crop_start = int(round(bounds['crop_start'] * rate))
         crop_end = min(frames, int(round(bounds['crop_end'] * rate)))
@@ -179,9 +231,17 @@ def words_edit(job, inp, spec, started):
         sf.write(native_crop, original[crop_start:crop_end], rate, subtype='PCM_24')
         reference = work / "crop.wav"
         ffmpeg("-i", native_crop, "-ar", 24000, "-ac", 1, reference)
+        reference_audio, _ = sf.read(reference)
+        if reference_audio.size == 0 or not np.isfinite(reference_audio).all():
+            raise ValueError('The marked stretch has no usable audio. Choose another range.')
         store = Store()
         fade = int(round(spec['crossfade_ms'] * rate / 1000))
-        candidates, failures = [], []
+        head_pad = int(round(bounds['range_start'] * rate)) - crop_start
+        tail_pad = crop_end - int(round(bounds['range_end'] * rate))
+        candidates, failures, memory = [], [], None
+        # Load before the takes, so a model cache that is not ready is said plainly.
+        engine()
+        reset_gpu_peak()
         for n, seed in enumerate(spec['seeds']):
             runpod.serverless.progress_update(job, f"AuK HQ: take {n + 1} of {len(spec['seeds'])}")
             try:
@@ -189,6 +249,7 @@ def words_edit(job, inp, spec, started):
                            {"type": "audio", "audio": str(reference)}]
                 audio, sr = generate([{"role": "user", "content": content}],
                                      gen_seconds=seconds, nfe=32, cfg_strength=2.0, seed=seed)
+                memory = gpu_memory(f'take {n + 1}') or memory
                 take = work / f"take{n}.wav"
                 save_audio(audio, sr, str(take))
                 native = work / f"take{n}-native.wav"
@@ -196,14 +257,30 @@ def words_edit(job, inp, spec, started):
                 # the take is copied to each channel here at full level.
                 ffmpeg("-i", take, "-ar", rate, "-ac", 1, "-c:a", "pcm_s24le", native)
                 generated, _ = sf.read(native, always_2d=True)
-                generated = np.repeat(generated[:, :1], channels, axis=1)
-                master = np.clip(splice(original, generated, crop_start, crop_end, fade), -1.0, 1.0)
+                # Match the take to the original's level in the padding, so
+                # there is no level step at the joins.
+                gain = level_gain(original, generated[:, 0], crop_start, crop_end, head_pad, tail_pad,
+                                  int(LEVEL_WINDOW_S * rate))
+                generated = np.repeat(generated[:, :1] * gain, channels, axis=1)
+                # Keep the original until 0.15 s from the range on each side;
+                # the take replaces only the range and those margins.
+                head, tail = splice_points(rate, bounds, crop_start, crop_end, generated.shape[0], fade)
+                kept = generated[head:generated.shape[0] - tail]
+                master = np.clip(splice(original, kept, crop_start + head, crop_end - tail, fade), -1.0, 1.0)
                 wav, mp3 = work / f"master{n}.wav", work / f"master{n}.mp3"
                 sf.write(wav, master, rate, subtype='PCM_24')
                 ffmpeg("-i", wav, "-c:a", "libmp3lame", "-b:a", "192k", mp3)
-                candidate = {"seed": seed, **store.put(wav, mp3),
+                # The edited stretch with its padding, as it sits in the master,
+                # so the bridge can check that the old words are gone.
+                clip_wav, clip = work / f"clip{n}.wav", work / f"clip{n}.mp3"
+                sf.write(clip_wav, master[crop_start:crop_start + generated.shape[0]], rate, subtype='PCM_24')
+                ffmpeg("-i", clip_wav, "-c:a", "libmp3lame", "-b:a", "192k", clip)
+                candidate = {"seed": seed, **store.put(wav, mp3, clip),
                              "duration_s": round(master.shape[0] / rate, 2),
-                             "edited_seconds": round(generated.shape[0] / rate, 2)}
+                             "edited_seconds": round(generated.shape[0] / rate, 2),
+                             "clip_start": round(crop_start / rate, 3),
+                             "clip_seconds": round(generated.shape[0] / rate, 3),
+                             "level_db": round(20 * math.log10(gain), 2)}
                 if spec['rank']:
                     try:
                         candidate['transcript'] = transcribe(take, spec['kind'])
@@ -212,10 +289,10 @@ def words_edit(job, inp, spec, started):
                         log.warning('AuK ranking skipped (%s)', type(error).__name__)
                         candidate['rank_error'] = 'transcription_failed'
                 candidates.append(candidate)
-            except ValueError:
-                raise
             except Exception as error:
                 # No automatic re-roll: a failed seed is reported, the others still run.
+                # A ValueError too (upstream checks each take): finished takes
+                # are kept, and its raw text never reaches the user.
                 log.error('AuK take failed (%s)', type(error).__name__)
                 failures.append({"seed": seed, "error": type(error).__name__})
         if not candidates:
@@ -238,6 +315,8 @@ def words_edit(job, inp, spec, started):
             "wav_url": best["wav_url"], "bytes": best["bytes"], "duration_s": best["duration_s"],
             "seed": best["seed"], "processing_ms": int((time.monotonic() - started) * 1000),
             "has_reference_voice": True, "parts": 1, "voice_sample": False,
+            "clip_url": best["clip_url"], "clip_key": best["clip_key"],
+            **({"gpu_memory": memory} if memory else {}),
         }
 
 
@@ -252,6 +331,7 @@ def handler(job):
         import soundfile as sf
         import boto3
         import runpod
+        reset_gpu_peak()
         with tempfile.TemporaryDirectory() as td:
             work = Path(td)
             source = None
@@ -299,12 +379,18 @@ def handler(job):
                     content.append({"type": "audio", "audio": str(reference)})
                 audio, sr = generate([{"role": "user", "content": content}],
                     gen_seconds=piece["seconds"], nfe=32, cfg_strength=2.0, seed=piece["seed"])
+                gpu_memory(f'part {n + 1}')
                 output = work / f"part{n}.wav"
                 save_audio(audio, sr, str(output))
                 if editing:
+                    # Resample to mono, then copy to each channel at full level:
+                    # FFmpeg's own mono-to-stereo upmix drops 3 dB.
+                    mono = work / f'edited{n}-mono.wav'
+                    ffmpeg('-i', output, '-ar', source_info.samplerate, '-ac', 1, '-c:a', 'pcm_s24le', mono)
+                    data, _ = sf.read(mono, always_2d=True)
                     normalized = work / f'edited{n}.wav'
-                    ffmpeg('-i', output, '-ar', source_info.samplerate, '-ac', source_info.channels,
-                           '-c:a', 'pcm_s24le', normalized)
+                    sf.write(normalized, data[:, :1].repeat(source_info.channels, axis=1),
+                             source_info.samplerate, subtype='PCM_24')
                     output = normalized
                 if not piece.get("sample"):
                     paths.append(output)
@@ -361,10 +447,15 @@ def warm():
         engine()
     except Exception as error:
         log.warning('AuK boot load failed (%s); the first job will retry', type(error).__name__)
+        # Free what the failed load left on the card before the first job retries.
+        gc.collect()
+        torch = _cuda()
+        if torch is not None:
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
     import runpod
-    if os.environ.get('AUK_BOOT_LOAD', '1') not in ('0', 'false'):
+    if _flag('AUK_BOOT_LOAD', '1'):
         threading.Thread(target=warm, name='auk-boot-load', daemon=True).start()
     runpod.serverless.start({"handler": handler})

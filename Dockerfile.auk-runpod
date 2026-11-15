@@ -22,6 +22,6 @@ ENV AUK_QWEN_DIR=/runpod-volume/huggingface-cache/hub/models--Qwen--Qwen2.5-Omni
 RUN python3 -m pip install --no-cache-dir "audioread>=3.0.1,<4"
 COPY auk_edit.py auk_contract.py auk_handler.py check_auk_audio.py /app/
 RUN python3 -c "from auk.infer.infer_auk import AukInfer; import auk_handler" && python3 /app/check_auk_audio.py \
-    && python3 -c "import inspect, auk.infer.infer_auk as m; assert 'model.transformer.to(torch.float32)' in inspect.getsource(m), 'Qwen would be upcast to fp32'"
+    && python3 -c "import inspect, auk.infer.infer_auk as m; s = inspect.getsource(m); assert 'model.transformer.to(torch.float32)' in s and 'model.to(torch.float32)' not in s, 'Qwen would be upcast to fp32'"
 ENTRYPOINT []
 CMD ["python3", "-u", "/app/auk_handler.py"]
