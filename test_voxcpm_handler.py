@@ -69,11 +69,13 @@ class FakeModel:
         self.calls = []
 
     def generate(self, text, **kwargs):
-        self.calls.append({"text": text, **kwargs})
+        call = {"text": text, **kwargs}
         for key in ("reference_wav_path", "prompt_wav_path"):
             if key in kwargs:
-                info = sf.info(kwargs[key])
+                info = sf.info(kwargs[key])  # read now: the job's folder is gone afterwards
                 assert info.frames > 0
+                call[key + ":info"] = (info.samplerate, info.channels, info.duration)
+        self.calls.append(call)
         return np.full(int(0.5 * self.tts_model.sample_rate), 0.25 * len(self.calls) / 10, dtype=np.float32)
 
 
@@ -133,9 +135,9 @@ class HandlerTests(unittest.TestCase):
         mp3 = uploads[out["key"]][0]
         self.assertEqual(uploads[out["key"]][1], "audio/mpeg")
         self.assertEqual(sf.info(uploads[out["wav_key"]][0]).samplerate, 48000)
-        probe = worker.subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=sample_rate",
-                                       "-of", "csv=p=0", str(mp3)], capture_output=True, text=True)
-        self.assertEqual(probe.stdout.strip(), "48000")
+        probe = worker.subprocess.run(["ffmpeg", "-hide_banner", "-i", str(mp3)], capture_output=True, text=True)
+        self.assertIn("mp3", probe.stderr)
+        self.assertIn("48000 Hz", probe.stderr)
         self.assertTrue(out["url"].startswith("https://signed.invalid/voxcpm/"))
 
     def test_clone_with_style(self):
@@ -146,9 +148,9 @@ class HandlerTests(unittest.TestCase):
         (call,) = model.calls
         self.assertEqual(call["text"], "(slightly faster, cheerful tone)Hello there. Nice day.")
         self.assertNotIn("prompt_wav_path", call)
-        info = sf.info(call["reference_wav_path"])
-        self.assertEqual((info.samplerate, info.channels), (16000, 1))
-        self.assertLessEqual(info.duration, worker.REF_MAX_S + 0.05)
+        rate, channels, seconds = call["reference_wav_path:info"]
+        self.assertEqual((rate, channels), (16000, 1))
+        self.assertLessEqual(seconds, worker.REF_MAX_S + 0.05)
 
     def test_clone_ultimate_uses_clip_twice(self):
         out, model, _, _ = self.run_job({"mode": "clone", "text": "Hello.", "reference_voice_url": "https://h/a.mp3",
