@@ -25,6 +25,11 @@ DENSE_CHUNK_CHARS = 150
 DENSE_LANGUAGES = ("zh", "ja", "ko")
 SEED_MAX = 2**31 - 1
 
+
+class JobError(ValueError):
+    """A plain-words problem with the job; its message goes back to the caller as is."""
+
+
 # Chatterbox-Turbo's added tokenizer tokens (ResembleAI/chatterbox-turbo
 # added_tokens.json). The first nine are the event tags upstream's Turbo demo
 # offers; the other ten are style tokens the tokenizer also carries but
@@ -62,6 +67,11 @@ TEMPERATURE = {"turbo": (0.05, 2.0), "original": (0.05, 5.0), "multilingual": (0
 DEFAULT_TEMPERATURE = 0.8
 EXAGGERATION = (0.25, 2.0, 0.5)
 CFG_WEIGHT = (0.0, 1.0, 0.5)
+# Upstream's original-model generate() doubles the text for CFG only when
+# cfg_weight > 0, but T3.inference always builds a CFG batch of two, so
+# cfg_weight 0 crashes there. 0 (upstream's cross-language tip) is for
+# multilingual, whose generate() always doubles the text.
+CFG_WEIGHT_ZERO_MODELS = ("multilingual",)
 
 # Sentence ends: Latin marks need a space or the end after them; CJK marks do not.
 _SENTENCE_END = re.compile(r"[.!?…]+[\"'”’)\]]*(?=\s|$)|[。！？]+[”’）」』]*")
@@ -73,15 +83,15 @@ def _number(inp, name, kind, low, high, default):
     if value is None:
         return default
     if isinstance(value, bool):
-        raise ValueError(f"{name} must be a number.")
+        raise JobError(f"{name} must be a number.")
     try:
         number = kind(value)
     except (TypeError, ValueError):
-        raise ValueError(f"{name} must be a number.") from None
+        raise JobError(f"{name} must be a number.") from None
     if kind is int and number != value and not (isinstance(value, float) and value.is_integer()):
-        raise ValueError(f"{name} must be a whole number.")
+        raise JobError(f"{name} must be a whole number.")
     if not low <= number <= high:
-        raise ValueError(f"{name} must be between {low} and {high}.")
+        raise JobError(f"{name} must be between {low} and {high}.")
     return number
 
 
@@ -103,10 +113,10 @@ def sound_tags(text, model):
         tag = _TAGS_BY_NAME.get(name) or TAG_ALIASES.get(name)
         if model != "turbo":
             if tag is not None:
-                raise ValueError(f"Sound tags such as {tag} work only with model turbo.")
+                raise JobError(f"Sound tags such as {tag} work only with model turbo.")
             return match.group(0)
         if tag is None:
-            raise ValueError(f"Unknown sound tag [{match.group(1)}]. Turbo knows: {' '.join(SOUND_TAGS)}.")
+            raise JobError(f"Unknown sound tag [{match.group(1)}]. Turbo knows: {' '.join(SOUND_TAGS)}.")
         used.append(tag)
         return tag
 
@@ -196,50 +206,50 @@ def _words(inp, *names):
 def parse(inp):
     """Check a job's input and return the plan the handler runs."""
     if not isinstance(inp, dict):
-        raise ValueError("input must be an object.")
+        raise JobError("input must be an object.")
     model = inp.get("model", DEFAULT_MODEL)
     if isinstance(model, str):
         model = model.strip().lower()
     if model not in MODELS:
-        raise ValueError('model must be "turbo", "original" or "multilingual".')
+        raise JobError('model must be "turbo", "original" or "multilingual".')
 
     reference = inp.get("reference_url", inp.get("reference_voice_url"))
     if reference is not None and not isinstance(reference, str):
-        raise ValueError("reference_url must be a link.")
+        raise JobError("reference_url must be a link.")
     reference = (reference or "").strip() or None
     mode = inp.get("mode")
     if mode is None:
         mode = "clone" if reference else "design"
     if mode not in MODES:
-        raise ValueError('mode must be "design" or "clone".')
+        raise JobError('mode must be "design" or "clone".')
     if mode == "clone" and not reference:
-        raise ValueError("clone mode needs reference_url (a clip of the voice).")
+        raise JobError("clone mode needs reference_url (a clip of the voice).")
     if mode == "design" and reference:
-        raise ValueError("design mode uses the built-in voice and takes no clip. Use clone mode for a clip.")
+        raise JobError("design mode uses the built-in voice and takes no clip. Use clone mode for a clip.")
     described = _words(inp, "description", "voice_description", "style")
     if described:
-        raise ValueError(f"Chatterbox cannot make a voice from words, so {described} is not used. "
+        raise JobError(f"Chatterbox cannot make a voice from words, so {described} is not used. "
                          "Leave it out for the built-in voice, or send a clip in clone mode.")
 
     text = inp.get("text")
     if not isinstance(text, str) or not text.strip():
-        raise ValueError("text is required.")
+        raise JobError("text is required.")
     if len(text) > MAX_TEXT_CHARS:
-        raise ValueError(f"text is too long (at most {MAX_TEXT_CHARS} characters).")
+        raise JobError(f"text is too long (at most {MAX_TEXT_CHARS} characters).")
     text, tags = sound_tags(re.sub(r"\s+", " ", text).strip(), model)
     if model == "turbo" and not re.sub(_TAG_RE, "", text).strip(" .,!?"):
-        raise ValueError("text has no words to speak.")
+        raise JobError("text has no words to speak.")
 
     language = inp.get("language_id", inp.get("language"))
     if language is not None:
         if not isinstance(language, str) or language.strip().lower() not in LANGUAGES:
-            raise ValueError(f"language_id must be one of: {', '.join(LANGUAGES)}.")
+            raise JobError(f"language_id must be one of: {', '.join(LANGUAGES)}.")
         language = language.strip().lower()
     if model == "multilingual":
         if language is None:
-            raise ValueError(f"model multilingual needs language_id, one of: {', '.join(LANGUAGES)}.")
+            raise JobError(f"model multilingual needs language_id, one of: {', '.join(LANGUAGES)}.")
     elif language not in (None, "en"):
-        raise ValueError(f"model {model} speaks English only. Use model multilingual for "
+        raise JobError(f"model {model} speaks English only. Use model multilingual for "
                          f"{LANGUAGES[language]}.")
 
     low, high = TEMPERATURE[model]
@@ -264,6 +274,9 @@ def parse(inp):
     else:
         spec["exaggeration"] = _number(inp, "exaggeration", float, *EXAGGERATION)
         spec["cfg_weight"] = _number(inp, "cfg_weight", float, *CFG_WEIGHT)
+        if spec["cfg_weight"] <= 0 and model not in CFG_WEIGHT_ZERO_MODELS:
+            raise JobError(f"cfg_weight must be above 0 for model {model} (up to 1). "
+                           "cfg_weight 0 works only with model multilingual.")
     if inp.get("prompt_text") is not None:
         spec["ignored"].append("prompt_text")  # Chatterbox needs no transcript of the clip.
     if reference:

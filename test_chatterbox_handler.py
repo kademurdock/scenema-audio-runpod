@@ -18,6 +18,14 @@ import soundfile as sf
 import chatterbox_contract as contract
 import chatterbox_handler as worker
 
+# Import torch (when installed) before any test patches sys.modules: a first
+# import inside patch.dict would be dropped on exit, and torch cannot be
+# imported twice in one process.
+try:
+    import torch  # noqa: F401
+except Exception:
+    pass
+
 
 class ContractTests(unittest.TestCase):
     def test_split_keeps_order_and_limit(self):
@@ -58,10 +66,20 @@ class ContractTests(unittest.TestCase):
         self.assertEqual((spec["mode"], spec["reference_url"]), ("clone", "https://h/a.mp3"))
         self.assertEqual((spec["exaggeration"], spec["cfg_weight"]), (0.5, 0.5))
         spec = contract.parse({"model": "original", "mode": "clone", "text": "Hi.",
-                               "reference_voice_url": "https://h/a.mp3", "exaggeration": 0.9, "cfg_weight": 0,
+                               "reference_voice_url": "https://h/a.mp3", "exaggeration": 0.9, "cfg_weight": 0.05,
                                "temperature": 1.1, "seed": 7})
         self.assertEqual((spec["exaggeration"], spec["cfg_weight"], spec["temperature"], spec["seed"]),
-                         (0.9, 0.0, 1.1, 7))
+                         (0.9, 0.05, 1.1, 7))
+
+    def test_cfg_weight_zero_only_on_multilingual(self):
+        # Upstream's original model crashes on cfg_weight 0 (CFG batch mismatch in T3.inference).
+        for zero in (0, 0.0):
+            with self.assertRaisesRegex(contract.JobError, "above 0 for model original"):
+                contract.parse({"model": "original", "text": "Hi.", "cfg_weight": zero})
+        spec = contract.parse({"model": "multilingual", "language_id": "fr", "text": "Salut.", "cfg_weight": 0})
+        self.assertEqual(spec["cfg_weight"], 0.0)
+        self.assertEqual(contract.parse({"model": "original", "text": "Hi.", "cfg_weight": 0.01})["cfg_weight"], 0.01)
+        self.assertIsNone(contract.parse({"text": "Hi.", "cfg_weight": 0})["cfg_weight"])  # turbo ignores it
 
     def test_mode_and_reference_must_agree(self):
         with self.assertRaises(ValueError):
@@ -258,6 +276,21 @@ class HandlerTests(unittest.TestCase):
     def test_bad_input_is_an_error_not_a_crash(self):
         out, _, _ = self.run_job({"model": "multilingual", "text": "Hi."})
         self.assertIn("language_id", out["error"])
+
+    def test_library_value_errors_do_not_leak_urls(self):
+        secret = "https://b.example.invalid/clip.mp3?X-Amz-Signature=abc123"
+
+        def bad_download(url, dest):
+            raise ValueError(f"Invalid URL {secret}: No host supplied")  # like requests.exceptions.InvalidURL
+
+        with patch.object(worker, "parse", lambda inp: {**contract.parse(inp), "reference_url": secret}):
+            with patch.dict(sys.modules, {"runpod": types.SimpleNamespace()}):
+                with patch.object(worker, "download", bad_download):
+                    out = worker.handler({"id": "j", "input": {"text": "Hi.", "reference_url": "https://h/a.mp3"}})
+        self.assertEqual(out, {"error": "Chatterbox could not finish (ValueError). No audio was generated."})
+        out, _, _ = self.run_job({"model": "original", "text": "Hi.", "cfg_weight": 0})
+        self.assertIn("above 0", out["error"])
+        self.assertEqual(self.models["original"].calls, [])
 
     def test_download_refuses_other_hosts(self):
         with patch.dict("os.environ", {"AWS_ENDPOINT_URL": "https://s3.us-east-005.backblazeb2.com",

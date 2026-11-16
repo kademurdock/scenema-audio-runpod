@@ -25,7 +25,7 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-from chatterbox_contract import parse
+from chatterbox_contract import JobError, parse
 
 log = logging.getLogger("chatterbox-worker")
 logging.basicConfig(level=logging.INFO)
@@ -82,14 +82,14 @@ def model_dir(variant):
     if all((path / name).is_file() for name in info["files"]):
         return path
     if not _env_flag("CHATTERBOX_HF_FALLBACK", "1"):
-        raise ValueError(f"The Chatterbox {variant} model cache is not ready. No audio was generated.")
+        raise JobError(f"The Chatterbox {variant} model cache is not ready. No audio was generated.")
     log.warning("Chatterbox %s: cached snapshot missing; downloading %s@%s", variant, info["repo"], info["sha"][:8])
     from huggingface_hub import snapshot_download
     path = Path(snapshot_download(repo_id=info["repo"], revision=info["sha"], allow_patterns=list(info["files"]),
                                   token=os.environ.get("HF_TOKEN") or None))
     missing = [name for name in info["files"] if not (path / name).is_file()]
     if missing:
-        raise ValueError(f"The Chatterbox {variant} model files are incomplete. No audio was generated.")
+        raise JobError(f"The Chatterbox {variant} model files are incomplete. No audio was generated.")
     return path
 
 
@@ -217,20 +217,20 @@ def download(url, dest):
     parsed = urllib.parse.urlsplit(url)
     host = (parsed.hostname or "").lower()
     if parsed.scheme != "https" or host not in allowed_hosts() or parsed.username or parsed.port not in (None, 443):
-        raise ValueError("The reference clip must be stored with the platform first.")
+        raise JobError("The reference clip must be stored with the platform first.")
     for address in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM):
         if not ipaddress.ip_address(address[4][0]).is_global:
-            raise ValueError("The reference clip host is not public.")
+            raise JobError("The reference clip host is not public.")
     import requests
     with requests.get(url, stream=True, timeout=(15, 90), allow_redirects=False) as r:
         if r.status_code != 200:
-            raise ValueError("The reference clip could not be fetched.")
+            raise JobError("The reference clip could not be fetched.")
         size = 0
         with open(dest, "wb") as f:
             for data in r.iter_content(1024 * 1024):
                 size += len(data)
                 if size > 64 * 1024 * 1024:
-                    raise ValueError("The reference clip is too large.")
+                    raise JobError("The reference clip is too large.")
                 f.write(data)
 
 
@@ -247,17 +247,17 @@ def prepare_reference(source, work, variant, rate=24000):
     try:
         ffmpeg("-i", source, "-vn", "-ac", 1, "-ar", rate, "-t", REF_MAX_S, "-c:a", "pcm_s16le", reference)
     except subprocess.CalledProcessError:
-        raise ValueError("The reference clip is not readable audio.") from None
+        raise JobError("The reference clip is not readable audio.") from None
     info = sf.info(reference)
     if info.frames == 0:
-        raise ValueError("The reference clip has no audio.")
+        raise JobError("The reference clip has no audio.")
     shortest = TURBO_REF_MIN_S if variant == "turbo" else REF_MIN_S
     if info.duration <= shortest:
-        raise ValueError(f"The reference clip must be longer than {shortest:.0f} seconds for model {variant} "
+        raise JobError(f"The reference clip must be longer than {shortest:.0f} seconds for model {variant} "
                          "(5 to 10 seconds of clear speech is best).")
     data, _ = sf.read(reference)
     if data.size == 0 or not np.isfinite(data).all() or float(np.abs(data).max()) < 1e-4:
-        raise ValueError("The reference clip is silent or damaged.")
+        raise JobError("The reference clip is silent or damaged.")
     return reference
 
 
@@ -330,6 +330,10 @@ class Store:
                 "wav_key": key + ".wav", "wav_url": self.sign(key + ".wav"), "bytes": mp3.stat().st_size}
 
 
+def scrub(text):
+    return re.sub(r"https?://\S+", "<url>", text)
+
+
 def handler(job):
     started = time.monotonic()
     try:
@@ -369,9 +373,10 @@ def handler(job):
             log.error("Chatterbox missing dependency: %s", missing)
             return {"error": "The Chatterbox worker is missing a required component. No audio was generated.",
                     "error_code": "missing_dependency", "missing_module": missing}
-        log.error("Chatterbox failed (%s: %s)", type(error).__name__,
-                  re.sub(r"https?://\S+", "<url>", str(error))[:300])
-        return {"error": str(error) if isinstance(error, ValueError) else
+        log.error("Chatterbox failed (%s: %s)", type(error).__name__, scrub(str(error))[:300])
+        # Only the worker's own plain-words errors go back as written. Library
+        # errors (requests' InvalidURL is a ValueError too) may quote a URL or a path.
+        return {"error": scrub(str(error)) if isinstance(error, JobError) else
                 f"Chatterbox could not finish ({type(error).__name__}). No audio was generated."}
 
 
