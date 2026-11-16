@@ -10,3 +10,11 @@ Gemma 3 12B under Google's Gemma terms, pulled from the ungated `unsloth/gemma-3
 - Built by GitHub Actions to `ghcr.io/kademurdock/scenema-audio-runpod:latest`.
 
 Plan and design: `SCENEMA_SERVERLESS_PLAN_2026-09-03.md` in the Kade-AI project folder (Part 119).
+
+## Chatterbox worker
+
+`chatterbox_handler.py` / `Dockerfile.chatterbox` serve Resemble AI Chatterbox (MIT; code pinned at
+`ab55923c`) as image `ghcr.io/kademurdock/scenema-audio-runpod:chatterbox-<sha>`: `model` picks
+`turbo` (ResembleAI/chatterbox-turbo@749d1c1a), `original` or `multilingual` (V3; both
+ResembleAI/chatterbox@5bb1f6ee). Models load on first use and stay resident (all three fit a 24 GB card).
+`mode` is `design` (built-in voice) or `clone` (`reference_url`). Every take carries upstream's Perth watermark.
