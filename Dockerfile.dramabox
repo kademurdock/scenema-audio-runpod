@@ -1,0 +1,47 @@
+# DramaBox (Resemble AI, retired research archive) serverless worker.
+# Code: github.com/resemble-ai/DramaBox pinned below; code and weights under the
+# LTX-2 Community License (copy shipped at /app/upstream/LICENSE). Gemma 3 12B
+# comes pre-quantized (bnb 4-bit) from unsloth's ungated mirror, as upstream runs it.
+# Weights come from the RunPod model cache (endpoint modelReferences), each pinned
+# to one revision; the handler downloads the same revisions only if the cache is missing.
+FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 HF_HUB_DISABLE_TELEMETRY=1
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip git ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
+RUN python3 -m pip install --no-cache-dir --upgrade pip==25.3 setuptools==80.9.0 wheel==0.45.1
+# Upstream's own torch pin (requirements.txt: torch==2.8.0, torchaudio==2.8.0).
+RUN python3 -m pip install --no-cache-dir "torch==2.8.0" "torchaudio==2.8.0" --index-url https://download.pytorch.org/whl/cu128
+WORKDIR /app
+RUN git clone https://github.com/resemble-ai/DramaBox /app/upstream && cd /app/upstream \
+    && git checkout b6120855f60c22c4a795a3e6e1f3abc4f13c0d55 && rm -rf .git
+# Upstream's requirements.txt, inference subset, at exact versions (gradio,
+# spaces and peft are for the demo app and training only). No xformers:
+# upstream removed it and falls back to torch SDPA. No RE-USE denoiser:
+# its weights are NVIDIA non-commercial and it needs mamba-ssm builds.
+RUN python3 -m pip install --no-cache-dir "torch==2.8.0" "torchaudio==2.8.0" \
+        "numpy==2.2.6" "scipy==1.15.3" "einops==0.8.1" "av==14.2.0" "safetensors==0.7.0" \
+        "accelerate==1.13.0" "transformers==4.57.6" "huggingface-hub==0.36.2" "bitsandbytes==0.49.2" \
+        "sentencepiece==0.2.1" "pyyaml==6.0.3" "pillow==11.3.0" "tqdm==4.67.1" \
+        "soundfile==0.13.1" "librosa==0.11.0" "numba==0.61.2" "llvmlite==0.44.0" "pydub==0.25.1" \
+        "resemble-perth @ git+https://github.com/resemble-ai/Perth.git@ff1c8ac55a976971245cdd53c18d6131ca00d993" \
+        "runpod==1.7.13" "boto3==1.40.76" "requests==2.32.5" \
+        --extra-index-url https://download.pytorch.org/whl/cu128 \
+    && python3 -c "import torch; assert torch.__version__.split('+')[0] == '2.8.0', torch.__version__" \
+    && python3 -m pip freeze | grep -iE "^(torch|torchaudio|triton|transformers|bitsandbytes|accelerate|av|numpy|resemble.perth|librosa|runpod)( @|==)" \
+    && rm -rf /root/.cache
+COPY dramabox_contract.py dramabox_handler.py /app/
+# Build-time checks: the TTSServer and generate() keywords the handler passes
+# exist in the pinned upstream, and Perth's bundled weights load and mark audio.
+RUN cd /app && python3 -c "import sys, inspect; sys.path[:0] = ['/app/upstream/src', '/app/upstream/ltx2']; \
+from inference_server import TTSServer, estimate_duration; import dramabox_handler; \
+p = inspect.signature(TTSServer.__init__).parameters; need = {'checkpoint','full_checkpoint','gemma_root','device','dtype','compile_model','bnb_4bit'}; assert need <= set(p), need - set(p); \
+p = inspect.signature(TTSServer.generate).parameters; need = {'prompt','voice_ref','cfg_scale','stg_scale','duration_multiplier','seed','ref_duration','rescale_scale','gen_duration','denoise_ref'}; assert need <= set(p), need - set(p); \
+p = inspect.signature(TTSServer.generate_long).parameters; need = {'prompt','max_chunk_duration','target_chunk_duration','crossfade_ms','progress_callback'}; assert need <= set(p), need - set(p); \
+print('estimate', estimate_duration('A man says, \"Hello there, how are you doing today?\" He laughs.', 1.1)); \
+import numpy as np; a = (0.1 * np.random.default_rng(0).standard_normal((2, 48000))).astype(np.float32); \
+m = dramabox_handler.watermark(a, 48000); assert m.shape[0] == 2 and abs(m.shape[1] - 48000) < 10, m.shape; print('perth ok', m.shape)"
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ENV DRAMABOX_CODE_DIR=/app/upstream
+ENV DRAMABOX_MODEL_DIR=/runpod-volume/huggingface-cache/hub/models--ResembleAI--Dramabox/snapshots/404f967f653fa1170dc15a9d1ddd3fdb9a0a842d
+ENV DRAMABOX_GEMMA_DIR=/runpod-volume/huggingface-cache/hub/models--unsloth--gemma-3-12b-it-bnb-4bit/snapshots/826e729dbaeea4ecb143738eed2bcf3539ebf7bf
+ENTRYPOINT []
+CMD ["python3", "-u", "/app/dramabox_handler.py"]
