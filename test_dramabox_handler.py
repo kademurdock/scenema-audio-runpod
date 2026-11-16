@@ -1,4 +1,5 @@
 """Contract and handler checks with real FFmpeg/PCM; only the model, Perth and B2 are fakes."""
+import os
 import shutil
 import sys
 import tempfile
@@ -14,6 +15,18 @@ import dramabox_contract as contract
 import dramabox_handler as worker
 
 SCENE = 'A tired old sailor speaks slowly, "The sea gave me everything." He sighs deeply. "And took it back."'
+# One speaker, one long quoted speech: upstream's chunker alone keeps it as one ~175 s take.
+MONOLOGUE = 'An old sailor speaks slowly, "' + "The wind was cold and the night was long and dark. " * 40 + '" He sighs.'
+
+
+def upstream_src():
+    """The pinned upstream's src folder (CI clones it), or None to skip."""
+    src = Path(os.environ.get("DRAMABOX_CODE_DIR", "/nonexistent")) / "src"
+    if (src / "text_chunker.py").is_file():
+        return src
+    if os.environ.get("DRAMABOX_UPSTREAM_TESTS") == "1":
+        raise RuntimeError("DRAMABOX_UPSTREAM_TESTS=1 but the pinned upstream is not at DRAMABOX_CODE_DIR")
+    return None
 
 
 class ContractTests(unittest.TestCase):
@@ -48,6 +61,11 @@ class ContractTests(unittest.TestCase):
                 contract.parse({"prompt": bad})
         self.assertEqual(contract.parse({"text": SCENE})["prompt"], SCENE)
 
+    def test_long_speech_splits_between_sentences(self):
+        self.assertEqual(contract.split_spoken_sentences('A man says, "Hi there. How are you? Fine!" He waves. "Bye."'),
+                         'A man says, "Hi there." "How are you?" "Fine!" He waves. "Bye."')
+        self.assertEqual(contract.split_spoken_sentences(SCENE), SCENE)
+
     def test_bad_knobs(self):
         for bad in ({"seed": -1}, {"seed": 1.5}, {"seed": True}, {"cfg_scale": 0.5}, {"cfg_scale": 11},
                     {"stg_scale": -1}, {"rescale_scale": 2}, {"rescale_scale": "high"},
@@ -57,17 +75,26 @@ class ContractTests(unittest.TestCase):
                 contract.parse({"prompt": SCENE, **bad})
         spec = contract.parse({"prompt": SCENE, "rescale_scale": 0, "duration": 12, "watermark": False})
         self.assertEqual((spec["rescale_scale"], spec["duration"], spec["watermark"]), (0.0, 12.0, False))
+        nulls = contract.parse({"prompt": SCENE, "rescale_scale": None, "cfg_scale": None, "duration": None})
+        self.assertEqual((nulls["rescale_scale"], nulls["cfg_scale"], nulls["duration"]), ("auto", 2.5, 0.0))
+        with self.assertRaises(contract.PlainError):
+            contract.parse({"prompt": SCENE, "seed": "x"})
 
 
 class FakeModel:
     rate = 48000
 
-    def __init__(self, estimate=8.0):
+    def __init__(self, estimate=8.0, chunk_seconds=(37.0, 37.0, 26.0), fail=None):
         self.calls = []
         self.fixed_estimate = estimate
+        self.chunk_seconds = chunk_seconds
+        self.fail = fail
 
     def estimate(self, prompt, multiplier):
         return self.fixed_estimate
+
+    def chunks(self, prompt, multiplier):
+        return [(prompt, seconds) for seconds in self.chunk_seconds]
 
     def _record(self, kind, prompt, kwargs):
         call = {"kind": kind, "prompt": prompt, **kwargs}
@@ -78,6 +105,8 @@ class FakeModel:
 
     def generate(self, prompt, **kwargs):
         self._record("generate", prompt, kwargs)
+        if self.fail:
+            raise self.fail
         return np.full((1, 2, int(1.5 * self.rate)), 0.2, dtype=np.float32), self.rate
 
     def generate_long(self, prompt, **kwargs):
@@ -89,9 +118,10 @@ class FakeModel:
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is required")
 class HandlerTests(unittest.TestCase):
-    def run_job(self, inp, clip_seconds=12.0, estimate=8.0):
+    def run_job(self, inp, clip_seconds=12.0, estimate=8.0, model=None, engine=None, tone_seconds=None,
+                amplitude=0.3):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        model = FakeModel(estimate)
+        model = model or FakeModel(estimate)
         uploads, marks, progress = {}, [], []
 
         class Storage:
@@ -105,7 +135,10 @@ class HandlerTests(unittest.TestCase):
 
         clip = root / "clip.mp3"
         t = np.arange(int(44100 * clip_seconds)) / 44100
-        sf.write(root / "clip.wav", 0.3 * np.sin(2 * np.pi * 220 * t), 44100)
+        tone = amplitude * np.sin(2 * np.pi * 220 * t)
+        if tone_seconds is not None:
+            tone[int(44100 * tone_seconds):] = 0.0
+        sf.write(root / "clip.wav", tone, 44100)
         worker.ffmpeg("-i", root / "clip.wav", "-c:a", "libmp3lame", clip)
 
         def fake_download(url, dest):
@@ -120,7 +153,7 @@ class HandlerTests(unittest.TestCase):
                        progress_update=lambda job, message: progress.append(message)))}
         env = {"AWS_ENDPOINT_URL": "https://s3.example.invalid", "AWS_BUCKET_NAME": "b"}
         with patch.dict(sys.modules, modules), patch.dict("os.environ", env), \
-                patch.object(worker, "ENGINE", model), patch.object(worker, "download", fake_download), \
+                patch.object(worker, "ENGINE", engine or model), patch.object(worker, "download", fake_download), \
                 patch.object(worker, "watermark", fake_watermark):
             out = worker.handler({"id": "j", "input": inp})
         return out, model, uploads, marks, progress
@@ -186,6 +219,64 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(out["parts"], 3)
         self.assertEqual(progress[-1], "DramaBox: part 3 of 3")
         self.assertEqual(marks, [((2, 96000), 48000)])
+
+    def test_long_speech_reaches_upstream_split_by_sentence(self):
+        prompt = 'A man says, "One. Two. Three."'
+        out, model, _, _, _ = self.run_job({"prompt": prompt}, estimate=100.0)
+        self.assertNotIn("error", out, out)
+        self.assertEqual(model.calls[0]["prompt"], 'A man says, "One." "Two." "Three."')
+
+    def test_a_part_over_one_take_is_refused(self):
+        model = FakeModel(100.0, chunk_seconds=(37.0, 60.0))
+        out, _, _, _, _ = self.run_job({"prompt": SCENE, "reference_url": "https://h/a.mp3"}, model=model)
+        self.assertIn("too long to say in one take", out["error"])
+        self.assertEqual(model.calls, [])
+
+    def test_mostly_silent_clip_is_refused(self):
+        out, model, _, _, _ = self.run_job({"prompt": SCENE, "reference_url": "https://h/a.mp3"}, tone_seconds=0.5)
+        self.assertIn("mostly silent", out["error"])
+        self.assertEqual(model.calls, [])
+        out, model, _, _, _ = self.run_job({"prompt": SCENE, "reference_url": "https://h/a.mp3"}, amplitude=0.001)
+        self.assertIn("mostly silent", out["error"])
+        out, model, _, _, _ = self.run_job({"prompt": SCENE, "reference_url": "https://h/a.mp3"}, tone_seconds=4)
+        self.assertNotIn("error", out, out)
+
+    def test_internal_errors_stay_generic(self):
+        model = FakeModel(fail=ValueError("/app/upstream/src/x.py: bad tensor shape"))
+        out, _, _, _, _ = self.run_job({"prompt": SCENE}, model=model)
+        self.assertEqual(out["error"], "DramaBox could not finish (ValueError). No audio was generated.")
+
+    def test_upstream_chunker_keeps_every_part_under_one_take(self):
+        src = upstream_src()
+        if src is None:
+            self.skipTest("set DRAMABOX_CODE_DIR to the pinned upstream to run this")
+        sys.path.insert(0, str(src))
+        try:
+            from duration_estimator import estimate_speech_duration
+            from text_chunker import chunk_prompt_for_duration
+        finally:
+            sys.path.remove(str(src))
+
+        def estimate(prompt, multiplier):  # inference_server.estimate_duration, without torch
+            return max(3.0, round(estimate_speech_duration(prompt) * multiplier, 1))
+
+        server = FakeModel()
+        real = worker.DramaBox(server, estimate, chunk_prompt_for_duration)
+        # Upstream alone: one part far over a take, which is the bug this guards.
+        self.assertGreater(max(sec for _, sec in real.chunks(MONOLOGUE, 1.1)), 120)
+        out, _, _, _, _ = self.run_job({"prompt": MONOLOGUE, "seed": 3}, model=server, engine=real)
+        self.assertNotIn("error", out, out)
+        (call,) = server.calls
+        self.assertEqual(call["kind"], "generate_long")
+        parts = real.chunks(call["prompt"], 1.1)
+        self.assertGreater(len(parts), 3)
+        self.assertLessEqual(max(sec for _, sec in parts), worker.MAX_SINGLE_TAKE_S)
+        # One run-on sentence cannot be split: refused before any GPU work.
+        server.calls.clear()
+        run_on = 'A man says, "' + "and the wind was cold " * 120 + '"'
+        out, _, _, _, _ = self.run_job({"prompt": run_on}, model=server, engine=real)
+        self.assertIn("too long to say in one take", out["error"])
+        self.assertEqual(server.calls, [])
 
     def test_too_long_scene_is_refused(self):
         out, model, _, _, _ = self.run_job({"prompt": SCENE}, estimate=400.0)

@@ -17,6 +17,11 @@ SEED_MAX = 2**31 - 1
 
 _CURLY = str.maketrans({"“": '"', "”": '"', "„": '"', "‟": '"', "«": '"', "»": '"'})
 _QUOTED = re.compile(r'"([^"]+)"')
+_INNER_END = re.compile(r'([.!?]+)\s+(?=\S)')
+
+
+class PlainError(ValueError):
+    """A plain-words problem with the job, safe to show the caller word for word."""
 
 
 def _number(inp, name, kind, low, high, default):
@@ -24,22 +29,22 @@ def _number(inp, name, kind, low, high, default):
     if value is None:
         return default
     if isinstance(value, bool):
-        raise ValueError(f"{name} must be a number.")
+        raise PlainError(f"{name} must be a number.")
     try:
         number = kind(value)
     except (TypeError, ValueError):
-        raise ValueError(f"{name} must be a number.") from None
+        raise PlainError(f"{name} must be a number.") from None
     if kind is int and number != value and not (isinstance(value, float) and value.is_integer()):
-        raise ValueError(f"{name} must be a whole number.")
+        raise PlainError(f"{name} must be a whole number.")
     if not low <= number <= high:
-        raise ValueError(f"{name} must be between {low} and {high}.")
+        raise PlainError(f"{name} must be between {low} and {high}.")
     return number
 
 
 def _flag(inp, name, default):
     value = inp.get(name, default)
     if not isinstance(value, bool):
-        raise ValueError(f"{name} must be true or false.")
+        raise PlainError(f"{name} must be true or false.")
     return value
 
 
@@ -50,41 +55,49 @@ def clean_prompt(prompt):
     model speak the stage directions too.
     """
     if not isinstance(prompt, str) or not prompt.strip():
-        raise ValueError("prompt is required.")
+        raise PlainError("prompt is required.")
     if len(prompt) > MAX_PROMPT_CHARS:
-        raise ValueError(f"prompt is too long (at most {MAX_PROMPT_CHARS} characters).")
+        raise PlainError(f"prompt is too long (at most {MAX_PROMPT_CHARS} characters).")
     prompt = re.sub(r"\s+", " ", prompt.translate(_CURLY)).strip()
     if prompt.count('"') % 2:
-        raise ValueError('prompt has an unclosed double quote. Put every spoken line inside "double quotes".')
+        raise PlainError('prompt has an unclosed double quote. Put every spoken line inside "double quotes".')
     if not any(q.strip() for q in _QUOTED.findall(prompt)):
-        raise ValueError('prompt needs at least one spoken line inside "double quotes"; '
+        raise PlainError('prompt needs at least one spoken line inside "double quotes"; '
                          "words outside the quotes are performed, not spoken.")
     return prompt
+
+
+def split_spoken_sentences(prompt):
+    """'"A. B."' becomes '"A." "B."': still spoken, but upstream's quote-aware
+    chunker can now cut a long speech between its sentences."""
+    return _QUOTED.sub(lambda m: '"' + _INNER_END.sub(r'\1" "', m.group(1).strip()) + '"', prompt)
 
 
 def parse(inp):
     """Check a job's input and return the plan the handler runs."""
     if not isinstance(inp, dict):
-        raise ValueError("input must be an object.")
+        raise PlainError("input must be an object.")
     prompt = clean_prompt(inp.get("prompt", inp.get("text")))
     url = inp.get("reference_url", inp.get("reference_voice_url"))
     if url is not None and (not isinstance(url, str) or not url.strip()):
-        raise ValueError("reference_url must be a link to the clip.")
+        raise PlainError("reference_url must be a link to the clip.")
     mode = inp.get("mode")
     if mode is None:
         mode = "clone" if url else "design"
     if mode not in MODES:
-        raise ValueError('mode must be "design" or "clone".')
+        raise PlainError('mode must be "design" or "clone".')
     if mode == "design" and url:
-        raise ValueError("design mode takes no reference clip. Use clone mode for a clip.")
+        raise PlainError("design mode takes no reference clip. Use clone mode for a clip.")
     if mode == "clone" and not url:
-        raise ValueError("clone mode needs reference_url.")
-    rescale = inp.get("rescale_scale", "auto")
-    if rescale != "auto":
+        raise PlainError("clone mode needs reference_url.")
+    rescale = inp.get("rescale_scale")
+    if rescale is None or rescale == "auto":
+        rescale = "auto"
+    else:
         rescale = _number(inp, "rescale_scale", float, 0.0, 1.0, None)
     duration = _number(inp, "duration", float, 0.0, MAX_SINGLE_TAKE_S, 0.0)
     if 0 < duration < 3.0:
-        raise ValueError("duration must be 0 (automatic) or between 3 and 45 seconds.")
+        raise PlainError("duration must be 0 (automatic) or between 3 and 45 seconds.")
     spec = {
         "mode": mode,
         "prompt": prompt,

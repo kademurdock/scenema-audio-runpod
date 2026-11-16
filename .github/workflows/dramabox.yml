@@ -18,8 +18,14 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
           python3 -m pip install "numpy>=1.26,<3" "soundfile>=0.12,<1"
+      - name: Pinned upstream DramaBox (its pure-Python chunker and estimator)
+        run: |
+          git clone -q https://github.com/resemble-ai/DramaBox "$RUNNER_TEMP/upstream"
+          git -C "$RUNNER_TEMP/upstream" checkout -q b6120855f60c22c4a795a3e6e1f3abc4f13c0d55
       - name: Contract and handler tests (no GPU)
-        run: python3 -m unittest -v test_dramabox_handler.py
+        env:
+          DRAMABOX_UPSTREAM_TESTS: "1"
+        run: DRAMABOX_CODE_DIR="$RUNNER_TEMP/upstream" python3 -m unittest -v test_dramabox_handler.py
       - name: Free image build space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
       - uses: docker/setup-buildx-action@v3

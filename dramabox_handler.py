@@ -22,7 +22,7 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-from dramabox_contract import MAX_SINGLE_TAKE_S, parse
+from dramabox_contract import MAX_SINGLE_TAKE_S, PlainError, parse, split_spoken_sentences
 
 log = logging.getLogger("dramabox-worker")
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +38,8 @@ COMPONENTS_FILE = "dramabox-audio-components.safetensors"
 MAX_TOTAL_S = 300.0        # a whole job: at most five minutes of audio
 TARGET_CHUNK_S = 37.0      # upstream defaults for long scenes
 CROSSFADE_MS = 50.0
+ACTIVE_DBFS = -50.0        # a 20 ms frame of the reference clip counts as sound above this
+MIN_ACTIVE_S = 3.0
 ENGINE_NAME = "dramabox"
 
 ENGINE = None
@@ -62,7 +64,7 @@ def model_dirs():
     missing = [d for d, files in need.items() if not all((d / f).is_file() for f in files)]
     if missing:
         if not _env_flag("DRAMABOX_ALLOW_DOWNLOAD", "1"):
-            raise ValueError("The DramaBox model cache is not ready. No audio was generated.")
+            raise PlainError("The DramaBox model cache is not ready. No audio was generated.")
         from huggingface_hub import snapshot_download
         log.warning("DramaBox: model cache missing (%s); downloading the pinned revisions",
                     ", ".join(str(d) for d in missing))
@@ -76,11 +78,18 @@ def model_dirs():
 
 
 class DramaBox:
-    """Upstream's TTSServer plus its own duration estimate."""
+    """Upstream's TTSServer plus its own duration estimate and long-scene chunker."""
 
-    def __init__(self, server, estimate):
+    def __init__(self, server, estimate, chunker):
         self.server = server
         self.estimate = estimate
+        self.chunker = chunker
+
+    def chunks(self, prompt, multiplier):
+        """Upstream's own split for generate_long, as [(text, estimated seconds)]."""
+        return [(c.text, c.est_duration_s) for c in self.chunker(
+            prompt, max_duration_s=MAX_SINGLE_TAKE_S, target_duration_s=TARGET_CHUNK_S,
+            duration_multiplier=multiplier)]
 
     def generate(self, prompt, **kwargs):
         return self.server.generate(prompt, **kwargs)
@@ -97,14 +106,19 @@ def engine():
     return ENGINE
 
 
-def load_engine():
-    global LOAD_SECONDS
-    dramabox, gemma = model_dirs()
+def upstream_on_path():
     upstream = os.environ.get("DRAMABOX_CODE_DIR", "/app/upstream")
     for sub in ("src", "ltx2"):
         if str(Path(upstream) / sub) not in sys.path:
             sys.path.insert(0, str(Path(upstream) / sub))
+
+
+def load_engine():
+    global LOAD_SECONDS
+    dramabox, gemma = model_dirs()
+    upstream_on_path()
     from inference_server import TTSServer, estimate_duration
+    from text_chunker import chunk_prompt_for_duration
     started = time.monotonic()
     # bf16 as upstream's app runs it; torch.compile off by default (slow first
     # call, recompiles per length); DRAMABOX_COMPILE=1 turns it on.
@@ -115,7 +129,7 @@ def load_engine():
     torch = _cuda()
     log.info("DramaBox loaded in %.1f s; %.2f GiB on the GPU", LOAD_SECONDS,
              torch.cuda.memory_allocated() / 1024**3 if torch else 0.0)
-    return DramaBox(server, estimate_duration)
+    return DramaBox(server, estimate_duration, chunk_prompt_for_duration)
 
 
 def _cuda():
@@ -170,20 +184,20 @@ def download(url, dest):
     parsed = urllib.parse.urlsplit(url)
     host = (parsed.hostname or "").lower()
     if parsed.scheme != "https" or host not in allowed_hosts() or parsed.username or parsed.port not in (None, 443):
-        raise ValueError("The reference clip must be stored with the platform first.")
+        raise PlainError("The reference clip must be stored with the platform first.")
     for address in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM):
         if not ipaddress.ip_address(address[4][0]).is_global:
-            raise ValueError("The reference clip host is not public.")
+            raise PlainError("The reference clip host is not public.")
     import requests
     with requests.get(url, stream=True, timeout=(15, 90), allow_redirects=False) as r:
         if r.status_code != 200:
-            raise ValueError("The reference clip could not be fetched.")
+            raise PlainError("The reference clip could not be fetched.")
         size = 0
         with open(dest, "wb") as f:
             for data in r.iter_content(1024 * 1024):
                 size += len(data)
                 if size > 64 * 1024 * 1024:
-                    raise ValueError("The reference clip is too large.")
+                    raise PlainError("The reference clip is too large.")
                 f.write(data)
 
 
@@ -205,16 +219,31 @@ def prepare_reference(source, work, seconds):
     try:
         ffmpeg("-i", source, "-vn", "-t", seconds, "-ac", 2, "-ar", 48000, "-c:a", "pcm_s16le", reference)
     except subprocess.CalledProcessError:
-        raise ValueError("The reference clip is not readable audio.") from None
+        raise PlainError("The reference clip is not readable audio.") from None
     info = sf.info(reference)
     if info.frames == 0:
-        raise ValueError("The reference clip has no audio.")
+        raise PlainError("The reference clip has no audio.")
     if info.duration < 3.0:
-        raise ValueError("The reference clip must be at least 3 seconds long.")
-    data, _ = sf.read(reference)
-    if data.size == 0 or not np.isfinite(data).all() or float(np.abs(data).max()) < 1e-4:
-        raise ValueError("The reference clip is silent or damaged.")
-    return reference, round(min(float(seconds), info.duration), 2)
+        raise PlainError("The reference clip must be at least 3 seconds long.")
+    data, rate = sf.read(reference, always_2d=True)
+    if data.size == 0 or not np.isfinite(data).all():
+        raise PlainError("The reference clip is damaged.")
+    used = min(float(seconds), info.duration)
+    if active_seconds(data, rate) < min(MIN_ACTIVE_S, used / 2):
+        raise PlainError("The reference clip is mostly silent. It needs at least 3 seconds of clear voice (half the clip, if it is shorter than 6 seconds).")
+    return reference, round(used, 2)
+
+
+def active_seconds(data, rate):
+    """Seconds of 20 ms frames whose RMS is above ACTIVE_DBFS (data is (samples, channels))."""
+    import numpy as np
+    frame = max(1, int(rate * 0.02))
+    mono = data.mean(axis=1)
+    count = len(mono) // frame
+    if count == 0:
+        return 0.0
+    rms = np.sqrt(np.mean(np.square(mono[:count * frame].reshape(count, frame)), axis=1))
+    return float(np.count_nonzero(rms > 10 ** (ACTIVE_DBFS / 20))) * frame / rate
 
 
 def watermark(audio, rate):
@@ -247,27 +276,38 @@ def synthesize(spec, work, progress=lambda message: None):
     """Returns (audio as (channels, samples), sample_rate, parts, target_seconds, reference_seconds)."""
     import numpy as np
     model = engine()
+    prompt = spec["prompt"]
+    estimate = spec["duration"] or model.estimate(prompt, spec["duration_multiplier"])
+    if estimate > MAX_TOTAL_S:
+        raise PlainError(f"The scene is too long: about {estimate:.0f} s of audio, at most {MAX_TOTAL_S:.0f} s.")
+    long_scene = estimate > MAX_SINGLE_TAKE_S
+    if long_scene:
+        # Upstream's chunker never cuts inside quotes, and a chunk over 45 s is
+        # rendered as one degraded take. Cut long speeches between sentences,
+        # then refuse any part that is still too long for one take.
+        prompt = split_spoken_sentences(prompt)
+        longest = max(seconds for _, seconds in model.chunks(prompt, spec["duration_multiplier"]))
+        if longest > MAX_SINGLE_TAKE_S:
+            raise PlainError(f"One sentence is too long to say in one take (about {longest:.0f} s, "
+                             f"at most {MAX_SINGLE_TAKE_S:.0f} s). Break it into shorter sentences.")
     reference, ref_seconds = None, None
     if spec["mode"] == "clone":
         reference, ref_seconds = prepare_reference(work / "import", work, spec["reference_seconds"])
-    estimate = spec["duration"] or model.estimate(spec["prompt"], spec["duration_multiplier"])
-    if estimate > MAX_TOTAL_S:
-        raise ValueError(f"The scene is too long: about {estimate:.0f} s of audio, at most {MAX_TOTAL_S:.0f} s.")
     args = {"voice_ref": str(reference) if reference else None, "cfg_scale": spec["cfg_scale"],
             "stg_scale": spec["stg_scale"], "duration_multiplier": spec["duration_multiplier"],
             "seed": spec["seed"], "ref_duration": ref_seconds or spec["reference_seconds"],
             "rescale_scale": spec["rescale_scale"], "denoise_ref": False}
     parts = [1]
-    if estimate > MAX_SINGLE_TAKE_S:
+    if long_scene:
         def on_chunk(idx, total, est):
             parts[0] = total
             progress(f"DramaBox: part {idx + 1} of {total}")
-        waveform, rate = model.generate_long(spec["prompt"], max_chunk_duration=MAX_SINGLE_TAKE_S,
+        waveform, rate = model.generate_long(prompt, max_chunk_duration=MAX_SINGLE_TAKE_S,
                                              target_chunk_duration=TARGET_CHUNK_S, crossfade_ms=CROSSFADE_MS,
                                              progress_callback=on_chunk, **args)
     else:
         progress("DramaBox: rendering")
-        waveform, rate = model.generate(spec["prompt"], gen_duration=spec["duration"], **args)
+        waveform, rate = model.generate(prompt, gen_duration=spec["duration"], **args)
     audio = _numpy(waveform)
     if audio.size == 0 or not np.isfinite(audio).all():
         raise RuntimeError("empty or non-finite audio")
@@ -339,7 +379,9 @@ def handler(job):
                     "error_code": "missing_dependency", "missing_module": missing}
         log.error("DramaBox failed (%s: %s)", type(error).__name__,
                   re.sub(r"https?://\S+", "<url>", str(error))[:300])
-        return {"error": str(error) if isinstance(error, ValueError) else
+        # Only our own plain-words errors are shown as they are; anything raised
+        # inside upstream, torch or the hub gets the generic message.
+        return {"error": str(error) if isinstance(error, PlainError) else
                 f"DramaBox could not finish ({type(error).__name__}). No audio was generated."}
 
 

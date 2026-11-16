@@ -29,13 +29,14 @@ RUN python3 -m pip install --no-cache-dir "torch==2.8.0" "torchaudio==2.8.0" \
     && python3 -m pip freeze | grep -iE "^(torch|torchaudio|triton|transformers|bitsandbytes|accelerate|av|numpy|resemble.perth|librosa|runpod)( @|==)" \
     && rm -rf /root/.cache
 COPY dramabox_contract.py dramabox_handler.py /app/
-# Build-time checks: the TTSServer and generate() keywords the handler passes
-# exist in the pinned upstream, and Perth's bundled weights load and mark audio.
+# Build-time checks: the TTSServer, generate() and chunker keywords the handler
+# passes exist in the pinned upstream, and Perth's bundled weights load and mark audio.
 RUN cd /app && python3 -c "import sys, inspect; sys.path[:0] = ['/app/upstream/src', '/app/upstream/ltx2']; \
 from inference_server import TTSServer, estimate_duration; import dramabox_handler; \
 p = inspect.signature(TTSServer.__init__).parameters; need = {'checkpoint','full_checkpoint','gemma_root','device','dtype','compile_model','bnb_4bit'}; assert need <= set(p), need - set(p); \
 p = inspect.signature(TTSServer.generate).parameters; need = {'prompt','voice_ref','cfg_scale','stg_scale','duration_multiplier','seed','ref_duration','rescale_scale','gen_duration','denoise_ref'}; assert need <= set(p), need - set(p); \
 p = inspect.signature(TTSServer.generate_long).parameters; need = {'prompt','max_chunk_duration','target_chunk_duration','crossfade_ms','progress_callback'}; assert need <= set(p), need - set(p); \
+from text_chunker import chunk_prompt_for_duration; c = chunk_prompt_for_duration('A man says, \"Hi.\"', max_duration_s=45.0, target_duration_s=37.0, duration_multiplier=1.1); assert c[0].est_duration_s > 0 and c[0].text, c; \
 print('estimate', estimate_duration('A man says, \"Hello there, how are you doing today?\" He laughs.', 1.1)); \
 import numpy as np; a = (0.1 * np.random.default_rng(0).standard_normal((2, 48000))).astype(np.float32); \
 m = dramabox_handler.watermark(a, 48000); assert m.shape[0] == 2 and abs(m.shape[1] - 48000) < 10, m.shape; print('perth ok', m.shape)"
