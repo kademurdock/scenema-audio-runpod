@@ -14,7 +14,8 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip==25.3 setuptools==80.9.0
 # resemble-perth (the watermark upstream applies to every take) is pinned to
 # the Perth commit upstream's "@master" pointed at on this date. Chatterbox
 # itself goes in without dependencies so pip cannot swap torch. pip check may
-# only complain about that torch/torchaudio pin and the demo's gradio.
+# only complain about that torch/torchaudio pin, the demo's gradio, and the
+# base image's Ubuntu pygobject (no pycairo; nothing here imports it).
 RUN python3 -m pip install --no-cache-dir "torch==2.7.1" "torchaudio==2.7.1" \
         "numpy==1.26.4" "librosa==0.11.0" "s3tokenizer==0.3.0" "transformers==5.2.0" "tokenizers==0.22.2" "huggingface-hub==1.33.0" "diffusers==0.29.0" \
         "conformer==0.3.2" "safetensors==0.5.3" "spacy-pkuseg==1.0.1" "pykakasi==2.3.0" "pyloudnorm==0.1.1" \
@@ -24,7 +25,7 @@ RUN python3 -m pip install --no-cache-dir "torch==2.7.1" "torchaudio==2.7.1" \
         "chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox.git@ab55923c27757c90cfcc407baa57dc25a7d25217" \
     && python3 -c "import torch; assert torch.__version__.split('+')[0] == '2.7.1', torch.__version__" \
     && (python3 -m pip check > /tmp/pip-check.txt || true) && cat /tmp/pip-check.txt \
-    && if grep -vE '^No broken requirements|^chatterbox-tts [0-9.]+ (requires gradio, which is not installed|has requirement (torch|torchaudio)==2\.6\.0)' \
+    && if grep -vE '^No broken requirements|^pygobject [0-9.]+ requires pycairo, which is not installed|^chatterbox-tts [0-9.]+ (requires gradio, which is not installed|has requirement (torch|torchaudio)==2\.6\.0)' \
             /tmp/pip-check.txt | grep -q .; then echo "Unexpected pip check conflict" >&2; exit 1; fi \
     && python3 -m pip freeze | grep -iE "^(chatterbox.tts|torch|torchaudio|transformers|tokenizers|huggingface.hub|diffusers|s3tokenizer|resemble.perth|librosa|numpy|runpod)" \
     && rm -rf /root/.cache
