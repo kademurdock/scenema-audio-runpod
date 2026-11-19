@@ -143,8 +143,10 @@ with it.
 - `dereverb`, `denoise` (0 to 1): the same models as in a song job, on every recording.
 - `epochs`: a whole number from 20 to 600, or `"auto"`, by minutes of voice, so a run stays roughly 15 to 40 minutes on a 24 GB
   card: under 5 minutes 300 rounds, 5 to under 15 minutes 200, 15 to under 30 minutes 120, 30 to under 45 minutes 80, 45 minutes
-  and over 60. Rounds that cannot finish inside the job are trimmed (a worker note says so when the number was asked for), and
-  a run whose first rounds show it cannot finish is stopped early with a plain error instead of running out the clock.
+  and over 60. Rounds that cannot finish inside the job are trimmed before training starts (a worker note says so when the
+  number was asked for). The plan rests on an estimate of the card's pace, so the first three rounds are timed: when they show
+  the plan cannot finish, training is started once more with the rounds that do fit (a worker note says how many), or, when
+  fewer than 20 would fit, the job ends there with a plain error instead of running out the clock.
 
 The steps are the ones RVC's own WebUI runs at the pinned commit (`voice_train.py` has the details): listen (and isolate,
 dereverb, denoise) -> measure the seconds that are not silence -> `train/preprocess.py` (48 kHz) -> `extract_f0.py` (RMVPE on

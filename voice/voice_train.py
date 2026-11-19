@@ -114,6 +114,7 @@ class TrainRunner:
         self.exp_dir = os.path.join(root, "logs", EXP)
         self.cpus = max(1, min(8, os.cpu_count() or 2))
         self.loader_used = None
+        self.log_from = 0
         for d in (self.exp_dir, os.path.join(root, "assets", "weights"), os.path.join(root, "assets", "indices")):
             os.makedirs(d, exist_ok=True)
         for rel in ("i18n", os.path.join("assets", "rmvpe")):  # looked up from the working folder by the scripts
@@ -248,16 +249,26 @@ class TrainRunner:
         if self.loader_used != "upstream":
             env.update({"VOICE_TRAIN_LOADER_WORKERS": str(self.loader_used),
                         "PYTHONPATH": os.path.join(HERE, "train_site") + os.pathsep + self.rvc})
+        for stale in (os.path.join(self.exp_dir, "train.log"), self.model_path()):  # a second start counts its own rounds
+            if os.path.exists(stale):
+                os.remove(stale)
+        self.log_from = os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
         ok, secs, stopped = self._run(cmd, timeout, env, tick)
         return ok and os.path.exists(self.model_path()), secs, stopped
 
     def epochs_done(self):
-        """The last finished round in train.py's own log (0 before the first, or when the log says nothing we can read)."""
-        try:
-            with open(os.path.join(self.exp_dir, "train.log"), encoding="utf8", errors="replace") as f:
-                found = EPOCH_LINE.findall(f.read())
-        except OSError:
-            return 0
+        """The last finished round, from train.py's end-of-round line (0 before the first, or when nothing readable is there).
+        On one GPU train.py writes that line to its own train.log; on the CPU the training runs in a child process whose log
+        lines only reach the tool output (the image's build proved the line is read from there), so both are looked at: the
+        tool output only from where this training started."""
+        found = []
+        for path, start in ((os.path.join(self.exp_dir, "train.log"), 0), (self.log_path, self.log_from)):
+            try:
+                with open(path, "rb") as f:
+                    f.seek(start)
+                    found += EPOCH_LINE.findall(f.read().decode("utf-8", "replace"))
+            except OSError:
+                pass
         return max(map(int, found)) if found else 0
 
     def index(self, timeout=1800):
@@ -453,7 +464,7 @@ def run(req, samples, work, runner, trainer, progress=lambda text: None, vram_gb
                              f"so the voice was trained for {fits}.")
             epochs = fits
     progress("Learning the voice")
-    watch = {"said": time.monotonic(), "epoch": 0, "t0": None, "e0": 0}
+    watch = {}
 
     def tick():
         done, now = trainer.epochs_done(), time.monotonic()
@@ -465,14 +476,29 @@ def run(req, samples, work, runner, trainer, progress=lambda text: None, vram_gb
             watch["said"] = now
             progress(f"Learning the voice, epoch {min(done + 1, epochs)} of {epochs}" if done else "Learning the voice")
         if deadline is not None and watch["t0"] is not None and done - watch["e0"] >= 3:
-            each = (now - watch["t0"]) / (done - watch["e0"])  # the real pace, once three rounds have been timed
-            return now + each * (epochs - done) > deadline - AFTER_TRAIN_S
+            watch["pace"] = (now - watch["t0"]) / (done - watch["e0"])  # the real pace, once three rounds have been timed
+            return now + watch["pace"] * (epochs - done) > deadline - AFTER_TRAIN_S
         return False
-    limit = 7200 if deadline is None else max(60.0, deadline - time.monotonic() - AFTER_TRAIN_S / 2)
-    ok, timing["train_s"], stopped = trainer.train(epochs, batch, limit, tick)
+    # The rounds were planned on an estimate of this card's pace. When the first timed rounds show the plan cannot finish
+    # inside the job, training is stopped there and started once more with the rounds that do fit at the measured pace (two
+    # rounds' worth is set aside for starting again), instead of running out the clock with nothing to show for it.
+    timing["train_s"] = 0.0
+    for attempt in (1, 2):
+        watch.update({"said": time.monotonic(), "epoch": 0, "t0": None, "e0": 0, "pace": None})
+        limit = 7200 if deadline is None else max(60.0, deadline - time.monotonic() - AFTER_TRAIN_S / 2)
+        ok, secs, stopped = trainer.train(epochs, batch, limit, tick)
+        timing["train_s"] = round(timing["train_s"] + secs, 1)
+        if not stopped:
+            break
+        fits = int((deadline - time.monotonic() - AFTER_TRAIN_S) / watch["pace"]) - 2
+        if attempt == 2 or fits < EPOCHS_MIN:
+            trace["train"] = False
+            raise ValueError("Learning this voice was going to take longer than a job may run. Use fewer training rounds or "
+                             "less audio.")
+        notes.append(f"This card learned more slowly than planned, so the voice was trained for {fits} rounds instead of {epochs}.")
+        epochs = fits
+        progress("Learning the voice")
     trace["train"] = bool(ok)
-    if stopped:
-        raise ValueError("Learning this voice was going to take longer than a job may run. Use fewer training rounds or less audio.")
     if not ok:
         print(f"training failed\n{vp.log_tail(trainer.log_path, 4000)}", flush=True)
         raise RuntimeError("RVC training failed")

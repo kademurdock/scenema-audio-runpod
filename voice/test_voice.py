@@ -1574,6 +1574,36 @@ class TrainTests(TrainBase):
         self.assertEqual(said[-1], "Learning the voice, epoch 5 of 30")  # stopped after four rounds, not after thirty
         self.assertIn("Learning the voice, epoch 2 of 30", said)
 
+    def test_a_slow_card_gets_the_rounds_that_fit(self):
+        """The plan was 200 rounds; the first timed rounds take 40 seconds each, which cannot finish. Training is started once
+        more with the rounds that do fit at that pace, and the answer says so."""
+        clock = {"now": 1000.0}
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock["now"], strftime=lambda *a: "00:00:00", sleep=lambda s: None)
+        trainer = self.trainer()
+        starts = []
+
+        def paced_train(epochs, batch, limit, tick):
+            starts.append(epochs)
+            for done in range(1, epochs + 1):
+                trainer.epochs_done = lambda done=done: done
+                clock["now"] += 40.0
+                if tick():
+                    return False, 1.0, True
+            del trainer.epochs_done
+            return voice_train.TrainRunner.train(trainer, epochs, batch, limit, None)
+        trainer.train = paced_train
+        with mock.patch.object(voice_train, "time", fake_time):
+            out, said, _ = self.train(trainer=trainer, req=train_request(options={"epochs": 200}), deadline=clock["now"] + 7200)
+        self.assertEqual(starts, [200, 159])  # stopped after four rounds; 6,440 seconds were left, less two rounds to start again
+        r = out["report"]
+        self.assertEqual((r["epochs"], r["epochs_asked"]), (159, 200))
+        self.assertEqual(r["notes"], ["This card learned more slowly than planned, so the voice was trained for 159 rounds instead "
+                                      "of 200."])
+        with open(out["files"]["model.pth"], "rb") as f:
+            self.assertEqual(f.read(), b"model after 159 rounds at batch 8")
+        self.assertIn("Learning the voice, epoch 159 of 159", said)
+        self.assertLessEqual(clock["now"], 1000.0 + 7200 - voice_train.AFTER_TRAIN_S)  # and it finished with the reserve intact
+
     def test_progress_names_the_round(self):
         clock = {"now": 50.0}
         fake_time = types.SimpleNamespace(monotonic=lambda: clock["now"], strftime=lambda *a: "00:00:00", sleep=lambda s: None)
@@ -1607,6 +1637,17 @@ class TrainTests(TrainBase):
         with open(log, "w", encoding="utf8") as f:
             f.write("\n".join(lines))
         self.assertEqual(trainer.epochs_done(), 2)
+        # on the CPU the line only reaches the tool output (the child process has no log file): read there too, but only
+        # from where this training started, so an earlier start's rounds are not counted again
+        with open(trainer.log_path, "w", encoding="utf8") as f:
+            f.write("INFO:voice:====> Epoch: 9 [2026-11-18 09:00:00] | (0:00:09.000001)\n")
+        trainer.log_from = os.path.getsize(trainer.log_path)
+        self.assertEqual(trainer.epochs_done(), 2)
+        with open(trainer.log_path, "a", encoding="utf8") as f:
+            f.write("INFO:voice:Training epoch: 4 [50%]\nINFO:voice:====> Epoch: 3 [2026-11-18 10:00:27] | (0:00:09.000001)\n")
+        self.assertEqual(trainer.epochs_done(), 3)
+        os.remove(log)
+        self.assertEqual(trainer.epochs_done(), 3)
 
     def test_small_shared_memory_turns_the_loader_workers_off(self):
         self.assertIsNone(voice_train.loader_plan(8, None))  # size unknown: train.py as it is

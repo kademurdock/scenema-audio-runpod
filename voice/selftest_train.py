@@ -7,7 +7,8 @@ real pretrained weights, exactly as a train job does except for the device and t
   train/dataset/extract_hubert_feature.py (v2) -> the file list and config -> train/train.py for one round at batch 1 from
   f0G48k / f0D48k -> train/train_index.py -> the new model and its index sing four seconds through infer/cli.py
 Then train.py runs once more with its data loader untouched (the first run holds it to no workers when /dev/shm is as small as
-a build container's: voice_train.loader_plan), so both ways of loading are proven.
+a build container's: voice_train.loader_plan), so both ways of loading are proven. "rounds_counted" is the worker's round
+counter read from train.py's real end-of-round line: 1 after the one round.
 
 What a CPU build cannot prove is written into the result too ("unproven"): the CUDA forms of the same scripts.
 The result is merged into /opt/voice/selftest.json as "train". This step never fails the build, because song and vocal jobs do
@@ -85,16 +86,19 @@ def main():
             traceback.print_exc()
             print(voice_pipeline.log_tail(log, 6000), flush=True)
         print("train self-test said:", said, flush=True)
-        if trace.get("train"):  # once more with train.py's own loader, whatever the first run used
-            os.remove(trainer.model_path())
+        if trace.get("train"):
+            # the round counter that feeds "Learning the voice, epoch 40 of 200" and the pace check, on train.py's real line
+            result["rounds_counted"] = trainer.epochs_done()
+            # once more with train.py's own loader, whatever the first run used
             trainer.loader = "upstream"
             ok, secs, _ = trainer.train(1, 1, 2700)
             result["upstream_loader"], result["seconds"]["train_upstream_s"] = bool(ok), secs
             if not ok:
                 print(voice_pipeline.log_tail(log, 6000), flush=True)
         try:
-            with open(os.path.join(trainer.exp_dir, "train.log"), encoding="utf8", errors="replace") as f:
-                print("train.log (last lines):\n" + f.read()[-1500:], flush=True)
+            with open(log, encoding="utf8", errors="replace") as f:
+                lines = [line for line in f.read().splitlines() if voice_train.EPOCH_LINE.search(line)]
+            print("train.py end-of-round lines:", lines[-3:], flush=True)
         except OSError:
             pass
     result["seconds"]["all_s"] = round(time.monotonic() - began, 1)
