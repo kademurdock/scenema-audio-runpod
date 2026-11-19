@@ -20,6 +20,8 @@ jobs:
       - name: CPU unit tests (no GPU, no bucket, no network)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          # the transposition tests skip themselves without ffmpeg's rubberband filter: make that a failure here, not a skip
+          ffmpeg -hide_banner -filters 2>/dev/null | grep ' rubberband '
           python -m pip install -q numpy==1.26.4
           cd voice && python -m unittest -v test_voice.py
       - name: Free disk for the CUDA wheels and the separation models

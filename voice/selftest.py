@@ -1,7 +1,7 @@
 """Build step (RVC venv, CPU only): prove the baked tools run before the image is pushed, so no GPU money finds out instead.
 
-  - every baked separator (the vocal extractors, the karaoke lead model, the dereverb model) runs through RVC's own pymss CLI on
-    six seconds of synthetic singing over a synthetic band and writes the stem the worker reads
+  - every baked separator (the vocal extractors, the karaoke lead model, the dereverb model, the denoise model) runs through
+    RVC's own pymss CLI on six seconds of synthetic singing over a synthetic band and writes the stem the worker reads
   - RVC's own infer/cli.py converts three seconds of a synthetic voice with a tiny RVC v2 48 kHz model made here from random
     weights (the same checkpoint layout RVC's trainer saves), through HuBERT and RMVPE, so the whole inference path is exercised
     without anybody's voice
@@ -20,7 +20,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from voice_request import DEFAULTS, DEREVERB_MODEL, EXTRACTORS, LEAD_MODELS  # noqa: E402
+from voice_request import DEFAULTS, DENOISE_MODEL, DEREVERB_MODEL, EXTRACTORS, LEAD_MODELS  # noqa: E402
 
 RVC = os.environ.get("VOICE_RVC_DIR", "/opt/rvc")
 MODELS = os.environ.get("PYMSS_MODEL_DIR", "/opt/pymss_models")
@@ -116,6 +116,12 @@ def main():
         print(f"dereverb: {'ok' if ok else 'FAILED'} in {secs} s", flush=True)
         if not ok and DEFAULTS["dereverb"]:
             fatal.append("dereverb")
+        # the denoise model (options.denoise, off by default): the worker reads its "dry" stem; a failure here is only recorded,
+        # and the worker then leaves the voice as it was and says so
+        ok, secs = pymss(DENOISE_MODEL, din, os.path.join(td, "nout"))
+        ok = ok and has_stem(os.path.join(td, "nout"), "lead", "dry")
+        report["denoise"], report["seconds"]["denoise"] = ok, secs
+        print(f"denoise: {'ok' if ok else 'FAILED'} in {secs} s", flush=True)
         model = os.path.join(td, "selftest.pth")
         tiny_rvc_model(model)
         vin, vout = os.path.join(td, "voice.wav"), os.path.join(td, "voice_out.wav")

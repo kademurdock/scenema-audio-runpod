@@ -4,7 +4,8 @@
 # Pinned: RVC WebUI 81eed5e (MIT); torch/torchaudio 2.7.1+cu118, the pair RVC names for pre-RTX-50 cards. It has NO RTX 50-series /
 # Blackwell kernels, so the endpoint must use older cards (RTX 4090, 3090, A5000, L4, L40S, A40, A6000); the worker refuses a card
 # it cannot run. The RVC venv is the exact set the Sep 27 2026 voice test froze on its pod. Base weights: HF
-# lj1995/VoiceConversionWebUI @ e6d0c1a1 (HuBERT, RMVPE) and pymss models from baicai1145/pymss @ f02318ef, baked in.
+# lj1995/VoiceConversionWebUI @ e6d0c1a1 (HuBERT, RMVPE, and for training the v2 48 kHz pretrained pair and RVC's silence sample)
+# and pymss models from baicai1145/pymss @ f02318ef, baked in.
 # Personal voice models are never in the image: they are fetched per job from the private bucket and cached by hash.
 FROM python:3.12-slim-bookworm
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HF_HUB_DISABLE_TELEMETRY=1 PIP_NO_CACHE_DIR=1 UV_NO_CACHE=1 UV_LINK_MODE=copy \
@@ -26,10 +27,19 @@ RUN printf 'torch==2.7.1\ntorchaudio==2.7.1\n' > /tmp/constraints-rvc.txt \
  && uv pip install -q --python /opt/rvc-venv/bin/python -c /tmp/constraints-rvc.txt -r /opt/voice/requirements-rvc.txt \
  && /opt/rvc-venv/bin/python -c "import torch, torchaudio, faiss, librosa, transformers, parselmouth, pymss_core, soundfile; assert torch.__version__ == '2.7.1+cu118', torch.__version__; print('rvc venv', torch.__version__, 'archs', torch.cuda.get_arch_list())" \
  && cd /opt/rvc && /opt/rvc-venv/bin/python infer/cli.py --help > /dev/null
+# transpose_song moves the band and the backing vocals to the voice's new key with ffmpeg's rubberband filter: no filter, no image.
+RUN ffmpeg -hide_banner -filters 2>/dev/null | grep -q ' rubberband ' \
+ || (echo 'This ffmpeg has no rubberband filter: transpose_song cannot work. Install an ffmpeg built with librubberband.' >&2; exit 1)
 COPY voice/voice_request.py voice/fetch_base_models.py /opt/voice/
 RUN /opt/rvc-venv/bin/python /opt/voice/fetch_base_models.py
 COPY voice/selftest.py /opt/voice/
 RUN /opt/rvc-venv/bin/python /opt/voice/selftest.py
+# Training cannot be tried on a GPU for free, so the image trains a voice on the CPU while it is built: the worker's own train
+# flow through the real RVC scripts and pretrained weights, one round on synthetic singing, then the new model sings through
+# infer/cli.py. The result goes into selftest.json; an image whose proof failed refuses train jobs in plain words.
+COPY voice/vpaudio.py voice/vocalfx.py voice/voice_models.py voice/voice_pipeline.py voice/voice_train.py voice/selftest_train.py /opt/voice/
+COPY voice/train_site/ /opt/voice/train_site/
+RUN /opt/rvc-venv/bin/python /opt/voice/selftest_train.py
 COPY voice/ /opt/voice/
 RUN cd /opt/voice && python -m unittest -v test_voice.py \
  && python -c "import sys; sys.path.insert(0, '/opt/voice'); import voice_handler, runpod, boto3; print('handler ok', voice_handler.FEATURES)"
