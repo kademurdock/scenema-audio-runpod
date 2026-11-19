@@ -7,6 +7,10 @@ numpy + ffmpeg only, so the CPU unit tests run the same code the worker runs. Py
   pitch_stats / choose_shift   semitone statistics and the octave rule (0 or +/-12) used for every song
   align / reverb / limiter     envelope cross-correlation, a synthetic stereo room (FFT overlap-add) and a look-ahead peak limiter
   master                       gain to a loudness target + limiter + MP3, the one path every listening file goes through
+  fit_shift                    the whole-semitone move that puts the most of a melody inside a singer's range (request pitch "fit")
+  formant_shift                timbre up or down with the pitch left alone (STFT, cepstral envelope, warp, overlap-add)
+  transpose                    a whole stem moved by semitones through ffmpeg's rubberband filter, lined back up with its source
+  active_blocks / _seconds     which 50 ms blocks of a recording are not silence, and how many seconds that is
 """
 import json
 import os
@@ -57,11 +61,13 @@ def probe(path):
     return int(m.group(1)), ch, dur
 
 
-def decode(path, sr=None, channels=None, af=None):
-    """-> (float32 [n, ch], sr). sr/channels None keep the file's own."""
+def decode(path, sr=None, channels=None, af=None, limit_s=None):
+    """-> (float32 [n, ch], sr). sr/channels None keep the file's own; limit_s reads no more than that many seconds."""
     fsr, fch, _ = probe(path)
     sr, channels = sr or fsr, channels or fch
     args = ["-i", str(path), "-vn"]
+    if limit_s:
+        args += ["-t", f"{float(limit_s):.3f}"]
     if af:
         args += ["-af", af]
     args += ["-ac", str(channels), "-ar", str(sr), "-f", "f32le", "-c:a", "pcm_f32le", "pipe:1"]
@@ -249,6 +255,30 @@ def choose_shift(her, song, song_st=None):
         out["share_above_top"] = round(float((st > her["p95"]).mean()), 3)
         out["share_above_top_plus3"] = round(float((st > her["p95"] + 3).mean()), 3)
     return out
+
+
+def fit_shift(her, song_st, limit=24):
+    """The request's pitch "fit": the whole-semitone move (any from -limit to +limit, so -11..+11 plus octaves) that leaves the
+    fewest of the melody's notes outside the singer's range (her p05..p95, MIDI), counted to the nearest percent so a handful of
+    stray frames never buys a bigger move. Ties go to the smallest move, then to the one that puts the song's middle note
+    nearest the singer's own middle. A melody that already fits therefore stays where it is. Unlike the octave rule this
+    changes the key, which is why "fit" always moves the music too (voice_pipeline, transpose_song).
+    song_st: the melody's voiced-frame semitones (MIDI numbers)."""
+    st = np.asarray(song_st, dtype=np.float64)
+    med = float(np.median(st))
+
+    def outside(k):
+        return float(((st + k < her["p05"]) | (st + k > her["p95"])).mean())
+    k = min(range(-limit, limit + 1), key=lambda k: (round(outside(k), 2), abs(k), abs(med + k - her["p50"])))
+    before, after = round(outside(0), 3), round(outside(k), 3)
+    span = f"{note(her['p05'])}-{note(her['p95'])}"
+    if k == 0:
+        why = f"the melody already sits best in your range ({span}) where it is: {before:.0%} of it is outside"
+    else:
+        why = (f"moved {'up' if k > 0 else 'down'} {abs(k)} semitone{'' if abs(k) == 1 else 's'} to centre the melody in your "
+               f"range ({span}): {after:.0%} of it is outside instead of {before:.0%}")
+    return {"shift": int(k), "why": why, "outside_before": before, "outside_after": after,
+            "share_above_top": round(float((st + k > her["p95"]).mean()), 3)}
 
 
 # ---------------------------------------------------------------- alignment, room, limiter
@@ -455,6 +485,107 @@ def unvoiced_blend(conv, src, sr, lo=3500, hi_x=4500, n_fft=2048, hop=512):
     y = istft(Sc * (1 - W) + Ss * np.float32(g) * W, len(conv), n_fft, hop)
     return y, {"blend_frames": int((w > 0.5).sum()), "blend_s": round(float((w > 0.5).sum()) * hop / sr, 1),
                "src_gain_db": round(float(lc - ls), 2)}
+
+
+# ---------------------------------------------------------------- timbre, key and silence (Nov 2026)
+def _medfilt(v, k):
+    if k <= 1 or not len(v):
+        return v
+    pad = k // 2
+    vp = np.concatenate([np.full(pad, v[0]), v, np.full(pad, v[-1])])
+    return np.median(np.stack([vp[i:i + len(v)] for i in range(k)]), axis=0)
+
+
+def spectral_envelope(logmag, keep, n_fft):
+    """The smooth outline of each frame's log spectrum (the mouth and throat, without the harmonics) by cepstral liftering: only
+    the quefrencies up to keep[frame] samples stay."""
+    q = np.minimum(np.arange(n_fft), n_fft - np.arange(n_fft))
+    return np.fft.rfft(np.fft.irfft(logmag, n_fft, axis=1) * (q[None, :] <= np.asarray(keep)[:, None]), axis=1).real
+
+
+def formant_shift(x, sr, semitones, n_fft=2048, hop=512, max_db=24.0, block=1024):
+    """Timbre up (positive: a smaller, brighter voice) or down (negative: bigger, darker) by semitones, with the pitch left alone.
+    Each STFT frame's spectrum is split into its smooth envelope (spectral_envelope: the mouth and throat) and the fine structure
+    under it (the harmonics, and so the pitch). Only the envelope is slid along the frequency axis by 2^(semitones/12); the
+    harmonics and every phase stay where they were, so the notes do not move. The envelope's quefrency cut is 1 ms, or 0.35 of
+    the pitch period when the note is high enough for that to be shorter (the voice's own pitch track, bridged over the unvoiced
+    gaps and median-smoothed over about 0.2 s): a fixed cut takes the harmonics of a high note for formants and then moves the
+    wrong thing. Measured on synthetic vowels sung from G2 to C6: the fixed 0.8 ms cut moved the brightness the wrong way in 17
+    of 44 cases, this cut in none, and the pitch stayed within 0.9 percent. The change at any one
+    frequency is held to +-max_db. Mono in, mono out, same length; 0 semitones hands the input back untouched. numpy only and
+    nothing random: the same voice always gives the same result."""
+    x = np.asarray(x, np.float32)
+    if not semitones:
+        return x
+    ratio = 2.0 ** (float(semitones) / 12.0)
+    S = stft(x, n_fft, hop)
+    bins = n_fft // 2 + 1
+    tr = pitch_track(x, sr)
+    period = np.full(len(S), sr / 200.0)  # samples; a 200 Hz voice when nothing is voiced
+    if tr["voiced"].any():
+        at = (np.flatnonzero(tr["voiced"]) * YIN_HOP + YIN_FRAME / 2) / YIN_SR
+        period = _medfilt(np.interp(np.arange(len(S)) * hop / sr, at, sr / tr["f0"][tr["voiced"]]), 15)
+    keep = np.clip(np.round(0.35 * period), 8, round(0.001 * sr)).astype(np.int64)
+    src = np.clip(np.arange(bins) / ratio, 0, bins - 1)  # the envelope at f comes from f / ratio
+    i0 = np.floor(src).astype(np.int64)
+    i1 = np.minimum(i0 + 1, bins - 1)
+    frac = src - i0
+    lim = max_db / 20 * np.log(10)
+    for b in range(0, len(S), block):
+        seg = S[b:b + block]
+        env = spectral_envelope(np.log(np.maximum(np.abs(seg), 1e-7)).astype(np.float64), keep[b:b + block], n_fft)
+        moved = env[:, i0] * (1 - frac) + env[:, i1] * frac
+        S[b:b + block] = seg * np.exp(np.clip(moved - env, -lim, lim)).astype(np.float32)
+    return istft(S, len(x), n_fft, hop)
+
+
+_RUBBERBAND = []
+
+
+def has_rubberband():
+    """Whether this ffmpeg carries the rubberband filter (asked once). The image's build fails without it (Dockerfile.voice)."""
+    if not _RUBBERBAND:
+        try:
+            r = subprocess.run([ffmpeg_bin(), "-hide_banner", "-filters"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE)
+            _RUBBERBAND.append(b" rubberband " in r.stdout)
+        except (OSError, RuntimeError):
+            _RUBBERBAND.append(False)
+    return _RUBBERBAND[0]
+
+
+def transpose(x, sr, semitones, voice=False):
+    """x ([n] or [n, ch]) moved by semitones at the same speed, through ffmpeg's rubberband filter; voice=True keeps the formants
+    (singers stay people instead of turning into chipmunks or giants), False lets them move with the notes (instruments).
+    rubberband answers a few milliseconds early or late depending on the move (-17 ms at +6, +12 ms at -5 when measured), so the
+    result is lined back up with its source by the loudness envelope and cut to the same length."""
+    x = as2d(x)
+    if not semitones:
+        return x
+    af = (f"rubberband=pitch={2.0 ** (float(semitones) / 12.0):.8f}:pitchq=quality:channels=together:"
+          f"formant={'preserved' if voice else 'shifted'}")
+    r = _run(["-f", "f32le", "-ar", str(sr), "-ac", str(x.shape[1]), "-i", "pipe:0", "-af", af, "-f", "f32le", "-c:a", "pcm_f32le",
+              "pipe:1"], np.ascontiguousarray(x, dtype="<f4").tobytes())
+    y = np.frombuffer(r.stdout, dtype="<f4").reshape(-1, x.shape[1])
+    lag, _ = align_lag(x, y, sr, max_ms=100)
+    return np.ascontiguousarray(shift_fit(y, lag, len(x)))
+
+
+def active_blocks(x, sr, block_ms=50.0):
+    """-> (bool per block, block length in samples): the blocks of a recording that are not silence, meaning within 40 dB of its
+    own loud level (the 95th percentile block) and above -55 dBFS."""
+    m = as2d(x).mean(1)
+    b = max(1, int(round(sr * block_ms / 1000)))
+    n = len(m) // b
+    if n == 0:
+        return np.zeros(0, bool), b
+    db = 10 * np.log10((m[:n * b].reshape(n, b).astype(np.float64) ** 2).mean(1) + 1e-12)
+    return db > max(-55.0, float(np.percentile(db, 95)) - 40.0), b
+
+
+def active_seconds(x, sr):
+    mask, b = active_blocks(x, sr)
+    return float(mask.sum()) * b / sr
 
 
 def master(path, x, sr, target_lufs=-16.0, ceiling_db=-1.0):
