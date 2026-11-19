@@ -3,15 +3,19 @@
 Input (RunPod job "input"):
   mode          "song"  a mix with music: split the voice from the band, re-sing the lead, put it back (the default)
                 "vocal" a dry vocal with no music: re-sing it as it is
-  audio_key     a key in the private bucket (a Sound Booth take or an earlier voice output), or
+                "train" make a new voice from uploaded recordings (its own fields: parse_train below)
+  audio_key    a key in the private bucket (a Sound Booth take or an earlier voice output), or
   audio_url     an https link on an allowed host (VOICE_AUDIO_HOSTS), such as a signed link to an imported recording
   model_key     the RVC voice model (.pth) in the private bucket, under voice-models/<owner>/...
   model_sha256  optional; the worker caches models by content hash and refuses a download that does not match
   index_key / index_sha256   optional retrieval index (.index) from the same voice-models/<owner>/ folder
-  pitch         "auto" (the octave rule, needs voice_range) or whole semitones -24..24
+  pitch         "auto" (the octave rule, needs voice_range), whole semitones -24..24, or "fit" (the whole-semitone move that puts
+                the most of the melody inside voice_range; without a voice_range it behaves as "auto")
+  transpose_song  off by default, always on with pitch "fit": in song mode, when the voice moves by anything but whole octaves,
+                the music and the kept backing vocals move to the same key
   voice_range   optional {"p05", "p50", "p95"}: the singer's own low, middle and high notes as MIDI numbers
   options       extractor, fallback, lead_split, lead_model, dereverb, room, soft_s, index_rate, protect, rms_mix_rate, f0_method
-                (DEFAULTS below)
+                (DEFAULTS below), and since Nov 2026 dereverb_strength, denoise, backing and formant (EXTRA_DEFAULTS below)
   vocal_fx      optional studio effect on the converted lead (vocalfx.py): "none" (the default: output exactly as before),
                 "studio", "plate", "hall", "slapback", "echo" or "dreamy"; the dry vocal files stay dry either way
   output_prefix optional "voice/<8-64 letters, digits, - or _>"; default voice/<random>
@@ -60,15 +64,38 @@ DEFAULTS = {
     "rms_mix_rate": 0.25,
     "f0_method": "rmvpe",
 }
+# The Nov 2026 options. They arrive inside "options" like the others, but parse() hands them back on their own as "extra", so
+# "options" stays the eleven settings above for anything that reads it. Every default here does nothing at all: with none of
+# them set, each audio file is byte for byte what the worker made before they existed.
+#   dereverb_strength  0..1, only with dereverb on: how much of the room comes off the lead before it is re-sung (1: all of it)
+#   denoise            0..1: how much hiss and background noise comes off the voice before it is re-sung (DENOISE_MODEL)
+#   backing            "keep" (backing vocals left as sung), "convert" (re-sung in the voice too) or "remove" (left out)
+#   formant            -6..6 semitones: the converted voice's timbre, darker and bigger below 0, brighter and smaller above
+EXTRA_DEFAULTS = {"dereverb_strength": 1.0, "denoise": 0.0, "backing": "keep", "formant": 0.0}
+BACKING_MODES = ("keep", "convert", "remove")
+# aufr33's Mel-band RoFormer denoiser, from the same pinned pymss catalog as the separators; its "dry" stem is the clean voice.
+DENOISE_MODEL = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"
 # Vocal effects (vocalfx.PRESETS; listed here too because this file is copied into the image before the audio code is).
 VOCAL_FX = ("none", "studio", "plate", "hall", "slapback", "echo", "dreamy")
-MAX_SECONDS = 6 * 60 + 5
+MAX_SECONDS = 10 * 60 + 5
 MAX_BYTES = 256 * 1024 * 1024
 KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/=-]{0,1023}$")
 MODEL_KEY_RE = re.compile(r"^voice-models/([A-Za-z0-9_-]{1,64})/[A-Za-z0-9._/-]{1,512}\.pth$")
 INDEX_KEY_RE = re.compile(r"^voice-models/([A-Za-z0-9_-]{1,64})/[A-Za-z0-9._/-]{1,512}\.index$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 PREFIX_RE = re.compile(r"^voice/[A-Za-z0-9_-]{8,64}$")
+# Training (mode "train"): the recordings of one voice live under voice-samples/<owner>/<voice_id>/ and the finished voice goes
+# to voice-models/<owner>/<voice_id>/, nowhere else.
+OWNER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+VOICE_ID_RE = re.compile(r"^[a-z0-9_-]{8,64}$")
+SAMPLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/=-]{0,511}$")
+MAX_SAMPLES = 60
+MAX_SAMPLE_BYTES = 256 * 1024 * 1024
+MAX_SAMPLES_BYTES = 2 * 1024 * 1024 * 1024
+MIN_TRAIN_SECONDS = 60
+MAX_TRAIN_SECONDS = 60 * 60
+EPOCHS_MIN, EPOCHS_MAX = 20, 600
+TRAIN_DEFAULTS = {"epochs": "auto", "isolate": False, "denoise": 0.0, "dereverb": False}
 
 
 def _audio_prefixes():
@@ -81,8 +108,8 @@ def _audio_hosts():
     return {h.strip().lower() for h in raw.split(",") if h.strip()}
 
 
-def _flag(options, key):
-    value = options.get(key, DEFAULTS[key])
+def _flag(options, key, defaults=DEFAULTS):
+    value = options.get(key, defaults[key])
     if isinstance(value, bool):
         return value
     if value in (0, 1):
@@ -92,8 +119,8 @@ def _flag(options, key):
     raise ValueError(f"The {key.replace('_', ' ')} setting must be on or off.")
 
 
-def _number(options, key, low, high, label):
-    value = options.get(key, DEFAULTS[key])
+def _number(options, key, low, high, label, defaults=DEFAULTS):
+    value = options.get(key, defaults[key])
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value or not low <= value <= high:
         raise ValueError(f"{label} must be a number from {low} to {high}.")
     return float(value)
@@ -128,11 +155,65 @@ def check_url(url, resolve=True):
     return url
 
 
+def parse_train(raw):
+    """mode "train": {"owner", "voice_id", "sample_keys": [...], "options": {"epochs", "isolate", "denoise", "dereverb"}}.
+      owner        1-64 letters, digits, - or _ (whatever the caller's registry calls the account; never a name)
+      voice_id     8-64 lower-case letters, digits, - or _
+      sample_keys  1..60 recordings, every one under voice-samples/<owner>/<voice_id>/ and nowhere else
+      epochs       "auto" (chosen from how much audio there is: voice_train.auto_epochs) or a whole number 20..600
+      isolate      off: the recordings are a voice on its own. on: each is run through the vocal extractor and the lead split
+                   first, for recordings with music under the voice
+      denoise      0..1, as in a song job; dereverb on takes the room off each recording
+    -> a clean request whose only output folder is voice-models/<owner>/<voice_id>, or ValueError with a sentence."""
+    owner, voice_id = raw.get("owner"), raw.get("voice_id")
+    if not isinstance(owner, str) or not OWNER_RE.match(owner):
+        raise ValueError("The voice's owner is not valid.")
+    if not isinstance(voice_id, str) or not VOICE_ID_RE.match(voice_id):
+        raise ValueError("The voice id is not valid.")
+    keys = raw.get("sample_keys")
+    if not isinstance(keys, (list, tuple)) or not keys:
+        raise ValueError("Add at least one recording of the voice.")
+    if len(keys) > MAX_SAMPLES:
+        raise ValueError(f"That is more than {MAX_SAMPLES} recordings. Use {MAX_SAMPLES} or fewer.")
+    folder = f"voice-samples/{owner}/{voice_id}/"
+    clean_keys = []
+    for key in keys:
+        name = key[len(folder):] if isinstance(key, str) and key.startswith(folder) else ""
+        if not name or ".." in name or "//" in name or name.endswith("/") or not SAMPLE_NAME_RE.match(name):
+            raise ValueError("One of the recordings is not in this voice's own folder.")
+        if key not in clean_keys:
+            clean_keys.append(key)
+    options = raw.get("options") or {}
+    if not isinstance(options, dict):
+        raise ValueError("The voice options were not readable.")
+    epochs = options.get("epochs", TRAIN_DEFAULTS["epochs"])
+    if epochs != "auto":
+        if isinstance(epochs, bool) or not isinstance(epochs, (int, float)) or epochs != epochs or epochs != int(epochs) \
+                or not EPOCHS_MIN <= epochs <= EPOCHS_MAX:
+            raise ValueError(f"Training rounds must be automatic or a whole number from {EPOCHS_MIN} to {EPOCHS_MAX}.")
+        epochs = int(epochs)
+    return {
+        "mode": "train",
+        "owner": owner,
+        "voice_id": voice_id,
+        "sample_keys": clean_keys,
+        "options": {
+            "epochs": epochs,
+            "isolate": _flag(options, "isolate", TRAIN_DEFAULTS),
+            "denoise": _number(options, "denoise", 0, 1, "Noise cleanup", TRAIN_DEFAULTS),
+            "dereverb": _flag(options, "dereverb", TRAIN_DEFAULTS),
+        },
+        "output_prefix": f"voice-models/{owner}/{voice_id}",
+    }
+
+
 def parse(raw, resolve=True):
     """-> a clean request dict, or ValueError with a sentence the Sound Booth can say as it is."""
     if not isinstance(raw, dict):
         raise ValueError("The voice request was empty.")
     mode = raw.get("mode", "song")
+    if mode == "train":
+        return parse_train(raw)
     if mode not in ("song", "vocal"):
         raise ValueError('Choose "song" for a recording with music or "vocal" for a voice on its own.')
     has_key, has_url = raw.get("audio_key") is not None, raw.get("audio_url") is not None
@@ -153,10 +234,12 @@ def parse(raw, resolve=True):
         if INDEX_KEY_RE.match(index_key).group(1) != owner:
             raise ValueError("The voice index belongs to a different voice model.")
     pitch = raw.get("pitch", "auto")
-    if pitch != "auto":
+    if not isinstance(pitch, str) or pitch not in ("auto", "fit"):
         if isinstance(pitch, bool) or not isinstance(pitch, (int, float)) or pitch != int(pitch) or not -24 <= pitch <= 24:
-            raise ValueError("Pitch must be automatic or a whole number of semitones from -24 to 24.")
+            raise ValueError("Pitch must be automatic, fit or a whole number of semitones from -24 to 24.")
         pitch = int(pitch)
+    # "fit" changes the key, so the music always moves with the voice; otherwise it moves only when asked
+    transpose_song = _flag(raw, "transpose_song", {"transpose_song": False}) or pitch == "fit"
     voice_range = raw.get("voice_range")
     if voice_range is not None:
         try:
@@ -193,6 +276,15 @@ def parse(raw, resolve=True):
         "rms_mix_rate": _number(options, "rms_mix_rate", 0, 1, "Loudness follow (RMS mix rate)"),
         "f0_method": f0_method,
     }
+    backing = options.get("backing", EXTRA_DEFAULTS["backing"])
+    if not isinstance(backing, str) or backing not in BACKING_MODES:
+        raise ValueError("Backing vocals must be keep, convert or remove.")
+    extra = {
+        "dereverb_strength": _number(options, "dereverb_strength", 0, 1, "Room removal strength", EXTRA_DEFAULTS),
+        "denoise": _number(options, "denoise", 0, 1, "Noise cleanup", EXTRA_DEFAULTS),
+        "backing": backing,
+        "formant": _number(options, "formant", -6, 6, "Voice character (formant)", EXTRA_DEFAULTS),
+    }
     vocal_fx = raw.get("vocal_fx")
     vocal_fx = "none" if vocal_fx is None else (vocal_fx.strip().lower() if isinstance(vocal_fx, str) else vocal_fx)
     if not isinstance(vocal_fx, str) or vocal_fx not in VOCAL_FX:
@@ -209,8 +301,10 @@ def parse(raw, resolve=True):
         "index_key": index_key,
         "index_sha256": _sha(raw.get("index_sha256"), "voice index") if index_key else None,
         "pitch": pitch,
+        "transpose_song": transpose_song,
         "voice_range": voice_range,
         "options": clean,
+        "extra": extra,
         "vocal_fx": vocal_fx,
         "output_prefix": prefix or f"voice/{uuid.uuid4().hex}",
     }

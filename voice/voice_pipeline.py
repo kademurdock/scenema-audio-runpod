@@ -21,7 +21,24 @@ matched to the dry lead's loudness; the effected lead replaces the dry one in th
 which would double the space). The dry vocal files are never touched.
 Outputs (in the work folder): mix.mp3 + mix.wav (24-bit) and vocal.mp3 + vocal.wav (24-bit mono, the dry converted voice); with a
 vocal effect also vocal_fx.mp3 + vocal_fx.wav (24-bit stereo, the effected voice with its tail; in vocal mode it is the mix).
-With vocal_fx "none" every audio file is byte for byte what the worker made before vocal effects existed."""
+With vocal_fx "none" every audio file is byte for byte what the worker made before vocal effects existed.
+
+Nov 2026, each off unless asked for (voice_request.EXTRA_DEFAULTS), so a request without them makes the same mix and vocal files:
+  dereverb_strength  step 3 takes only that share of the room off: the lead that is re-sung is lead*(1-s) + dry*s, and the
+                     remembered reverb ratio (so the room put back in step 7) shrinks with it
+  denoise            after step 3 (and in vocal mode): the denoise model's clean voice, blended in by the amount asked for
+  pitch "fit"        step 4 picks the whole-semitone move that puts the most of the melody in the singer's range (va.fit_shift)
+  formant            after step 5: the converted voice's timbre moved with its pitch left alone (va.formant_shift); the same
+                     move goes on converted backing vocals, so the lead and the backing stay one voice
+  backing            "convert": the backing vocals get their own RVC pass at the same shift, as loud as the backing they
+                     replace; "remove": they are left out of the mix
+  transpose_song     when the voice moved by anything but whole octaves, the band and the kept backing vocals move to the same
+                     key (va.transpose; the octaves are dropped, so the band never moves more than six semitones). Without it a
+                     worker note says the voice may be out of key with the music.
+  stems              song mode always also writes instrumental.mp3/.wav (the band), backing.mp3/.wav (when the lead split found
+                     backing vocals: as they are in the mix, or as they were sung when the mix leaves them out) and
+                     lead_original.mp3/.wav (the original singer's lead exactly as it went into RVC), each with the mix's own
+                     master gain, so the stems sit at the level they have in the song."""
 import glob
 import json
 import os
@@ -36,7 +53,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import vocalfx  # noqa: E402
 import vpaudio as va  # noqa: E402
-from voice_request import DEREVERB_MODEL, EXTRACTORS, LEAD_MODELS, MAX_SECONDS  # noqa: E402
+from voice_request import DENOISE_MODEL, DEREVERB_MODEL, EXTRA_DEFAULTS, EXTRACTORS, LEAD_MODELS, MAX_SECONDS  # noqa: E402
 
 SR = 44100
 ROOM_RT60 = 1.2
@@ -105,6 +122,10 @@ def extractor_ready(name):
     return proved.get(name, True) is not False
 
 
+def denoise_ready():
+    return selftest().get("denoise", True) is not False
+
+
 def stem_file(out_dir, stem, instr):
     """pymss writes <input stem>_<instrument>.<ext>; the instrument's case follows the model's config ("Vocals", "vocals")."""
     for p in glob.glob(os.path.join(out_dir, "**", f"{stem}_*"), recursive=True):
@@ -127,7 +148,7 @@ def lufs(x):
     return m if np.isfinite(m) and m > -69 else None
 
 
-def separate(mix, work, opts, runner, progress, notes):
+def separate(mix, work, opts, runner, progress, notes, dereverb_strength=1.0):
     """-> dict(band [n,2], backing [n,2] or None, lead_dry [n] mono, reverb_ratio_db or None, info)."""
     n = len(mix)
     info = {"extractor": opts["extractor"], "vocals_by": None, "lead_split": "off", "dereverb": "off", "reverb_ratio_db": None}
@@ -201,7 +222,7 @@ def separate(mix, work, opts, runner, progress, notes):
         if info["lead_split"] != "used":
             notes.append("The lead singer could not be told apart from the backing vocals, so every voice was re-sung together.")
     dry, ratio = lead, None
-    if opts["dereverb"]:
+    if opts["dereverb"] and dereverb_strength > 0:  # strength 0 asks for none of the room to come off: nothing to run
         progress("Taking the room off the voice")
         din, dout = os.path.join(work, "dry_in"), os.path.join(work, "dry_out")
         os.makedirs(din, exist_ok=True)
@@ -210,6 +231,9 @@ def separate(mix, work, opts, runner, progress, notes):
         found = stem_file(dout, "lead", "noreverb") if ok else None
         if found:
             dry = fit(va.decode(found, sr=SR, channels=2)[0], n)
+            if dereverb_strength < 1:  # part of the room stays on the voice; what came off (lead - dry) shrinks with it
+                dry = (lead * np.float32(1 - dereverb_strength) + dry * np.float32(dereverb_strength)).astype(np.float32)
+                info["dereverb_strength"] = dereverb_strength
             ratio = round(rms_db(lead - dry) - rms_db(dry), 2)
             info.update({"dereverb": "used", "reverb_ratio_db": ratio, "dereverb_s": secs})
         else:
@@ -218,21 +242,57 @@ def separate(mix, work, opts, runner, progress, notes):
     return {"band": band, "backing": backing, "lead_dry": dry.mean(1).astype(np.float32), "reverb_ratio_db": ratio, "info": info}
 
 
+def denoise(voice, work, runner, amount, progress, notes):
+    """The mono voice with the hiss and background noise taken off by the denoise model, blended in by amount (0..1):
+    voice*(1-amount) + clean*amount. -> (mono float32, info). A model that cannot run leaves the voice as it was, with a note."""
+    if not denoise_ready():
+        notes.append("The noise cleanup failed the worker's own check when it was built, so the voice was used as it was.")
+        return voice, {"denoise": "skipped"}
+    progress("Cleaning the noise off the voice")
+    nin, nout = os.path.join(work, "clean_in"), os.path.join(work, "clean_out")
+    os.makedirs(nin, exist_ok=True)
+    va.encode(os.path.join(nin, "voice.wav"), np.repeat(va.as2d(voice), 2, axis=1), SR, bits=32)
+    ok, secs = runner.pymss(DENOISE_MODEL, nin, nout)
+    found = stem_file(nout, "voice", "dry") if ok else None
+    if not found:
+        print(f"denoise failed\n{log_tail(runner.log_path)}", flush=True)
+        notes.append("The noise could not be cleaned off the voice, so it was used as it was.")
+        return voice, {"denoise": "failed"}
+    clean = fit(va.decode(found, sr=SR, channels=2)[0], len(voice)).mean(1)
+    out = (voice * np.float32(1 - amount) + clean * np.float32(amount)).astype(np.float32)
+    return out, {"denoise": "used", "amount": amount, "removed_db": round(rms_db(voice - out) - rms_db(voice), 1), "denoise_s": secs}
+
+
 def choose_pitch(req, voice):
-    if req["pitch"] != "auto":
+    if req["pitch"] not in ("auto", "fit"):
         return {"shift": int(req["pitch"]), "source": "set", "why": f"moved {req['pitch']:+d} semitones, as asked"}
+    source = req["pitch"]
     if not req.get("voice_range"):
-        return {"shift": 0, "source": "auto", "why": "no voice range is on record, so the melody stays where it is"}
+        return {"shift": 0, "source": source, "why": "no voice range is on record, so the melody stays where it is"}
     tr = va.pitch_track(voice, SR)
     stats = va.pitch_stats(tr)
     if stats.get("voiced_frames", 0) < 50:
-        return {"shift": 0, "source": "auto", "why": "too little clear pitch to choose an octave, so the melody stays where it is"}
+        return {"shift": 0, "source": source, "why": "too little clear pitch to choose "
+                + ("an octave" if source == "auto" else "a key") + ", so the melody stays where it is"}
     st = va.hz_to_st(tr["f0"][tr["voiced"]])
+    if source == "fit":
+        sh = va.fit_shift(req["voice_range"], st)
+        return {"shift": int(sh["shift"]), "source": "fit", "why": sh["why"], "share_above_top": sh["share_above_top"],
+                "outside_before": sh["outside_before"], "outside_after": sh["outside_after"]}
     sh = va.choose_shift(req["voice_range"], stats, st)
     out = {"shift": int(sh["shift"]), "source": "auto", "why": sh["why"]}
     if "share_above_top" in sh:
         out["share_above_top"] = sh["share_above_top"]
     return out
+
+
+def key_shift(shift):
+    """The semitones the music moves when the voice moved by shift: the same key with the octaves dropped (-6..6), because a
+    band moved an octave and a bit sounds far worse than one moved just the bit, and it is the same key either way."""
+    r = int(shift) % 12
+    if r > 6 or (r == 6 and shift < 0):
+        r -= 12
+    return r
 
 
 def finish(x, mp3, wav, target_lufs):
@@ -246,16 +306,17 @@ def finish(x, mp3, wav, target_lufs):
     return {"in_lufs": None if before is None else round(before, 2), "gain_db": round(gain, 2), "limit_db": round(limited, 2)}
 
 
-def load_input(audio_path):
+def load_input(audio_path, limit_s=None):
     """The recording as float32 [n, 2] at SR, at its own level. ffmpeg's mono-to-stereo upmix puts each side
     3 dB down, so a mono file is decoded as mono and copied to both sides instead (Sep 27 2026: a mono upload
-    came back 3 dB quieter); more than two channels are folded to stereo by ffmpeg as before."""
-    x, _ = va.decode(audio_path, sr=SR)
+    came back 3 dB quieter); more than two channels are folded to stereo by ffmpeg as before.
+    limit_s (training) reads no more than that many seconds of it."""
+    x, _ = va.decode(audio_path, sr=SR, limit_s=limit_s)
     if x.shape[1] == 1:
         return np.repeat(x, 2, axis=1)
     if x.shape[1] == 2:
         return x
-    return va.decode(audio_path, sr=SR, channels=2)[0]
+    return va.decode(audio_path, sr=SR, channels=2, limit_s=limit_s)[0]
 
 
 def vocal_effect(conv, name, beat_source):
@@ -270,6 +331,21 @@ def vocal_effect(conv, name, beat_source):
     return (fx * np.float32(10 ** (gain / 20))).astype(np.float32), report
 
 
+def resing(runner, model_path, index_path, voice, work, name, shift, opts):
+    """One RVC pass: the mono voice written to <name>_in.wav, re-sung, read back and lined up with the voice it replaces
+    (+-300 ms). -> (mono float32 the length of voice, {"lag_ms", "align_peak"}, seconds RVC took)."""
+    src, conv_path = os.path.join(work, f"{name}_in.wav"), os.path.join(work, f"{name}_out.wav")
+    va.encode(src, voice, SR, bits=32)
+    ok, secs = runner.rvc_convert(model_path, index_path, src, conv_path, shift, opts)
+    if not ok or not os.path.exists(conv_path):
+        print(f"RVC failed\n{log_tail(runner.log_path)}", flush=True)
+        raise RuntimeError("RVC conversion failed")
+    conv = va.decode(conv_path, sr=SR, channels=1)[0][:, 0]
+    lag, peak = va.align_lag(voice, conv, SR, max_ms=300)
+    conv = va.shift_fit(conv, lag, len(voice))[:, 0]
+    return conv, {"lag_ms": round(1000 * lag / SR, 1), "align_peak": round(peak, 3)}, secs
+
+
 def run(req, audio_path, model_path, index_path, work, runner, progress=lambda text: None):
     """-> {"files": {name: path}, "report": {...}}. ValueError carries a sentence for the person."""
     notes, timing = [], {}
@@ -277,40 +353,76 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
     mix = load_input(audio_path)
     seconds = len(mix) / SR
     if seconds > MAX_SECONDS:
-        raise ValueError(f"This recording is {int(seconds // 60)} minutes {int(seconds % 60)} seconds long. Use one up to six minutes.")
+        raise ValueError(f"This recording is {int(seconds // 60)} minutes {int(seconds % 60)} seconds long. Use one up to ten minutes.")
     if seconds < 2 or rms_db(mix) < -70:
         raise ValueError("The recording is silent or too short to sing.")
     timing["decode_s"] = round(time.monotonic() - began, 1)
     opts = req["options"]
+    extra = {**EXTRA_DEFAULTS, **(req.get("extra") or {})}
     song = req["mode"] == "song"
     began = time.monotonic()
-    sep = separate(mix, work, opts, runner, progress, notes) if song else None
+    sep = separate(mix, work, opts, runner, progress, notes, extra["dereverb_strength"]) if song else None
     voice = sep["lead_dry"] if song else mix.mean(1).astype(np.float32)
     timing["separate_s"] = round(time.monotonic() - began, 1)
     if rms_db(voice) < -60:
         raise ValueError("No singing was found in this recording.")
+    cleaned = None
+    if extra["denoise"] > 0:
+        began = time.monotonic()
+        voice, cleaned = denoise(voice, work, runner, extra["denoise"], progress, notes)
+        timing["denoise_s"] = round(time.monotonic() - began, 1)
     pitch = choose_pitch(req, voice)
+    # the key: a voice moved by anything but whole octaves is in a new key, and the music either follows it or is left behind
+    move = key_shift(pitch["shift"]) if song else 0
+    pitch["transposed_song"], pitch["song_shift"] = False, 0
+    if move and not req.get("transpose_song"):
+        notes.append(f"The voice was moved {abs(pitch['shift'])} semitone{'' if abs(pitch['shift']) == 1 else 's'} "
+                     f"{'up' if pitch['shift'] > 0 else 'down'} and the music was not, so the voice may be out of key with the music.")
+        move = 0
+    elif move and not va.has_rubberband():
+        notes.append("This worker could not move the music to the new key, so the voice may be out of key with the music.")
+        move = 0
     progress("Singing it in your voice")
     began = time.monotonic()
-    src, conv_path = os.path.join(work, "voice_in.wav"), os.path.join(work, "voice_out.wav")
-    va.encode(src, voice, SR, bits=32)
-    ok, secs = runner.rvc_convert(model_path, index_path, src, conv_path, pitch["shift"], opts)
-    if not ok or not os.path.exists(conv_path):
-        print(f"RVC failed\n{log_tail(runner.log_path)}", flush=True)
-        raise RuntimeError("RVC conversion failed")
+    conv, placed, secs = resing(runner, model_path, index_path, voice, work, "voice", pitch["shift"], opts)
     timing["convert_s"] = round(time.monotonic() - began, 1)
+    backing_mode = extra["backing"]
+    backing = sep["backing"] if song else None
+    backing_info = {"mode": backing_mode, "status": "none" if backing is None else {"keep": "kept", "remove": "left out"}.get(backing_mode)}
+    backing_conv = None
+    if backing_mode != "keep" and backing is None:
+        notes.append("The backing vocals setting had no effect, because the lead singer was not split from the backing vocals."
+                     if song else "The backing vocals setting only applies to a song with music.")
+    elif backing_mode == "convert" and rms_db(backing) < -60:
+        backing_info["status"] = "kept"
+        notes.append("There were no backing vocals to speak of, so none were re-sung.")
+    elif backing_mode == "convert":
+        progress("Singing the backing vocals in your voice")
+        began_b = time.monotonic()
+        back_in = backing.mean(1).astype(np.float32)
+        backing_conv, back_placed, back_secs = resing(runner, model_path, index_path, back_in, work, "backing", pitch["shift"], opts)
+        if extra["formant"]:
+            backing_conv = va.formant_shift(backing_conv, SR, extra["formant"])
+        # exactly as loud as the backing it replaces (the same voice on both sides against the stereo original)
+        l_ref, l_conv = lufs(backing), lufs(np.repeat(backing_conv[:, None], 2, axis=1))
+        bgain = float(np.clip(l_ref - l_conv, -20, 20)) if (l_ref is not None and l_conv is not None) else 0.0
+        backing_conv = (backing_conv * 10 ** (bgain / 20)).astype(np.float32)
+        backing_info.update({"status": "converted", "gain_db": round(bgain, 2), "rvc_s": back_secs, **back_placed})
+        timing["convert_backing_s"] = round(time.monotonic() - began_b, 1)
     want_fx = req.get("vocal_fx", "none") != "none"
     if not want_fx:
         progress("Putting the song back together" if song else "Finishing your vocal")
     began = time.monotonic()
     n = len(voice)
-    conv = va.decode(conv_path, sr=SR, channels=1)[0][:, 0]
-    lag, peak = va.align_lag(voice, conv, SR, max_ms=300)
-    conv = va.shift_fit(conv, lag, n)[:, 0]
+    if extra["formant"]:
+        began_f = time.monotonic()
+        conv = va.formant_shift(conv, SR, extra["formant"])
+        placed["formant_st"] = extra["formant"]
+        timing["formant_s"] = round(time.monotonic() - began_f, 1)
     l_ref, l_conv = lufs(voice), lufs(conv)
     vgain = float(np.clip(l_ref - l_conv, -20, 20)) if (l_ref is not None and l_conv is not None) else 0.0
     conv = (conv * 10 ** (vgain / 20)).astype(np.float32)
-    placed = {"lag_ms": round(1000 * lag / SR, 1), "align_peak": round(peak, 3), "vocal_gain_db": round(vgain, 2)}
+    placed["vocal_gain_db"] = round(vgain, 2)
     if opts["soft_s"]:
         began_s = time.monotonic()
         conv, placed["soft_s"] = va.unvoiced_blend(conv, voice, SR)
@@ -326,6 +438,7 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
         fx_report["master"] = finish(fx, files["vocal_fx.mp3"], files["vocal_fx.wav"], None)
         timing["vocal_fx_s"] = round(time.monotonic() - began_fx, 1)
         progress("Putting the song back together" if song else "Finishing your vocal")
+    stems = None
     if song:
         vocal = np.repeat(conv[:, None], 2, axis=1) if fx is None else fx[:n]
         ratio = sep["reverb_ratio_db"]
@@ -338,11 +451,32 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
             if e_w > 0 and e_c > 0:
                 vocal = vocal + wet * np.float32(np.sqrt(e_c / e_w * 10 ** (wet_db / 10)))
                 placed["room_db"] = wet_db
-        if sep["backing"] is not None:
-            vocal = vocal + sep["backing"]
+        band = sep["band"]
+        if move:
+            began_k = time.monotonic()
+            band = va.transpose(band, SR, move)
+            if backing is not None and backing_conv is None:  # kept or left out: either way the stem matches the new key
+                backing = va.transpose(backing, SR, move, voice=True)
+            pitch["transposed_song"], pitch["song_shift"] = True, move
+            timing["transpose_s"] = round(time.monotonic() - began_k, 1)
+        if backing_conv is not None:
+            vocal = vocal + backing_conv[:, None]
+        elif backing is not None and backing_mode != "remove":
+            vocal = vocal + backing
         target = lufs(mix)
         target = None if target is None else float(np.clip(target, -23, -9))
-        mix_master = finish(sep["band"] + vocal, files["mix.mp3"], files["mix.wav"], target)
+        mix_master = finish(band + vocal, files["mix.mp3"], files["mix.wav"], target)
+        # the stems, each with the mix's own master gain, so they sit at the level they have in the song
+        began_st = time.monotonic()
+        gain = np.float32(10 ** (mix_master["gain_db"] / 20))
+        parts = {"instrumental": band, "lead_original": voice}
+        if backing is not None:
+            parts["backing"] = backing if backing_conv is None else backing_conv
+        stems = {"gain_db": mix_master["gain_db"]}
+        for name, x in parts.items():
+            files[f"{name}.mp3"], files[f"{name}.wav"] = os.path.join(work, f"{name}.mp3"), os.path.join(work, f"{name}.wav")
+            stems[name] = finish(x * gain, files[f"{name}.mp3"], files[f"{name}.wav"], None)
+        timing["stems_s"] = round(time.monotonic() - began_st, 1)
     elif fx is not None:  # vocal mode with an effect: the effected voice is the result, the dry one stays beside it
         files["mix.mp3"], files["mix.wav"] = files["vocal_fx.mp3"], files["vocal_fx.wav"]
         mix_master = fx_report["master"]
@@ -353,7 +487,8 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
     report = {
         "mode": req["mode"], "seconds": round(seconds, 2), "pitch": pitch, "placed": placed,
         "separation": sep["info"] if song else None, "master": mix_master, "vocal_master": vocal_master, "vocal_fx": fx_report,
-        "settings": {**opts, "index_used": bool(index_path and opts["index_rate"] > 0), "rvc_s": secs},
+        "settings": {**opts, **extra, "index_used": bool(index_path and opts["index_rate"] > 0), "rvc_s": secs},
+        "backing": backing_info, "denoise": cleaned, "stems": stems,
         "notes": notes, "timing": timing,
     }
     with open(os.path.join(work, "report.json"), "w", encoding="utf-8", newline="\n") as f:
