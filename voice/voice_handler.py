@@ -29,7 +29,7 @@ import voice_request  # noqa: E402
 import voice_train  # noqa: E402
 
 FEATURES = ["song", "vocal", "auto-octave", "extractors", "lead-split", "lead-models", "dereverb", "room", "soft-s", "model-cache",
-            "vocal-fx", "stems", "backing-modes", "formant", "dereverb-strength", "denoise", "pitch-fit", "transpose", "train"]
+            "vocal-fx", "stems", "backing-modes", "formant", "dereverb-strength", "denoise", "pitch-fit", "transpose", "train", "auto-mix"]
 PRESIGN_S = 7 * 24 * 3600
 GPU = {}
 STEMS = ("instrumental", "backing", "lead_original")

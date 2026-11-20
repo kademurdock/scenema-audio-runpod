@@ -903,7 +903,7 @@ class HandlerTests(Base):
                                  "instrumental.wav", "backing.mp3", "backing.wav", "lead_original.mp3", "lead_original.wav"]))
         self.assertEqual((out["key"], out["vocal_key"]), ("voice/testjob0003/mix.mp3", "voice/testjob0003/vocal.mp3"))  # as before
         self.assertEqual(out["pitch"]["transposed_song"], False)
-        for name in ("stems", "backing-modes", "formant", "dereverb-strength", "denoise", "pitch-fit", "transpose", "train"):
+        for name in ("stems", "backing-modes", "formant", "dereverb-strength", "denoise", "pitch-fit", "transpose", "train", "auto-mix"):
             self.assertIn(name, out["features"])
         self.assertEqual({k: out["settings"][k] for k in voice_request.EXTRA_DEFAULTS}, voice_request.EXTRA_DEFAULTS)
 
