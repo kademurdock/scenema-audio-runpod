@@ -23,7 +23,11 @@ Outputs (in the work folder): mix.mp3 + mix.wav (24-bit) and vocal.mp3 + vocal.w
 vocal effect also vocal_fx.mp3 + vocal_fx.wav (24-bit stereo, the effected voice with its tail; in vocal mode it is the mix).
 With vocal_fx "none" every audio file is byte for byte what the worker made before vocal effects existed.
 
-Nov 2026, each off unless asked for (voice_request.EXTRA_DEFAULTS), so a request without them makes the same mix and vocal files:
+Nov 2026, each off unless asked for (voice_request.EXTRA_DEFAULTS), so a request without them (and with auto_mix off) makes the
+same mix and vocal files:
+  auto_mix           ON by default (Nov 19 2026): step 6b rides the converted lead to the original singer phrase by phrase
+                     (va.ride), quiets it between phrases and tilts its tone toward the original (va.tone_match, one octave);
+                     step 8 EQs the finished song toward the original song's tonal balance (a third of an octave, +-4 dB)
   dereverb_strength  step 3 takes only that share of the room off: the lead that is re-sung is lead*(1-s) + dry*s, and the
                      remembered reverb ratio (so the room put back in step 7) shrinks with it
   denoise            after step 3 (and in vocal mode): the denoise model's clean voice, blended in by the amount asked for
@@ -423,6 +427,18 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
     vgain = float(np.clip(l_ref - l_conv, -20, 20)) if (l_ref is not None and l_conv is not None) else 0.0
     conv = (conv * 10 ** (vgain / 20)).astype(np.float32)
     placed["vocal_gain_db"] = round(vgain, 2)
+    auto_mix = None
+    if extra["auto_mix"]:
+        # 6b (Nov 19 2026): the voice rides the original singer phrase by phrase and goes quiet in the gaps, its tone is
+        # tilted toward the original's (a whole octave of smoothing: brightness and warmth, never the singer's formants),
+        # and its song-wide loudness is set again so the level matched above stays
+        began_a = time.monotonic()
+        conv, auto_mix = va.ride(conv, voice, SR)
+        conv, auto_mix["vocal_eq"] = va.tone_match(conv, voice, SR, strength=0.6, max_db=6.0, octave=1.0)
+        l_conv = lufs(conv)
+        regain = float(np.clip(l_ref - l_conv, -12, 12)) if (l_ref is not None and l_conv is not None) else 0.0
+        conv = (conv * 10 ** (regain / 20)).astype(np.float32)
+        timing["auto_mix_s"] = round(time.monotonic() - began_a, 1)
     if opts["soft_s"]:
         began_s = time.monotonic()
         conv, placed["soft_s"] = va.unvoiced_blend(conv, voice, SR)
@@ -465,7 +481,14 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
             vocal = vocal + backing
         target = lufs(mix)
         target = None if target is None else float(np.clip(target, -23, -9))
-        mix_master = finish(band + vocal, files["mix.mp3"], files["mix.wav"], target)
+        song_out = band + vocal
+        if auto_mix is not None:
+            # 8 (auto mix): the finished song EQ'd toward the original song's tonal balance (a third of an octave of
+            # smoothing, at most 4 dB either way), so the mud and dullness a rebuilt mix gains are taken back out
+            began_m = time.monotonic()
+            song_out, auto_mix["mix_eq"] = va.tone_match(song_out, mix, SR, strength=0.7, max_db=4.0, octave=1 / 3)
+            timing["auto_mix_s"] = round(timing.get("auto_mix_s", 0) + time.monotonic() - began_m, 1)
+        mix_master = finish(song_out, files["mix.mp3"], files["mix.wav"], target)
         # the stems, each with the mix's own master gain, so they sit at the level they have in the song
         began_st = time.monotonic()
         gain = np.float32(10 ** (mix_master["gain_db"] / 20))
@@ -488,7 +511,7 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
         "mode": req["mode"], "seconds": round(seconds, 2), "pitch": pitch, "placed": placed,
         "separation": sep["info"] if song else None, "master": mix_master, "vocal_master": vocal_master, "vocal_fx": fx_report,
         "settings": {**opts, **extra, "index_used": bool(index_path and opts["index_rate"] > 0), "rvc_s": secs},
-        "backing": backing_info, "denoise": cleaned, "stems": stems,
+        "backing": backing_info, "denoise": cleaned, "stems": stems, "auto_mix": auto_mix,
         "notes": notes, "timing": timing,
     }
     with open(os.path.join(work, "report.json"), "w", encoding="utf-8", newline="\n") as f:

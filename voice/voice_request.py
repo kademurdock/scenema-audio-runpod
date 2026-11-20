@@ -65,13 +65,17 @@ DEFAULTS = {
     "f0_method": "rmvpe",
 }
 # The Nov 2026 options. They arrive inside "options" like the others, but parse() hands them back on their own as "extra", so
-# "options" stays the eleven settings above for anything that reads it. Every default here does nothing at all: with none of
-# them set, each audio file is byte for byte what the worker made before they existed.
+# "options" stays the eleven settings above for anything that reads it. Every default here but auto_mix does nothing at all:
+# with none of them set and auto_mix off, each audio file is byte for byte what the worker made before they existed.
 #   dereverb_strength  0..1, only with dereverb on: how much of the room comes off the lead before it is re-sung (1: all of it)
 #   denoise            0..1: how much hiss and background noise comes off the voice before it is re-sung (DENOISE_MODEL)
 #   backing            "keep" (backing vocals left as sung), "convert" (re-sung in the voice too) or "remove" (left out)
 #   formant            -6..6 semitones: the converted voice's timbre, darker and bigger below 0, brighter and smaller above
-EXTRA_DEFAULTS = {"dereverb_strength": 1.0, "denoise": 0.0, "backing": "keep", "formant": 0.0}
+#   auto_mix           on by default since Nov 19 2026 (the one default that changes the sound; off gives the files made
+#                      before it): the re-sung voice rides the original singer's level phrase by phrase and is quieted
+#                      between phrases, its tone is tilted toward the original's, and in song mode the finished mix is EQ'd
+#                      toward the original song's tonal balance before its loudness is matched (voice_pipeline step 6b/8)
+EXTRA_DEFAULTS = {"dereverb_strength": 1.0, "denoise": 0.0, "backing": "keep", "formant": 0.0, "auto_mix": True}
 BACKING_MODES = ("keep", "convert", "remove")
 # aufr33's Mel-band RoFormer denoiser, from the same pinned pymss catalog as the separators; its "dry" stem is the clean voice.
 DENOISE_MODEL = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"
@@ -284,6 +288,7 @@ def parse(raw, resolve=True):
         "denoise": _number(options, "denoise", 0, 1, "Noise cleanup", EXTRA_DEFAULTS),
         "backing": backing,
         "formant": _number(options, "formant", -6, 6, "Voice character (formant)", EXTRA_DEFAULTS),
+        "auto_mix": _flag(options, "auto_mix", EXTRA_DEFAULTS),
     }
     vocal_fx = raw.get("vocal_fx")
     vocal_fx = "none" if vocal_fx is None else (vocal_fx.strip().lower() if isinstance(vocal_fx, str) else vocal_fx)

@@ -588,6 +588,88 @@ def active_seconds(x, sr):
     return float(mask.sum()) * b / sr
 
 
+# ---------------------------------------------------------------- auto mix (Nov 19 2026)
+def _block_db(m, b):
+    n = len(m) // b
+    return 10 * np.log10((m[:n * b].reshape(n, b).astype(np.float64) ** 2).mean(1) + 1e-12), n
+
+
+def ride(x, ref, sr, block_ms=50.0, smooth_ms=400.0, max_db=6.0, duck_db=-12.0):
+    """Phrase by phrase, mono x follows the loudness of mono ref (the voice it replaces): where ref sings, x gets the gain that
+    brings its smoothed level to ref's (centred on the median, so the song-wide level set before stays, and clipped to
+    +-max_db); where ref is silent (between phrases), x goes down by duck_db, which takes out the hiss, bleed and smear a
+    re-sung voice leaves in the gaps. The gain curve is smoothed and interpolated, so it rides, never chops.
+    -> (x with the ride, {"ride_db_p10", "ride_db_p90", "ducked_share"})."""
+    x = np.asarray(x, np.float32)
+    ref = as2d(ref).mean(1)
+    b = max(1, int(round(sr * block_ms / 1000)))
+    k = max(1, int(round(smooth_ms / block_ms)))
+    dx, n = _block_db(x, b)
+    dr, n2 = _block_db(ref, b)
+    n = min(n, n2)
+    if n < 8:
+        return x, {"ride_db_p10": 0.0, "ride_db_p90": 0.0, "ducked_share": 0.0}
+    dx, dr = dx[:n], dr[:n]
+    sx = 10 * np.log10(_smooth(10 ** (dx / 10), k) + 1e-12)
+    sr_ = 10 * np.log10(_smooth(10 ** (dr / 10), k) + 1e-12)
+    active = dr > max(-55.0, float(np.percentile(dr, 95)) - 40.0)
+    active = _movmax(active.astype(np.float64), 3) > 0  # keep the edges of each phrase (onsets, tails)
+    g = np.where(active, sr_ - sx, duck_db)
+    if active.any():
+        g[active] -= float(np.median(g[active]))
+        g[active] = np.clip(g[active], -max_db, max_db)
+    g = _smooth(g, 3)
+    centres = (np.arange(n) + 0.5) * b
+    gs = np.interp(np.arange(len(x)), centres, g).astype(np.float32)
+    y = x * np.power(10.0, gs / 20).astype(np.float32)
+    act = g[active] if active.any() else np.zeros(1)
+    return y.astype(np.float32), {"ride_db_p10": round(float(np.percentile(act, 10)), 2), "ride_db_p90": round(float(np.percentile(act, 90)), 2),
+                                  "ducked_share": round(float(1 - active.mean()), 3)}
+
+
+def _long_spectrum(x, n_fft):
+    S = stft(x, n_fft=n_fft, hop=n_fft // 2)
+    p = (np.abs(S) ** 2).astype(np.float64)
+    e = p.sum(1)
+    if not len(e) or e.max() <= 0:
+        return None
+    keep = e > e.max() * 1e-3  # frames within 30 dB of the loudest: the sound, not the silences
+    return p[keep].mean(0)
+
+
+def tone_match(x, ref, sr, strength=0.5, max_db=6.0, octave=1 / 3, lo=50.0, hi=16000.0, n_fft=4096):
+    """x (mono or stereo) EQ'd toward ref's long-term tonal balance: the difference of their average spectra, smoothed over
+    `octave` of each frequency (a whole octave fixes only the tilt, dull or bright; a third also the broad bands), with the
+    overall level difference taken out, scaled by strength, clipped to +-max_db and faded to nothing outside lo..hi (so a
+    band x does not have is never boosted from noise). Zero-phase, applied on the STFT. -> (y, {"eq_db_min", "eq_db_max"})."""
+    x2, r = as2d(x), as2d(ref).mean(1)
+    px, pr = _long_spectrum(x2.mean(1), n_fft), _long_spectrum(r, n_fft)
+    if px is None or pr is None:
+        return np.asarray(x, np.float32), {"eq_db_min": 0.0, "eq_db_max": 0.0}
+    f = np.arange(n_fft // 2 + 1) * sr / n_fft
+    cx, cd = np.concatenate([[0.0], np.cumsum(px)]), np.concatenate([[0.0], np.cumsum(pr)])
+    half = 2 ** (octave / 2)
+    lo_i = np.clip(np.searchsorted(f, f / half), 0, len(f) - 1)
+    hi_i = np.clip(np.searchsorted(f, f * half, side="right"), 1, len(f))
+    hi_i = np.maximum(hi_i, lo_i + 1)
+    d = _db((cd[hi_i] - cd[lo_i]) / (hi_i - lo_i)) - _db((cx[hi_i] - cx[lo_i]) / (hi_i - lo_i))
+    band = (f >= lo) & (f <= hi)
+    w = px[band] / px[band].sum()
+    d = d - float((d[band] * w).sum())  # the tone, not the level
+    fade = np.clip(np.minimum((f - lo / 2) / (lo / 2), (hi * 1.2 - f) / (hi * 0.2)), 0, 1)
+    curve = np.clip(d * strength, -max_db, max_db) * fade
+    gain = np.power(10.0, curve / 20).astype(np.float32)
+    # the same tone on 2048-point frames: the curve read off at those bins
+    f2 = np.arange(2048 // 2 + 1) * sr / 2048
+    g2 = np.interp(f2, f, gain).astype(np.float32)
+    out = np.empty_like(x2)
+    for c in range(x2.shape[1]):
+        out[:, c] = istft(stft(x2[:, c]) * g2[None, :], len(x2))
+    y = out if np.asarray(x).ndim == 2 else out[:, 0]
+    inside = curve[band]
+    return y.astype(np.float32), {"eq_db_min": round(float(inside.min()), 2), "eq_db_max": round(float(inside.max()), 2)}
+
+
 def master(path, x, sr, target_lufs=-16.0, ceiling_db=-1.0):
     """The one listening path: gain to target_lufs, peak-limit to ceiling_db, write (mp3/flac/wav). Returns the measurements."""
     before = measure(x, sr)

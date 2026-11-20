@@ -913,14 +913,16 @@ class NewRequestTests(unittest.TestCase):
 
     def test_defaults_do_nothing(self):
         r = request()
-        self.assertEqual(r["extra"], {"dereverb_strength": 1.0, "denoise": 0.0, "backing": "keep", "formant": 0.0})
+        self.assertEqual(r["extra"], {"dereverb_strength": 1.0, "denoise": 0.0, "backing": "keep", "formant": 0.0, "auto_mix": True})
         self.assertEqual(r["extra"], voice_request.EXTRA_DEFAULTS)
         self.assertIs(r["transpose_song"], False)
         self.assertEqual(sorted(r["options"]), sorted(voice_request.DEFAULTS))  # "options" is still the eleven settings
 
     def test_each_new_option(self):
         r = request(options={"dereverb": True, "dereverb_strength": 0.4, "denoise": 0.5, "backing": "convert", "formant": -3})
-        self.assertEqual(r["extra"], {"dereverb_strength": 0.4, "denoise": 0.5, "backing": "convert", "formant": -3.0})
+        self.assertEqual(r["extra"], {"dereverb_strength": 0.4, "denoise": 0.5, "backing": "convert", "formant": -3.0, "auto_mix": True})
+        self.assertIs(request(options={"auto_mix": False})["extra"]["auto_mix"], False)
+        self.assertIs(request(options={"auto_mix": "off"})["extra"]["auto_mix"], False)
         self.assertEqual(request(options={"backing": "remove"})["extra"]["backing"], "remove")
         self.assertEqual(request(options={"formant": 6})["extra"]["formant"], 6.0)
         self.assertEqual((request(pitch="fit")["pitch"], request(pitch="fit")["transpose_song"]), ("fit", True))
@@ -941,6 +943,36 @@ class NewRequestTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             request(options={"backing": "mute"})
         self.assertEqual(caught.exception.args[0], "Backing vocals must be keep, convert or remove.")
+
+
+class AutoMixTests(unittest.TestCase):
+    """Nov 19 2026: the re-sung voice rides the original singer, goes quiet in the gaps, and the tone moves toward the original."""
+
+    def test_ride_evens_phrases_to_the_reference_and_ducks_the_gaps(self):
+        t = np.arange(SR * 6) / SR
+        tone = np.sin(2 * np.pi * 220 * t).astype(np.float32)
+        ref = tone * np.where(t < 2, 0.5, np.where(t < 3, 0.0, 0.5)).astype(np.float32)        # even phrases, a gap
+        x = tone * np.where(t < 2, 0.8, np.where(t < 3, 0.02, 0.2)).astype(np.float32)         # loud, smear, soft
+        y, info = va.ride(x, ref, SR)
+        a, b = voice_pipeline.rms_db(y[int(0.5 * SR):int(1.5 * SR)]), voice_pipeline.rms_db(y[int(4 * SR):int(5.5 * SR)])
+        before = voice_pipeline.rms_db(x[int(0.5 * SR):int(1.5 * SR)]) - voice_pipeline.rms_db(x[int(4 * SR):int(5.5 * SR)])
+        self.assertLessEqual(abs(a - b), before - 5.5)  # 12 dB apart before; the ride closes at least 6 of it (its clip)
+        gap = voice_pipeline.rms_db(y[int(2.3 * SR):int(2.7 * SR)]) - voice_pipeline.rms_db(x[int(2.3 * SR):int(2.7 * SR)])
+        self.assertLess(gap, -10)                       # the smear between phrases goes down
+        self.assertGreater(info["ducked_share"], 0.05)
+
+    def test_tone_match_brightens_a_dull_copy_and_keeps_its_level(self):
+        rng = np.random.default_rng(3)
+        bright = rng.standard_normal(SR * 4).astype(np.float32) * 0.1
+        k = np.ones(16, np.float32) / 16
+        dull = np.convolve(bright, k, mode="same").astype(np.float32)                         # the top end mostly gone
+        y, info = va.tone_match(dull, bright, SR, strength=1.0, max_db=6.0, octave=1.0)
+        hi = lambda s: va._db((np.abs(np.fft.rfft(s))[len(s) // 8:len(s) // 6] ** 2).mean())  # 5.5-7.4 kHz
+        self.assertGreater(hi(y) - hi(dull), 3)
+        self.assertLessEqual(info["eq_db_max"], 6.0)
+        self.assertLess(abs(voice_pipeline.rms_db(y) - voice_pipeline.rms_db(dull)), 3)
+        z, _ = va.tone_match(bright, bright, SR)
+        self.assertLess(float(np.abs(z - bright).max()), 1e-3)                                   # nothing to change: unchanged
 
 
 def train_request(**over):
@@ -1158,6 +1190,20 @@ class NewPipelineTests(Base):
         self.assertLess(float(np.abs(lead - g * voice_in).max()), 2e-3)  # exactly what RVC was given
         for stem in ("instrumental", "backing", "lead_original"):
             self.assertTrue(os.path.getsize(plain["files"][f"{stem}.mp3"]) > 1000, stem)
+
+    def test_auto_mix_is_on_by_default_and_off_leaves_it_out(self):
+        song = self.song_file()
+        on, said = self.run_job(request(), audio=song)
+        off, _ = self.run_job(request(options={"auto_mix": False}), audio=song)
+        self.assertIsNone(off["report"]["auto_mix"])
+        a = on["report"]["auto_mix"]
+        self.assertEqual(sorted(a), ["ducked_share", "mix_eq", "ride_db_p10", "ride_db_p90", "vocal_eq"])
+        self.assertNotIn("Mixing", " ".join(said))  # no new spoken step
+        with open(on["files"]["mix.wav"], "rb") as x, open(off["files"]["mix.wav"], "rb") as y:
+            self.assertNotEqual(x.read(), y.read())
+        # the song-wide level still matches the original's in both
+        self.assertAlmostEqual(on["report"]["master"]["in_lufs"] + on["report"]["master"]["gain_db"],
+                               off["report"]["master"]["in_lufs"] + off["report"]["master"]["gain_db"], delta=0.05)
 
     def test_vocal_mode_has_no_stems(self):
         out, _ = self.run_job(request(mode="vocal"), index=False)
