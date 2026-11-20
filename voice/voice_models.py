@@ -31,7 +31,7 @@ def sha256_file(path):
 
 
 def _prune(d, keep):
-    files = sorted((p for p in d.iterdir() if p.is_file() and p.suffix in (".pth", ".index")), key=lambda p: p.stat().st_mtime,
+    files = sorted((p for p in d.iterdir() if p.is_file() and p.suffix in (".pth", ".index", ".wav", ".mp3", ".flac", ".m4a", ".ogg")), key=lambda p: p.stat().st_mtime,
                    reverse=True)
     for p in files[keep:]:
         try:

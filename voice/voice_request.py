@@ -19,6 +19,13 @@ Input (RunPod job "input"):
   vocal_fx      optional studio effect on the converted lead (vocalfx.py): "none" (the default: output exactly as before),
                 "studio", "plate", "hall", "slapback", "echo" or "dreamy"; the dry vocal files stay dry either way
   output_prefix optional "voice/<8-64 letters, digits, - or _>"; default voice/<random>
+  engine        "rvc" (the default: a trained RVC voice, model_key above) or, since Nov 20 2026, "seedvc": Seed-VC re-sings the
+                lead in the voice of a short reference recording, with no training. It is the engine for TALKING voices (a voice
+                heard only speaking: an Inworld voice, a spoken sample); in the Nov 19 talk test it sang a speaking voice far more
+                naturally than an RVC voice trained on the same speech. Its fields:
+  reference_key  the voice's reference recording (wav, mp3, flac, m4a or ogg; the first 25 s are used), under
+                voice-models/<owner>/ or voice-refs/<owner>/; model_key and index_key are not used
+  reference_sha256  optional, as model_sha256
 Nothing here names a person: the owner is whatever the caller's registry put in the model key."""
 import ipaddress
 import os
@@ -100,6 +107,11 @@ MIN_TRAIN_SECONDS = 60
 MAX_TRAIN_SECONDS = 60 * 60
 EPOCHS_MIN, EPOCHS_MAX = 20, 600
 TRAIN_DEFAULTS = {"epochs": "auto", "isolate": False, "denoise": 0.0, "dereverb": False}
+# Seed-VC (engine "seedvc"): the settings the Nov 19 2026 talk test used (inference.py of Plachtaa/seed-vc @ 51383ef, the 44 kHz
+# singing model with pitch conditioning, no automatic pitch match: the octave rule here picks the octave instead).
+ENGINES = ("rvc", "seedvc")
+SEEDVC = {"diffusion_steps": 50, "cfg_rate": 0.7}
+REF_KEY_RE = re.compile(r"^voice-(?:models|refs)/([A-Za-z0-9_-]{1,64})/[A-Za-z0-9._/-]{1,512}\.(?:wav|mp3|flac|m4a|ogg)$")
 
 
 def _audio_prefixes():
@@ -230,10 +242,16 @@ def parse(raw, resolve=True):
             raise ValueError("The recording is not a file this worker can read.")
     else:
         audio_url = check_url(raw["audio_url"], resolve=resolve)
-    model_key = _key(raw.get("model_key"), MODEL_KEY_RE, "voice model")
-    owner = MODEL_KEY_RE.match(model_key).group(1)
-    index_key = None
-    if raw.get("index_key") is not None:
+    engine = raw.get("engine", "rvc")
+    if engine not in ENGINES:
+        raise ValueError("Choose the rvc or seedvc voice engine.")
+    model_key = index_key = reference_key = None
+    if engine == "seedvc":
+        reference_key = _key(raw.get("reference_key"), REF_KEY_RE, "voice reference recording")
+    else:
+        model_key = _key(raw.get("model_key"), MODEL_KEY_RE, "voice model")
+        owner = MODEL_KEY_RE.match(model_key).group(1)
+    if engine == "rvc" and raw.get("index_key") is not None:
         index_key = _key(raw["index_key"], INDEX_KEY_RE, "voice index")
         if INDEX_KEY_RE.match(index_key).group(1) != owner:
             raise ValueError("The voice index belongs to a different voice model.")
@@ -299,10 +317,13 @@ def parse(raw, resolve=True):
         raise ValueError("The output folder name is not allowed.")
     return {
         "mode": mode,
+        "engine": engine,
         "audio_key": audio_key,
         "audio_url": audio_url,
         "model_key": model_key,
-        "model_sha256": _sha(raw.get("model_sha256"), "voice model"),
+        "model_sha256": _sha(raw.get("model_sha256"), "voice model") if model_key else None,
+        "reference_key": reference_key,
+        "reference_sha256": _sha(raw.get("reference_sha256"), "voice reference") if reference_key else None,
         "index_key": index_key,
         "index_sha256": _sha(raw.get("index_sha256"), "voice index") if index_key else None,
         "pitch": pitch,

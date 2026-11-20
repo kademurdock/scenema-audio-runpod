@@ -30,6 +30,20 @@ RUN printf 'torch==2.7.1\ntorchaudio==2.7.1\n' > /tmp/constraints-rvc.txt \
 # transpose_song moves the band and the backing vocals to the voice's new key with ffmpeg's rubberband filter: no filter, no image.
 RUN ffmpeg -hide_banner -filters 2>/dev/null | grep -q ' rubberband ' \
  || (echo 'This ffmpeg has no rubberband filter: transpose_song cannot work. Install an ffmpeg built with librubberband.' >&2; exit 1)
+# Engine "seedvc" (Nov 20 2026), for talking voices: Seed-VC @ 51383ef (GPL-3.0, upstream archived), run as its own program in its
+# own venv (Python 3.10, torch 2.4.0 cu121: Seed-VC's pins). seedvc_fetch.py bakes every weight it loads into /opt/seedvc/checkpoints
+# and converts four seconds on the CPU, offline, so a broken engine fails the build instead of a paid job.
+ARG SEEDVC_COMMIT=51383efd921027683c89e5348211d93ff12ac2a8
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN git init -q /opt/seedvc && git -C /opt/seedvc remote add origin https://github.com/Plachtaa/seed-vc.git \
+ && git -C /opt/seedvc fetch -q --depth 1 origin "$SEEDVC_COMMIT" && git -C /opt/seedvc checkout -q FETCH_HEAD \
+ && test "$(git -C /opt/seedvc rev-parse HEAD)" = "$SEEDVC_COMMIT" && rm -rf /opt/seedvc/.git
+COPY voice/requirements-seedvc.txt /opt/voice/requirements-seedvc.txt
+RUN uv venv -q --python 3.10 --python-preference only-managed /opt/seedvc-venv \
+ && uv pip install -q --python /opt/seedvc-venv/bin/python -r /opt/voice/requirements-seedvc.txt \
+ && /opt/seedvc-venv/bin/python -c "import torch, torchaudio, dac, librosa, transformers, munch; assert torch.__version__.startswith('2.4.0'), torch.__version__; print('seedvc venv', torch.__version__, 'archs', torch.cuda.get_arch_list())"
+COPY voice/seedvc_run.py voice/seedvc_fetch.py /opt/voice/
+RUN cd /opt/seedvc && PYTHONPATH=/opt/seedvc /opt/seedvc-venv/bin/python /opt/voice/seedvc_fetch.py
 COPY voice/voice_request.py voice/fetch_base_models.py /opt/voice/
 RUN /opt/rvc-venv/bin/python /opt/voice/fetch_base_models.py
 COPY voice/selftest.py /opt/voice/

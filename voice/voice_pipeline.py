@@ -57,7 +57,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import vocalfx  # noqa: E402
 import vpaudio as va  # noqa: E402
-from voice_request import DENOISE_MODEL, DEREVERB_MODEL, EXTRA_DEFAULTS, EXTRACTORS, LEAD_MODELS, MAX_SECONDS  # noqa: E402
+from voice_request import DENOISE_MODEL, DEREVERB_MODEL, EXTRA_DEFAULTS, EXTRACTORS, LEAD_MODELS, MAX_SECONDS, SEEDVC  # noqa: E402
 
 SR = 44100
 ROOM_RT60 = 1.2
@@ -73,15 +73,18 @@ class Runner:
         self.models = env.get("PYMSS_MODEL_DIR", "/opt/pymss_models")
         self.endpoint = env.get("PYMSS_ENDPOINT", "")
         self.device = env.get("VOICE_DEVICE", "cuda")
+        self.seedvc = env.get("VOICE_SEEDVC_DIR", "/opt/seedvc")
+        self.seedvc_python = env.get("VOICE_SEEDVC_PYTHON", "/opt/seedvc-venv/bin/python")
+        self.seedvc_script = env.get("VOICE_SEEDVC_SCRIPT", os.path.join(HERE, "seedvc_run.py"))
         self.log_path = log_path
 
-    def _run(self, cmd, env, timeout):
+    def _run(self, cmd, env, timeout, cwd=None):
         began = time.monotonic()
         with open(self.log_path, "a", encoding="utf-8", errors="replace") as log:
             log.write(f"\n=== {time.strftime('%H:%M:%S')} {' '.join(map(str, cmd[:6]))}\n")
             log.flush()
             try:
-                r = subprocess.run(list(map(str, cmd)), cwd=self.rvc, env=env, stdout=log, stderr=subprocess.STDOUT,
+                r = subprocess.run(list(map(str, cmd)), cwd=cwd or self.rvc, env=env, stdout=log, stderr=subprocess.STDOUT,
                                    stdin=subprocess.DEVNULL, timeout=timeout)
                 code = r.returncode
             except subprocess.TimeoutExpired:
@@ -107,6 +110,13 @@ class Runner:
         # PYTHONSAFEPATH + PYTHONPATH: the fix the pod needed (a system Python puts infer/ first on sys.path otherwise)
         env = dict(os.environ, PYTHONSAFEPATH="1", PYTHONPATH=self.rvc)
         return self._run(cmd, env, timeout)
+
+    def seedvc_convert(self, reference, src, dst, shift, timeout=1500):
+        """Seed-VC (seedvc_run.py in its own venv, run from the pinned seed-vc folder, weights baked in: no network)."""
+        cmd = [self.seedvc_python, self.seedvc_script, "--ref", reference, "--source", src, "--output", dst, "--shift", int(shift),
+               "--steps", SEEDVC["diffusion_steps"], "--cfg", SEEDVC["cfg_rate"], "--device", self.device]
+        env = dict(os.environ, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", PYTHONPATH=self.seedvc)
+        return self._run(cmd, env, timeout, cwd=self.seedvc)
 
 
 def log_tail(path, n=1500):
@@ -335,24 +345,59 @@ def vocal_effect(conv, name, beat_source):
     return (fx * np.float32(10 ** (gain / 20))).astype(np.float32), report
 
 
-def resing(runner, model_path, index_path, voice, work, name, shift, opts):
-    """One RVC pass: the mono voice written to <name>_in.wav, re-sung, read back and lined up with the voice it replaces
-    (+-300 ms). -> (mono float32 the length of voice, {"lag_ms", "align_peak"}, seconds RVC took)."""
+def talk_range(reference):
+    """Engine seedvc with no voice_range on record: a singing range guessed from how the reference voice SPEAKS. Speech sits low
+    and narrow; the same person sings from about two semitones under their speaking low to about seven over their speaking high,
+    centred about three over their speaking middle. Only the octave rule reads it (a whole octave or nothing), so a rough guess
+    is enough to keep a deep voice from being handed a soprano line. -> {"p05", "p50", "p95"} or None."""
+    stats = va.pitch_stats(va.pitch_track(reference, SR))
+    if stats.get("voiced_frames", 0) < 50:
+        return None
+    low, mid, high = stats["p05"] - 2, stats["p50"] + 3, stats["p95"] + 7
+    low, high = max(30.0, low), min(100.0, high)
+    mid = min(max(mid, low), high)
+    return {"p05": round(low, 2), "p50": round(mid, 2), "p95": round(high, 2)}
+
+
+def resing(runner, model_path, index_path, voice, work, name, shift, opts, reference=None):
+    """One RVC pass (or with reference, one Seed-VC pass in that voice): the mono voice written to <name>_in.wav, re-sung, read
+    back and lined up with the voice it replaces (+-300 ms). -> (mono float32 the length of voice, {"lag_ms", "align_peak"},
+    seconds the conversion took)."""
     src, conv_path = os.path.join(work, f"{name}_in.wav"), os.path.join(work, f"{name}_out.wav")
     va.encode(src, voice, SR, bits=32)
-    ok, secs = runner.rvc_convert(model_path, index_path, src, conv_path, shift, opts)
+    if reference:
+        ok, secs = runner.seedvc_convert(reference, src, conv_path, shift)
+    else:
+        ok, secs = runner.rvc_convert(model_path, index_path, src, conv_path, shift, opts)
     if not ok or not os.path.exists(conv_path):
-        print(f"RVC failed\n{log_tail(runner.log_path)}", flush=True)
-        raise RuntimeError("RVC conversion failed")
+        tool = "Seed-VC" if reference else "RVC"
+        print(f"{tool} failed\n{log_tail(runner.log_path)}", flush=True)
+        raise RuntimeError(f"{tool} conversion failed")
     conv = va.decode(conv_path, sr=SR, channels=1)[0][:, 0]
     lag, peak = va.align_lag(voice, conv, SR, max_ms=300)
     conv = va.shift_fit(conv, lag, len(voice))[:, 0]
     return conv, {"lag_ms": round(1000 * lag / SR, 1), "align_peak": round(peak, 3)}, secs
 
 
-def run(req, audio_path, model_path, index_path, work, runner, progress=lambda text: None):
-    """-> {"files": {name: path}, "report": {...}}. ValueError carries a sentence for the person."""
+def run(req, audio_path, model_path, index_path, work, runner, progress=lambda text: None, reference_path=None):
+    """-> {"files": {name: path}, "report": {...}}. ValueError carries a sentence for the person.
+    Engine "seedvc": model_path and index_path are None and reference_path is the voice's reference recording."""
     notes, timing = [], {}
+    engine = req.get("engine") or "rvc"
+    reference, range_source = None, "record" if req.get("voice_range") else None
+    if engine == "seedvc":
+        if not reference_path:
+            raise RuntimeError("seedvc job without a reference recording")
+        reference = os.path.join(work, "reference.wav")
+        ref_audio = load_input(reference_path, limit_s=25)
+        if len(ref_audio) < 3 * SR or rms_db(ref_audio) < -60:
+            raise ValueError("The voice's reference recording is silent or shorter than three seconds.")
+        va.encode(reference, ref_audio.mean(1).astype(np.float32), SR, bits=32)
+        if not req.get("voice_range"):
+            guessed = talk_range(ref_audio.mean(1).astype(np.float32))
+            if guessed:
+                req = dict(req, voice_range=guessed)
+                range_source = "guessed from the reference"
     began = time.monotonic()
     mix = load_input(audio_path)
     seconds = len(mix) / SR
@@ -388,7 +433,7 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
         move = 0
     progress("Singing it in your voice")
     began = time.monotonic()
-    conv, placed, secs = resing(runner, model_path, index_path, voice, work, "voice", pitch["shift"], opts)
+    conv, placed, secs = resing(runner, model_path, index_path, voice, work, "voice", pitch["shift"], opts, reference)
     timing["convert_s"] = round(time.monotonic() - began, 1)
     backing_mode = extra["backing"]
     backing = sep["backing"] if song else None
@@ -404,7 +449,8 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
         progress("Singing the backing vocals in your voice")
         began_b = time.monotonic()
         back_in = backing.mean(1).astype(np.float32)
-        backing_conv, back_placed, back_secs = resing(runner, model_path, index_path, back_in, work, "backing", pitch["shift"], opts)
+        backing_conv, back_placed, back_secs = resing(runner, model_path, index_path, back_in, work, "backing", pitch["shift"],
+                                                      opts, reference)
         if extra["formant"]:
             backing_conv = va.formant_shift(backing_conv, SR, extra["formant"])
         # exactly as loud as the backing it replaces (the same voice on both sides against the stereo original)
@@ -510,7 +556,9 @@ def run(req, audio_path, model_path, index_path, work, runner, progress=lambda t
     report = {
         "mode": req["mode"], "seconds": round(seconds, 2), "pitch": pitch, "placed": placed,
         "separation": sep["info"] if song else None, "master": mix_master, "vocal_master": vocal_master, "vocal_fx": fx_report,
-        "settings": {**opts, **extra, "index_used": bool(index_path and opts["index_rate"] > 0), "rvc_s": secs},
+        "settings": {**opts, **extra, "index_used": bool(index_path and opts["index_rate"] > 0), "rvc_s": secs, "engine": engine,
+                     **({"seedvc": dict(SEEDVC), "voice_range": req.get("voice_range"), "range_source": range_source}
+                        if engine == "seedvc" else {})},
         "backing": backing_info, "denoise": cleaned, "stems": stems, "auto_mix": auto_mix,
         "notes": notes, "timing": timing,
     }

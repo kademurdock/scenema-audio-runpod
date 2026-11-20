@@ -9,6 +9,9 @@ Voice models come from the private bucket and are cached on the worker by conten
 A train job reads its recordings from voice-samples/<owner>/<voice_id>/ and writes exactly three files, model.pth, model.index
 and train_report.json, to voice-models/<owner>/<voice_id>/. The recordings and everything made from them on the way stay in the
 job's temp folder and go with it.
+Since Nov 20 2026 a song or vocal job may ask for engine "seedvc" (talking voices): Seed-VC re-sings the lead in the voice of a
+reference recording (reference_key, cached on the worker like a model) instead of an RVC model; everything around it (separation,
+pitch, mix, stems) is the same job.
 A failure answers {"error": sentence}; nothing is retried automatically.
 
 Environment: AWS_ENDPOINT_URL, AWS_REGION, AWS_BUCKET_NAME, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (the private bucket),
@@ -29,7 +32,8 @@ import voice_request  # noqa: E402
 import voice_train  # noqa: E402
 
 FEATURES = ["song", "vocal", "auto-octave", "extractors", "lead-split", "lead-models", "dereverb", "room", "soft-s", "model-cache",
-            "vocal-fx", "stems", "backing-modes", "formant", "dereverb-strength", "denoise", "pitch-fit", "transpose", "train", "auto-mix"]
+            "vocal-fx", "stems", "backing-modes", "formant", "dereverb-strength", "denoise", "pitch-fit", "transpose", "train", "auto-mix",
+            "seedvc"]
 PRESIGN_S = 7 * 24 * 3600
 GPU = {}
 STEMS = ("instrumental", "backing", "lead_original")
@@ -214,8 +218,13 @@ def handler(job):
             fetch_audio(req, client, bucket, audio)
             timing["download_s"] = round(time.monotonic() - began, 1)
             began = time.monotonic()
-            model_path, model_info = voice_models.fetch(client, bucket, req["model_key"], ".pth", req["model_sha256"])
-            index_path, index_info = None, None
+            model_path = model_info = index_path = index_info = reference_path = reference_info = None
+            if req["engine"] == "seedvc":
+                suffix = os.path.splitext(req["reference_key"])[1].lower()
+                reference_path, reference_info = voice_models.fetch(client, bucket, req["reference_key"], suffix,
+                                                                    req["reference_sha256"])
+            else:
+                model_path, model_info = voice_models.fetch(client, bucket, req["model_key"], ".pth", req["model_sha256"])
             if req["index_key"]:
                 index_path, index_info = voice_models.fetch(client, bucket, req["index_key"], ".index", req["index_sha256"])
             timing["models_s"] = round(time.monotonic() - began, 1)
@@ -223,7 +232,8 @@ def handler(job):
             os.makedirs(work)
             runner = voice_pipeline.Runner(os.path.join(td, "tools.log"))
             result = voice_pipeline.run(req, audio, model_path, index_path, work, runner,
-                                        progress=lambda text: runpod.serverless.progress_update(job, text))
+                                        progress=lambda text: runpod.serverless.progress_update(job, text),
+                                        reference_path=reference_path)
             began = time.monotonic()
             prefix = req["output_prefix"]
             uploaded, by_path = {}, {}
@@ -242,7 +252,7 @@ def handler(job):
                                                      ExpiresIn=PRESIGN_S)
             report = result["report"]
             out = {
-                "engine": "rvc", "mode": req["mode"],
+                "engine": req["engine"], "mode": req["mode"],
                 "key": uploaded["mix.mp3"], "url": url("mix.mp3"),
                 "wav_key": uploaded["mix.wav"], "wav_url": url("mix.wav"),
                 "vocal_key": uploaded["vocal.mp3"], "vocal_url": url("vocal.mp3"),
@@ -251,7 +261,9 @@ def handler(job):
                 "duration_s": report["seconds"], "bytes": os.path.getsize(result["files"]["mix.mp3"]),
                 "gpu": gpu.get("name"), "pitch": report["pitch"], "separation": report["separation"],
                 "settings": report["settings"], "worker_notes": report["notes"],
-                "models": {"model_cached": model_info["cached"], "index_cached": index_info["cached"] if index_info else None},
+                "models": {"model_cached": model_info["cached"] if model_info else None,
+                           "index_cached": index_info["cached"] if index_info else None,
+                           **({"reference_cached": reference_info["cached"]} if reference_info else {})},
                 "timing": {**timing, **report["timing"]},
                 "processing_ms": int((time.monotonic() - start) * 1000), "features": FEATURES,
                 "vocal_fx": fx_summary(report.get("vocal_fx")),

@@ -1969,5 +1969,121 @@ class TrainHandlerTests(TrainBase):
         self.assertEqual((self.s3.heads, self.s3.downloads), ([], []))
 
 
+SEEDVC_STANDIN = textwrap.dedent('''
+    """Stand-in for seedvc_run.py: the source 25 ms late and 6 dB quieter, at Seed-VC's 44.1 kHz. FAKE_SEEDVC=fail fails it."""
+    import json, os, sys
+    sys.path.insert(0, os.environ["FAKE_VOICE_DIR"])
+    import numpy as np
+    import vpaudio as va
+    a = sys.argv[1:]
+    opt = {a[i]: a[i + 1] for i in range(0, len(a) - 1, 2)}
+    with open(os.environ["FAKE_LOG"], "a") as f:
+        f.write(json.dumps({"tool": "seedvc", "argv": a, "cwd": os.getcwd(), "offline": os.environ.get("HF_HUB_OFFLINE"),
+                            "PYTHONPATH": os.environ.get("PYTHONPATH")}) + chr(10))
+    if os.environ.get("FAKE_SEEDVC") == "fail":
+        sys.exit(1)
+    x, sr = va.decode(opt["--source"], channels=1)
+    lag = int(0.025 * sr)
+    y = np.concatenate([np.zeros((lag, 1), np.float32), x[:-lag]]) * np.float32(10 ** (-6 / 20))
+    va.encode(opt["--output"], y, sr, bits=32)
+''')
+REF = "voice-refs/inworld/voice-801.wav"
+
+
+def seed_request(**over):
+    raw = {"mode": "vocal", "audio_key": "voice/abcdefgh12/in.wav", "engine": "seedvc", "reference_key": REF, "pitch": "auto"}
+    raw.update(over)
+    return voice_request.parse(raw, resolve=False)
+
+
+class SeedVCTests(Base):
+    """Engine "seedvc" (Nov 20 2026): a talking voice sings through Seed-VC from a reference recording, no RVC model."""
+
+    def runner(self):
+        script = os.path.join(self.td, "seedvc_standin.py")
+        with open(script, "w") as f:
+            f.write(SEEDVC_STANDIN)
+        os.makedirs(os.path.join(self.td, "seedvc"), exist_ok=True)
+        return voice_pipeline.Runner(os.path.join(self.td, "tools.log"), env={
+            "VOICE_RVC_DIR": self.rvc, "VOICE_RVC_PYTHON": sys.executable, "PYMSS_MODEL_DIR": os.path.join(self.td, "models"),
+            "PYMSS_ENDPOINT": "https://models.example/pinned", "VOICE_DEVICE": "cpu", "VOICE_SEEDVC_DIR": os.path.join(self.td, "seedvc"),
+            "VOICE_SEEDVC_PYTHON": sys.executable, "VOICE_SEEDVC_SCRIPT": script})
+
+    def ref_file(self, f0=220.0, seconds=8.0, level=1.0):
+        path = os.path.join(self.td, "ref.wav")
+        va.encode(path, tone_song(seconds=seconds, f0=f0, band_level=0) * np.float32(level), SR, bits=16)
+        return path
+
+    def test_request_contract(self):
+        r = seed_request()
+        self.assertEqual((r["engine"], r["model_key"], r["index_key"], r["reference_key"], r["reference_sha256"]),
+                         ("seedvc", None, None, REF, None))
+        self.assertEqual(seed_request(reference_key="voice-models/u123/abc/reference.mp3")["reference_key"],
+                         "voice-models/u123/abc/reference.mp3")
+        self.assertEqual((request()["engine"], request()["reference_key"]), ("rvc", None))  # RVC requests are as they were
+        for bad in (dict(engine="magic"), dict(reference_key=None), dict(reference_key="voice-models/u1/x.pth"),
+                    dict(reference_key="voice-refs/u1/../x.wav"), dict(reference_key="private/u1/x.wav"),
+                    dict(reference_sha256="xyz")):
+            with self.assertRaises(ValueError) as ctx:
+                seed_request(**bad)
+            self.assertTrue(str(ctx.exception).endswith("."), str(ctx.exception))
+
+    def test_vocal_job_sings_through_seedvc_in_the_guessed_octave(self):
+        work = tempfile.mkdtemp(prefix="work-", dir=self.td)
+        song = self.song_file(tone_song(seconds=6.0, f0=440.0, band_level=0))  # an A4 melody
+        out = voice_pipeline.run(seed_request(), song, None, None, work, self.runner(), reference_path=self.ref_file(220.0))
+        r = out["report"]
+        calls = self.calls("seedvc")
+        self.assertEqual((len(calls), self.calls("rvc")), (1, []))
+        argv = calls[0]["argv"]
+        opt = {argv[i]: argv[i + 1] for i in range(0, len(argv) - 1, 2)}
+        self.assertEqual((opt["--shift"], opt["--steps"], opt["--cfg"], opt["--device"]), ("-12", "50", "0.7", "cpu"))
+        self.assertEqual(opt["--ref"], os.path.join(work, "reference.wav"))
+        self.assertEqual((calls[0]["cwd"], calls[0]["offline"]), (os.path.join(self.td, "seedvc"), "1"))
+        # a voice that speaks around A3 is guessed to sing up to about E4, so an A4 melody comes down an octave
+        self.assertEqual((r["pitch"]["shift"], r["settings"]["engine"], r["settings"]["range_source"]),
+                         (-12, "seedvc", "guessed from the reference"))
+        self.assertEqual(r["settings"]["seedvc"], voice_request.SEEDVC)
+        self.assertLess(r["settings"]["voice_range"]["p95"], 69)
+        vocal, _ = va.decode(out["files"]["vocal.wav"])
+        self.assertEqual(len(vocal), len(tone_song(seconds=6.0)))
+
+    def test_a_range_on_record_wins_and_a_silent_reference_is_refused(self):
+        work = tempfile.mkdtemp(prefix="work-", dir=self.td)
+        req = seed_request(voice_range={"p05": 60, "p50": 67, "p95": 76})
+        out = voice_pipeline.run(req, self.song_file(tone_song(seconds=6.0, f0=440.0, band_level=0)), None, None, work,
+                                 self.runner(), reference_path=self.ref_file(110.0))
+        self.assertEqual((out["report"]["pitch"]["shift"], out["report"]["settings"]["range_source"]), (0, "record"))
+        with self.assertRaises(ValueError):
+            voice_pipeline.run(seed_request(), self.song_file(), None, None, tempfile.mkdtemp(dir=self.td), self.runner(),
+                               reference_path=self.ref_file(level=0.0))
+        os.environ["FAKE_SEEDVC"] = "fail"
+        with self.assertRaises(RuntimeError) as ctx:
+            voice_pipeline.run(seed_request(), self.song_file(), None, None, tempfile.mkdtemp(dir=self.td), self.runner(),
+                               reference_path=self.ref_file())
+        self.assertEqual(str(ctx.exception), "Seed-VC conversion failed")
+
+    def test_handler_fetches_the_reference_not_a_model(self):
+        import voice_handler
+        with open(self.song_file(), "rb") as f, open(self.ref_file(), "rb") as g:
+            s3 = FakeS3({"voice/abcdefgh12/in.wav": f.read(), REF: g.read()})
+        sys.modules["runpod"] = types.SimpleNamespace(serverless=types.SimpleNamespace(progress_update=lambda job, text: None))
+        runner = self.runner()
+        with mock.patch.object(voice_handler, "storage", lambda: (s3, "bucket")), \
+                mock.patch.object(voice_pipeline, "Runner", lambda log: runner), \
+                mock.patch.dict(voice_handler.GPU, {"cuda": True, "name": "NVIDIA A40", "supported": True}, clear=True):
+            try:
+                out = voice_handler.handler({"input": {"mode": "song", "audio_key": "voice/abcdefgh12/in.wav", "engine": "seedvc",
+                                                       "reference_key": REF, "output_prefix": "voice/seedjob0001"}})
+            finally:
+                sys.modules.pop("runpod", None)
+        self.assertNotIn("error", out, out)
+        self.assertEqual((out["engine"], out["key"]), ("seedvc", "voice/seedjob0001/mix.mp3"))
+        self.assertEqual(s3.downloads, ["voice/abcdefgh12/in.wav", REF])
+        self.assertEqual(out["models"], {"model_cached": None, "index_cached": None, "reference_cached": False})
+        self.assertIn("seedvc", out["features"])
+        self.assertEqual(out["settings"]["engine"], "seedvc")
+
+
 if __name__ == "__main__":
     unittest.main()
